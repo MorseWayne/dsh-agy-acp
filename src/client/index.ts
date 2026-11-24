@@ -1,6 +1,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 // @ts-expect-error runtime React is supplied by the DSH web host
 import React from 'react'
+// @ts-expect-error runtime ReactDOM is supplied by the DSH web host
+import ReactDOM from 'react-dom'
 import type {
   AccountHealthSnapshot,
   PendingPermission,
@@ -682,56 +684,30 @@ function AgyAcpSettingsSection(): unknown {
   )
 }
 
-/** Compact header badge + quick dropdown popover (`conversation.session.header.actions`). */
+function portalToBody(node: unknown): unknown {
+  if (typeof document !== 'undefined' && document.body && typeof ReactDOM?.createPortal === 'function') {
+    return ReactDOM.createPortal(node, document.body)
+  }
+  return node
+}
+
+/** Compact header badge + body-portaled console modal (`conversation.session.header.actions`). */
 function AgyAcpConsoleWidget(): unknown {
   const [open, setOpen] = React.useState(false)
-  const [busy, setBusy] = React.useState(false)
   const status = useAgyAcpStatus(() => setOpen(true))
+
+  React.useEffect(() => {
+    if (!open || typeof window === 'undefined') return
+    const onKey = (ev: KeyboardEvent): void => {
+      if (ev.key === 'Escape') setOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open])
 
   const connected = Boolean(status?.connected)
   const pending = status?.pendingPermissions ?? []
   const sessions = status?.sessions ?? []
-  const totals = status?.usageTotals ?? {
-    inputTokens: 0,
-    outputTokens: 0,
-    cachedReadTokens: 0,
-    reasoningTokens: 0,
-  }
-
-  const handleModeChange = async (mode: PermissionMode): Promise<void> => {
-    setBusy(true)
-    try {
-      await postJson('/plugins/agy-acp/mode', { mode })
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const handleResetSessions = async (sessionKey?: string): Promise<void> => {
-    setBusy(true)
-    try {
-      await postJson('/plugins/agy-acp/sessions/reset', sessionKey ? { sessionKey } : {})
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const handleDecidePermission = async (
-    requestId: string,
-    optionId?: string,
-    cancel?: boolean,
-  ): Promise<void> => {
-    setBusy(true)
-    try {
-      await postJson('/plugins/agy-acp/permissions/decide', {
-        requestId,
-        ...(optionId ? { optionId } : {}),
-        ...(cancel ? { cancel: true } : {}),
-      })
-    } finally {
-      setBusy(false)
-    }
-  }
 
   const badgeLabel =
     pending.length > 0
@@ -742,17 +718,87 @@ function AgyAcpConsoleWidget(): unknown {
 
   const dotColor = pending.length > 0 ? '#f59e0b' : connected ? '#22c55e' : '#94a3b8'
 
+  const modal = open
+    ? portalToBody(
+        React.createElement(
+          'div',
+          {
+            onClick: (ev: { target: unknown; currentTarget: unknown }) => {
+              if (ev.target === ev.currentTarget) setOpen(false)
+            },
+            style: {
+              position: 'fixed',
+              inset: 0,
+              zIndex: 10000,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: '24px',
+              backgroundColor: 'rgba(0, 0, 0, 0.55)',
+              backdropFilter: 'blur(4px)',
+            },
+          },
+          React.createElement(
+            'div',
+            {
+              role: 'dialog',
+              'aria-label': 'Antigravity ACP 控制台',
+              style: {
+                position: 'relative',
+                width: 'min(780px, 94vw)',
+                maxHeight: '86vh',
+                overflowY: 'auto',
+                borderRadius: '14px',
+                border: '1px solid rgba(148, 163, 184, 0.35)',
+                backgroundColor: 'var(--bg-elevated, #18181b)',
+                color: 'var(--text-primary, #f4f4f5)',
+                boxShadow: '0 24px 64px rgba(0, 0, 0, 0.5)',
+                padding: '18px 22px',
+              },
+            },
+            React.createElement(
+              'button',
+              {
+                type: 'button',
+                onClick: () => setOpen(false),
+                title: '关闭 (Esc)',
+                style: {
+                  position: 'absolute',
+                  top: '14px',
+                  right: '14px',
+                  width: '28px',
+                  height: '28px',
+                  borderRadius: '6px',
+                  border: '1px solid rgba(148, 163, 184, 0.3)',
+                  background: 'transparent',
+                  color: 'inherit',
+                  cursor: 'pointer',
+                  fontSize: '15px',
+                  lineHeight: 1,
+                },
+              },
+              '×',
+            ),
+            React.createElement(AgyAcpSettingsSection),
+          ),
+        ),
+      )
+    : null
+
   return React.createElement(
-    'div',
-    { style: { position: 'relative', display: 'inline-flex', alignItems: 'center' } },
+    React.Fragment,
+    null,
     React.createElement(
       'button',
       {
         type: 'button',
-        onClick: () => setOpen((v: boolean) => !v),
+        onClick: (ev: { stopPropagation?: () => void }) => {
+          ev.stopPropagation?.()
+          setOpen((v: boolean) => !v)
+        },
         title: connected
           ? `${status?.agentName ?? 'Antigravity ACP'} ${status?.agentVersion ?? ''} (${status?.tierName ?? '已连接'})`
-          : 'Antigravity ACP 控制台',
+          : '打开 Antigravity ACP 控制台',
         style: {
           display: 'inline-flex',
           alignItems: 'center',
@@ -765,7 +811,7 @@ function AgyAcpConsoleWidget(): unknown {
           background: 'transparent',
           color: 'inherit',
           cursor: 'pointer',
-          opacity: connected || pending.length > 0 ? 0.95 : 0.7,
+          opacity: connected || pending.length > 0 ? 0.95 : 0.75,
         },
       },
       React.createElement('span', {
@@ -778,200 +824,7 @@ function AgyAcpConsoleWidget(): unknown {
       }),
       badgeLabel,
     ),
-    open
-      ? React.createElement(
-          'div',
-          {
-            style: {
-              position: 'absolute',
-              top: 'calc(100% + 8px)',
-              right: 0,
-              width: '360px',
-              maxHeight: '480px',
-              overflowY: 'auto',
-              zIndex: 9999,
-              borderRadius: '10px',
-              border: '1px solid rgba(148, 163, 184, 0.35)',
-              backgroundColor: 'var(--bg-elevated, #18181b)',
-              color: 'var(--text-primary, #f4f4f5)',
-              boxShadow: '0 12px 32px rgba(0, 0, 0, 0.35)',
-              padding: '12px',
-              fontSize: '12px',
-              lineHeight: 1.45,
-            },
-          },
-          React.createElement(
-            'div',
-            {
-              style: {
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                marginBottom: '10px',
-                paddingBottom: '8px',
-                borderBottom: '1px solid rgba(148, 163, 184, 0.2)',
-              },
-            },
-            React.createElement(
-              'div',
-              null,
-              React.createElement('strong', { style: { fontSize: '13px' } }, 'Antigravity ACP'),
-              React.createElement(
-                'div',
-                { style: { opacity: 0.7, fontSize: '11px' } },
-                connected
-                  ? `${status?.agentName ?? 'agy'} ${status?.agentVersion ?? ''} · ${status?.tierName ?? '已连接'}`
-                  : '待机中（首轮对话自动建连）',
-              ),
-            ),
-            React.createElement(
-              'span',
-              {
-                style: {
-                  fontSize: '11px',
-                  padding: '2px 6px',
-                  borderRadius: '6px',
-                  backgroundColor: status?.mcpBridgeActive ? 'rgba(34, 197, 94, 0.18)' : 'rgba(148, 163, 184, 0.15)',
-                  color: status?.mcpBridgeActive ? '#4ade80' : '#cbd5e1',
-                },
-              },
-              status?.mcpBridgeActive ? 'MCP Bridge ON' : 'MCP Bridge OFF',
-            ),
-          ),
-
-          renderPendingPermissions(pending, busy, handleDecidePermission),
-
-          React.createElement(
-            'div',
-            { style: { marginBottom: '10px' } },
-            React.createElement('div', { style: { opacity: 0.75, marginBottom: '4px' } }, '权限模式'),
-            React.createElement(
-              'div',
-              { style: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '4px' } },
-              ...MODES.map((m) => {
-                const active = status?.permissionMode === m.id
-                return React.createElement(
-                  'button',
-                  {
-                    key: m.id,
-                    type: 'button',
-                    disabled: busy,
-                    onClick: () => void handleModeChange(m.id),
-                    style: {
-                      padding: '4px 4px',
-                      borderRadius: '6px',
-                      border: `1px solid ${active ? '#3b82f6' : 'rgba(148,163,184,0.3)'}`,
-                      backgroundColor: active ? 'rgba(59, 130, 246, 0.22)' : 'transparent',
-                      color: 'inherit',
-                      cursor: 'pointer',
-                      fontSize: '11px',
-                      fontWeight: active ? 600 : 400,
-                    },
-                  },
-                  m.label,
-                )
-              }),
-            ),
-          ),
-
-          React.createElement(
-            'div',
-            {
-              style: {
-                display: 'grid',
-                gridTemplateColumns: 'repeat(4, 1fr)',
-                gap: '6px',
-                padding: '6px',
-                borderRadius: '6px',
-                backgroundColor: 'rgba(148, 163, 184, 0.08)',
-                marginBottom: '10px',
-                textAlign: 'center',
-              },
-            },
-            React.createElement('div', null, React.createElement('div', { style: { opacity: 0.65, fontSize: '10px' } }, 'Input'), formatTokens(totals.inputTokens)),
-            React.createElement('div', null, React.createElement('div', { style: { opacity: 0.65, fontSize: '10px' } }, 'Cached'), formatTokens(totals.cachedReadTokens)),
-            React.createElement('div', null, React.createElement('div', { style: { opacity: 0.65, fontSize: '10px' } }, 'Output'), formatTokens(totals.outputTokens)),
-            React.createElement('div', null, React.createElement('div', { style: { opacity: 0.65, fontSize: '10px' } }, 'Think'), formatTokens(totals.reasoningTokens)),
-          ),
-
-          React.createElement(
-            'div',
-            null,
-            React.createElement(
-              'div',
-              { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' } },
-              React.createElement('span', { style: { opacity: 0.75 } }, `活跃会话 (${sessions.length})`),
-              sessions.length > 0
-                ? React.createElement(
-                    'button',
-                    {
-                      type: 'button',
-                      disabled: busy,
-                      onClick: () => void handleResetSessions(),
-                      style: {
-                        padding: '2px 6px',
-                        borderRadius: '4px',
-                        border: '1px solid rgba(239, 68, 68, 0.45)',
-                        background: 'transparent',
-                        color: '#f87171',
-                        cursor: 'pointer',
-                        fontSize: '11px',
-                      },
-                    },
-                    '重置全部',
-                  )
-                : null,
-            ),
-            sessions.length === 0
-              ? React.createElement('div', { style: { opacity: 0.55, fontSize: '11px' } }, '暂无活跃 ACP 会话')
-              : sessions.map((s: SessionSummary) =>
-                  React.createElement(
-                    'div',
-                    {
-                      key: s.dshSessionKey,
-                      style: {
-                        display: 'flex',
-                        justifyContent: 'space-between',
-                        alignItems: 'center',
-                        padding: '6px',
-                        borderRadius: '6px',
-                        backgroundColor: 'rgba(148, 163, 184, 0.08)',
-                        marginBottom: '4px',
-                      },
-                    },
-                    React.createElement(
-                      'div',
-                      { style: { minWidth: 0 } },
-                      React.createElement('div', { style: { fontWeight: 500 } }, s.currentModel || 'default'),
-                      React.createElement(
-                        'div',
-                        { style: { opacity: 0.7, fontSize: '11px' } },
-                        `${s.dshSessionKey} · ${s.currentEffort || 'auto'} · ctx ${formatTokens(s.contextUsed)}${s.contextSize > 0 ? '/' + formatTokens(s.contextSize) : ''}`,
-                      ),
-                    ),
-                    React.createElement(
-                      'button',
-                      {
-                        type: 'button',
-                        disabled: busy,
-                        onClick: () => void handleResetSessions(s.dshSessionKey),
-                        style: {
-                          padding: '2px 6px',
-                          borderRadius: '4px',
-                          border: '1px solid rgba(148,163,184,0.35)',
-                          background: 'transparent',
-                          color: 'inherit',
-                          cursor: 'pointer',
-                          fontSize: '11px',
-                        },
-                      },
-                      '关闭',
-                    ),
-                  ),
-                ),
-          ),
-        )
-      : null,
+    modal,
   )
 }
 
