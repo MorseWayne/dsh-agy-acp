@@ -118,7 +118,15 @@ export class AcpAdapter extends LlmAdapter {
     if (continuation) {
       const rec = this.deps.runs.get(continuation.runId)
       if (rec) {
-        yield* this.driveRecording(rec, continuation.itemIndex + 1, cutOnTool, isCodeMode, options.signal)
+        const onContAbort = (): void => {
+          rec.requestCancel()
+        }
+        options.signal?.addEventListener('abort', onContAbort, { once: true })
+        try {
+          yield* this.driveRecording(rec, continuation.itemIndex + 1, cutOnTool, isCodeMode, options.signal)
+        } finally {
+          options.signal?.removeEventListener('abort', onContAbort)
+        }
         return
       }
     }
@@ -141,13 +149,16 @@ export class AcpAdapter extends LlmAdapter {
 
     const promptBlocks = buildPromptBlocks(options.messages, created)
     const rec = this.deps.runs.create()
+    rec.setCancelHandler(() => {
+      client.sessionCancel(session.acpSessionId)
+    })
 
     const unsubscribe = client.onSessionUpdate(session.acpSessionId, (update) => {
       rec.pushUpdate(update)
     })
 
     const onAbort = (): void => {
-      client.sessionCancel(session.acpSessionId)
+      rec.requestCancel()
     }
     options.signal?.addEventListener('abort', onAbort, { once: true })
 
@@ -162,6 +173,7 @@ export class AcpAdapter extends LlmAdapter {
       })
       .finally(() => {
         unsubscribe()
+        rec.setCancelHandler(null)
         options.signal?.removeEventListener('abort', onAbort)
       })
 
@@ -204,6 +216,15 @@ export class AcpAdapter extends LlmAdapter {
       }
 
       const item = await rec.waitFor(idx, signal)
+      if (signal?.aborted) {
+        const closed = closeOpenBlock()
+        if (closed) yield closed
+        yield {
+          type: 'finish',
+          reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'Request aborted by caller' } },
+        }
+        return
+      }
       if (!item) {
         const closed = closeOpenBlock()
         if (closed) yield closed
@@ -278,12 +299,16 @@ export class AcpAdapter extends LlmAdapter {
                 run: rec.id,
                 step: idx,
                 tool: tc.name ?? 'tool',
+                ...(tc.title ? { title: tc.title } : {}),
+                ...(tc.kind ? { kind: tc.kind } : {}),
               })})`,
             })
           : JSON.stringify({
               run: rec.id,
               step: idx,
               tool: tc.name ?? 'tool',
+              ...(tc.title ? { title: tc.title } : {}),
+              ...(tc.kind ? { kind: tc.kind } : {}),
               input: tc.rawInput ?? tc.args,
             })
 

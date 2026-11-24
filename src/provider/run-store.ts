@@ -20,6 +20,7 @@ export class AcpRunRecording {
   readonly toolResults = new Map<number, AcpToolCallUpdate>()
   private waiters: Array<() => void> = []
   private settled = false
+  private cancelHandler: (() => void) | null = null
   lastContextUsed = 0
 
   constructor(id?: string) {
@@ -28,6 +29,14 @@ export class AcpRunRecording {
 
   get isSettled(): boolean {
     return this.settled
+  }
+
+  setCancelHandler(fn: (() => void) | null): void {
+    this.cancelHandler = fn
+  }
+
+  requestCancel(): void {
+    this.cancelHandler?.()
   }
 
   pushUpdate(update: SessionUpdatePayload): number {
