@@ -1,6 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { PermissionMode, StatusSnapshot } from '../common/types.ts'
-import type { PermissionManager } from '../runtime/permission-manager.ts'
+import type { StatusSnapshot } from '../common/types.ts'
 import type { AcpSessionPool } from '../runtime/session-pool.ts'
 
 export interface ExactRouteSpec {
@@ -19,8 +18,6 @@ export interface WebServerLike {
     handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>,
   ): (() => void) | void
 }
-
-const VALID_MODES = new Set<PermissionMode>(['skip', 'default', 'accept-edits', 'plan'])
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
@@ -61,14 +58,11 @@ function readJsonBody(req: IncomingMessage, maxBytes = 64 * 1024): Promise<Recor
  * Registers HTTP control APIs and real-time SSE event stream endpoints:
  * - GET  /plugins/agy-acp/status              (one-shot JSON snapshot)
  * - GET  /plugins/agy-acp/events              (Server-Sent Events push on state changes)
- * - POST /plugins/agy-acp/mode                (switch permission mode)
  * - POST /plugins/agy-acp/sessions/reset      (close one or all active ACP sessions)
- * - POST /plugins/agy-acp/permissions/decide  (approve/deny pending ACP permission request)
  */
 export function registerAcpRoutes(
   webServer: WebServerLike,
   pool: AcpSessionPool,
-  permissions?: PermissionManager,
 ): () => void {
   const disposers: Array<() => void> = []
   const sseClients = new Set<ServerResponse>()
@@ -145,8 +139,9 @@ export function registerAcpRoutes(
     try {
       const body = await readJsonBody(req)
       const patch: Record<string, unknown> = {}
-      if (typeof body.permissionMode === 'string' && VALID_MODES.has(body.permissionMode as PermissionMode)) {
-        patch.permissionMode = body.permissionMode
+      if ('permissionMode' in body) {
+        sendJson(res, 400, { error: 'Permission policy belongs to the DSH session' })
+        return
       }
       if (typeof body.mcpBridge === 'boolean') patch.mcpBridge = body.mcpBridge
       if (typeof body.agyBin === 'string') patch.agyBin = body.agyBin.trim()
@@ -154,21 +149,6 @@ export function registerAcpRoutes(
       if (typeof body.defaultModel === 'string') patch.defaultModel = body.defaultModel.trim()
       if (typeof body.defaultEffort === 'string') patch.defaultEffort = body.defaultEffort.trim()
       await pool.updateConfig(patch)
-      sendJson(res, 200, { ok: true, status: pool.getStatus() })
-    } catch (err) {
-      sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) })
-    }
-  })
-
-  addRoute('POST', '/plugins/agy-acp/mode', async (req, res) => {
-    try {
-      const body = await readJsonBody(req)
-      const mode = body.mode
-      if (typeof mode !== 'string' || !VALID_MODES.has(mode as PermissionMode)) {
-        sendJson(res, 400, { error: 'Invalid permission mode' })
-        return
-      }
-      await pool.setPermissionMode(mode as PermissionMode)
       sendJson(res, 200, { ok: true, status: pool.getStatus() })
     } catch (err) {
       sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) })
@@ -186,31 +166,6 @@ export function registerAcpRoutes(
         const closed = await pool.resetAllSessions()
         sendJson(res, 200, { ok: true, closed, status: pool.getStatus() })
       }
-    } catch (err) {
-      sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) })
-    }
-  })
-
-  addRoute('POST', '/plugins/agy-acp/permissions/decide', async (req, res) => {
-    if (!permissions) {
-      sendJson(res, 501, { error: 'Interactive permissions not configured' })
-      return
-    }
-    try {
-      const body = await readJsonBody(req)
-      const requestId = typeof body.requestId === 'string' ? body.requestId : ''
-      if (!requestId) {
-        sendJson(res, 400, { error: 'Missing requestId' })
-        return
-      }
-      const optionId = typeof body.optionId === 'string' ? body.optionId : undefined
-      const cancel = Boolean(body.cancel)
-      const handled = permissions.decide(requestId, { optionId, cancel })
-      if (!handled) {
-        sendJson(res, 404, { error: 'Pending permission request not found' })
-        return
-      }
-      sendJson(res, 200, { ok: true, status: pool.getStatus() })
     } catch (err) {
       sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) })
     }

@@ -2,8 +2,6 @@ export const PROVIDER_ID = 'antigravity-acp'
 export const MIRROR_TOOL_NAME = 'agy_acp_tool'
 export const WRAPPER_TOOL_NAME = 'run_code'
 
-export type PermissionMode = 'skip' | 'default' | 'accept-edits' | 'plan'
-
 export type ModelFamily = 'gemini-pro' | 'gemini-flash' | 'claude' | 'other'
 
 export interface AccountProfileConfig {
@@ -47,7 +45,6 @@ export interface AccountHealthSnapshot {
 export interface PluginConfig {
   enabled: boolean
   agyBin: string
-  permissionMode: PermissionMode
   workspaceRoot: string
   defaultModel: string
   defaultEffort: string
@@ -79,24 +76,6 @@ export interface SessionSummary {
   lastActiveAt: number
 }
 
-export interface PendingPermissionOption {
-  optionId: string
-  name: string
-  kind: string
-}
-
-export interface PendingPermission {
-  requestId: string
-  sessionId: string
-  toolCallId: string
-  toolName: string
-  title?: string
-  kind?: string
-  rawInput?: unknown
-  options: PendingPermissionOption[]
-  createdAt: number
-}
-
 export interface UsageTotals {
   inputTokens: number
   outputTokens: number
@@ -113,12 +92,10 @@ export interface StatusSnapshot {
   tierName: string | null
   activeSessions: number
   sessions: SessionSummary[]
-  pendingPermissions: PendingPermission[]
   mcpBridgeActive: boolean
   usageTotals: UsageTotals
   accounts: AccountHealthSnapshot[]
   models: AcpModelOption[]
-  permissionMode: PermissionMode
   config: {
     agyBin: string
     workspaceRoot: string

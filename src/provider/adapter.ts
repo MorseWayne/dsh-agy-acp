@@ -110,6 +110,8 @@ export class AcpAdapter extends LlmAdapter {
       throw new LlmError('dsh-agy-acp is disabled by config', 'PROVIDER_DISABLED')
     }
 
+    const sessionKey = options.sessionId
+    if (!sessionKey || options.purpose) throw new Error('Antigravity requires an identified DSH conversation turn; auxiliary calls cannot execute native tools')
     const hasMirrorTool = Boolean(options.tools?.some((t) => t.name === MIRROR_TOOL_NAME))
     const isCodeMode = Boolean(options.tools?.some((t) => t.name === WRAPPER_TOOL_NAME)) && !hasMirrorTool
     const cutOnTool = hasMirrorTool || isCodeMode
@@ -118,7 +120,7 @@ export class AcpAdapter extends LlmAdapter {
     const continuation = detectContinuation(options.messages)
     if (continuation) {
       const rec = this.deps.runs.get(continuation.runId)
-      if (rec) {
+      if (rec && rec.owner === sessionKey) {
         const onContAbort = (): void => {
           rec.requestCancel()
         }
@@ -133,8 +135,7 @@ export class AcpAdapter extends LlmAdapter {
     }
 
     // 2. Fresh turn over persistent ACP session (with automatic 429/quota failover).
-    const sessionKey = resolveSessionKey(options)
-    const cwd = cfg.workspaceRoot || process.cwd()
+    const cwd = this.deps.pool.policy(sessionKey).workspaceRoot
     const requestedModel = options.model || cfg.defaultModel || ''
     const triedAccounts = new Set<string>()
     const maxAttempts = Math.max(1, cfg.accounts.filter((a) => a.enabled !== false).length || 1)
@@ -151,7 +152,9 @@ export class AcpAdapter extends LlmAdapter {
       const targetModel = requestedModel || session.currentModel
       const targetEffort =
         options.reasoningEffort !== undefined ? String(options.reasoningEffort) : cfg.defaultEffort || undefined
-      const targetMode = cfg.permissionMode
+      const policy = this.deps.pool.policy(sessionKey)
+      const nativeAuto = session.configOptions.find(o => o.id === 'mode')?.options?.some(o => o.value === 'auto')
+      const targetMode = policy.preset === 'auto' && policy.mode === 'danger-full-access' && nativeAuto ? 'auto' : 'default'
 
       await this.deps.pool.syncSessionOptions(client, session, {
         model: targetModel,
@@ -160,8 +163,11 @@ export class AcpAdapter extends LlmAdapter {
       })
 
       const promptBlocks = buildPromptBlocks(options.messages, created)
-      const rec = this.deps.runs.create()
+      if (session.currentMode !== targetMode) throw new Error(`Antigravity did not accept permission mode ${targetMode}`)
+      const turn = this.deps.pool.beginPrompt(session, options.signal)
+      const rec = this.deps.runs.create(sessionKey)
       rec.setCancelHandler(() => {
+        turn.cancel()
         client.sessionCancel(session.acpSessionId)
       })
 
@@ -188,9 +194,12 @@ export class AcpAdapter extends LlmAdapter {
         .catch((err: unknown) => {
           const error = err instanceof Error ? err : new Error(String(err))
           this.deps.pool.reportAccountFailure(session.accountId, targetModel, error)
+          // A timed-out RPC may still be running on the peer. Never reuse that process.
+          if (this.deps.pool.owns(session)) this.deps.pool.invalidate(sessionKey)
           rec.fail(error)
         })
         .finally(() => {
+          turn.finish()
           unsubscribe()
           rec.setCancelHandler(null)
           options.signal?.removeEventListener('abort', onAbort)
@@ -399,9 +408,4 @@ function detectContinuation(messages: readonly Message[]): { runId: string; item
     }
   }
   return null
-}
-
-function resolveSessionKey(options: GenerateOptions): string {
-  const opt = options as unknown as { sessionId?: string; conversationId?: string; metadata?: { sessionId?: string } }
-  return opt.sessionId ?? opt.conversationId ?? opt.metadata?.sessionId ?? 'default'
 }

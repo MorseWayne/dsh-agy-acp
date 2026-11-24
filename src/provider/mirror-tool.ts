@@ -435,8 +435,9 @@ export function defineAgyAcpMirrorTool(runs: AcpRunStore): ToolDefinition {
     isConcurrencySafe() {
       return true
     },
-    async execute(args) {
+    async execute(args, exec) {
       const rec = runs.get(args.run)
+      if (rec?.owner && rec.owner !== exec.agent?.session.id) throw new Error('ACP recording belongs to another DSH session')
       const update = rec?.toolResults.get(args.step)
       if (!update) {
         return {

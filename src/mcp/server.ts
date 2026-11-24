@@ -189,7 +189,7 @@ export class ReverseMcpBridge {
     }
 
     const ac = new AbortController()
-    req.once('close', () => ac.abort())
+    res.once('close', () => { if (!res.writableEnded) ac.abort() })
 
     try {
       const result = await this.dispatchRpc(method, params, ac.signal)

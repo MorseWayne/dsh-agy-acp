@@ -25,6 +25,7 @@ export type UpdateListener = (update: SessionUpdatePayload) => void
 
 export interface AcpClientOptions {
   bin: string
+  /** Exact arguments, including the acp subcommand (possibly wrapped by the DSH sandbox). */
   args?: string[]
   cwd?: string
   env?: NodeJS.ProcessEnv
@@ -81,11 +82,13 @@ export class AcpClient {
   start(): void {
     if (this.child !== null) return
     this.closed = false
-    const args = ['acp', ...(this.opts.args ?? [])]
+    const args = this.opts.args ?? ['acp']
     const child = spawn(this.opts.bin, args, {
       cwd: this.opts.cwd || process.cwd(),
       env: this.opts.env ?? process.env,
       stdio: ['pipe', 'pipe', 'pipe'],
+      // Own the local process group so a sandbox wrapper is not the only process stopped.
+      detached: process.platform !== 'win32',
     })
     this.child = child
 
@@ -214,7 +217,8 @@ export class AcpClient {
     this.rl = null
     if (this.child) {
       try {
-        this.child.kill()
+        if (process.platform !== 'win32' && this.child.pid) process.kill(-this.child.pid, 'SIGKILL')
+        else this.child.kill()
       } catch {
         // ignore
       }
@@ -291,11 +295,7 @@ export class AcpClient {
         if (this.opts.onPermission) {
           result = await this.opts.onPermission(req)
         } else {
-          // Safe fallback: pick first allow option if configured, else cancel.
-          const allow = req.options?.find((o) => o.kind.includes('allow'))
-          result = allow
-            ? { outcome: { outcome: 'selected', optionId: allow.optionId } }
-            : { outcome: { outcome: 'cancelled' } }
+          result = { outcome: { outcome: 'cancelled' } }
         }
         this.writeResponse(id, result)
         return

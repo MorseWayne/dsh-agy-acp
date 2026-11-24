@@ -1,6 +1,4 @@
-import type { AccountProfileConfig, PermissionMode, PluginConfig } from './types.ts'
-
-const VALID_MODES = new Set<PermissionMode>(['skip', 'default', 'accept-edits', 'plan'])
+import type { AccountProfileConfig, PluginConfig } from './types.ts'
 
 function parseBool(v: unknown, fallback: boolean): boolean {
   if (typeof v === 'boolean') return v
@@ -44,15 +42,9 @@ function parseAccounts(raw: unknown): AccountProfileConfig[] {
 }
 
 export function resolveConfig(raw: Record<string, unknown> = {}): PluginConfig {
-  const modeRaw = typeof raw.permissionMode === 'string' ? raw.permissionMode.trim() : ''
-  const permissionMode: PermissionMode = VALID_MODES.has(modeRaw as PermissionMode)
-    ? (modeRaw as PermissionMode)
-    : 'accept-edits'
-
   return {
     enabled: parseBool(raw.enabled, true),
     agyBin: typeof raw.agyBin === 'string' ? raw.agyBin.trim() : '',
-    permissionMode,
     workspaceRoot: typeof raw.workspaceRoot === 'string' ? raw.workspaceRoot.trim() : '',
     defaultModel: typeof raw.defaultModel === 'string' ? raw.defaultModel.trim() : '',
     defaultEffort: typeof raw.defaultEffort === 'string' ? raw.defaultEffort.trim() : '',

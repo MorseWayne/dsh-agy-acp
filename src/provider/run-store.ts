@@ -23,7 +23,7 @@ export class AcpRunRecording {
   private cancelHandler: (() => void) | null = null
   lastContextUsed = 0
 
-  constructor(id?: string) {
+  constructor(id?: string, readonly owner?: string) {
     this.id = id ?? randomUUID().slice(0, 12)
   }
 
@@ -100,8 +100,8 @@ export class AcpRunRecording {
 export class AcpRunStore {
   private readonly runs = new Map<string, AcpRunRecording>()
 
-  create(): AcpRunRecording {
-    const rec = new AcpRunRecording()
+  create(owner?: string): AcpRunRecording {
+    const rec = new AcpRunRecording(undefined, owner)
     this.runs.set(rec.id, rec)
     // Keep bounded memory (last 64 runs)
     if (this.runs.size > 64) {

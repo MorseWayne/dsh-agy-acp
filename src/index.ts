@@ -3,30 +3,28 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
 import type { PreToolDecision, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import { resolveConfig } from './common/config.ts'
-import { MIRROR_TOOL_NAME, PROVIDER_ID, type PermissionMode } from './common/types.ts'
-import { ReverseMcpBridge, type BridgeToolSchema } from './mcp/server.ts'
+import { MIRROR_TOOL_NAME, PROVIDER_ID } from './common/types.ts'
+import { ReverseMcpBridge } from './mcp/server.ts'
 import { AcpAdapter } from './provider/adapter.ts'
 import { defineAgyAcpMirrorTool } from './provider/mirror-tool.ts'
 import { AcpRunStore } from './provider/run-store.ts'
 import { resolveAgyBin } from './runtime/bin.ts'
 import { MultiAccountPool } from './runtime/account-pool.ts'
 import { CredentialSlotLeaseManager } from './runtime/credential-lease.ts'
-import { PermissionManager } from './runtime/permission-manager.ts'
+import { hostPermissions, type SessionAgent } from './runtime/host-permissions.ts'
 import { AcpSessionPool } from './runtime/session-pool.ts'
 import { registerAcpRoutes, type WebServerLike } from './transport/sse.ts'
 
 export const name = '@morsewayne/dsh-agy-acp'
-export const inject = ['llm', 'commands']
+export const inject = ['llm', 'commands', 'agents', 'permissionPresets', 'approval', 'sandboxPolicy', 'sandbox']
 
 interface DshToolsServiceLike {
   register(t: unknown): (() => void) | void
-  schemas?(): Array<{ name: string; description?: string; parameters?: Record<string, unknown> }>
+  schemas?(agent: SessionAgent): Array<{ name: string; description?: string; parameters?: Record<string, unknown> }>
   execute?(input: {
-    callId: ToolCallId
-    name: string
-    arguments: unknown
-    signal: AbortSignal
-  }): Promise<ToolExecutionResult>
+    calls: Array<{ type: 'tool-call'; id: ToolCallId; name: string; arguments: unknown }>
+    agent: SessionAgent; signal: AbortSignal
+  }): Promise<{ results: Array<{ result: ToolExecutionResult }> }>
 }
 
 export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): void {
@@ -36,13 +34,14 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     console.log(`[dsh-agy-acp] ${msg}`)
   }
 
-  let mcpBridge: ReverseMcpBridge | null = null
-  let syncMcpBridge: (() => Promise<void>) | null = null
-
-  const permissions = new PermissionManager({
-    getMode: () => cfg.permissionMode,
-    log,
-  })
+  const permissions = hostPermissions(ctx as unknown as Parameters<typeof hostPermissions>[0])
+  let bridgeTools: DshToolsServiceLike | undefined
+  const bridges = new Map<string, ReverseMcpBridge>()
+  function releaseBridge(key: string) {
+    const bridge = bridges.get(key)
+    bridges.delete(key)
+    if (bridge) void bridge.dispose().catch(err => log(String(err)))
+  }
 
   const slotManager = cfg.credentialSlotDir
     ? new CredentialSlotLeaseManager({ slotDir: cfg.credentialSlotDir })
@@ -57,33 +56,52 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       : undefined
 
   const runs = new AcpRunStore()
-  const pool = new AcpSessionPool({
+  const pool: AcpSessionPool = new AcpSessionPool({
     getConfig: () => cfg,
     resolveBin: () => resolveAgyBin(cfg.agyBin),
     accountProvider: multiAccountPool,
-    onPermission: (req) => permissions.handleRequest(req),
-    getPendingPermissions: () => permissions.listPending(),
-    isMcpBridgeActive: () => Boolean(mcpBridge?.isRunning),
-    onPermissionModeChange: (mode: PermissionMode) => {
-      cfg = { ...cfg, permissionMode: mode }
-    },
-    onConfigPatch: async (patch) => {
+    ...permissions,
+    isMcpBridgeActive: () => bridges.size > 0,
+    onConfigPatch: patch => {
       cfg = { ...cfg, ...patch }
-      await syncMcpBridge?.()
+      if (!cfg.mcpBridge) for (const key of bridges.keys()) releaseBridge(key)
     },
-    onSessionClosed: (acpSessionId) => {
-      permissions.clearSessionRules(acpSessionId)
-    },
-    getMcpServers: () => {
-      const spec = mcpBridge?.getMcpServerSpec()
+    onSessionClosed: releaseBridge,
+    async getMcpServers(key) {
+      const tools = bridgeTools
+      if (!cfg.mcpBridge || !tools?.schemas || !tools.execute) return []
+      const owner = permissions.agent(key)
+      const authority = (): AbortSignal => {
+        const signal = pool.activeSignal(key)
+        if (!signal || !cfg.mcpBridge || bridges.get(key) !== bridge || bridgeTools !== tools) throw new Error('Inactive ACP tool bridge')
+        return signal
+      }
+      const bridge = new ReverseMcpBridge({
+        listTools: () => tools.schemas!(owner).map(t => ({ name: t.name, description: t.description, inputSchema: t.parameters })),
+        callTool: async (name, args, signal) => {
+          const turn = authority()
+          if (!tools.schemas!(owner).some(t => t.name === name)) throw new Error('Tool not available to this DSH session')
+          const batch = await tools.execute!({ agent: owner, signal: AbortSignal.any([signal, turn]),
+            calls: [{ type: 'tool-call', id: `mcp:${randomUUID()}` as ToolCallId, name, arguments: args }] })
+          const result = batch.results[0]?.result
+          if (!result) throw new Error('No DSH tool result')
+          return { content: [{ type: 'text', text: result.content.map(b => b.type === 'text' ? b.text : JSON.stringify(b)).join('\n') }], isError: result.isError }
+        }, log,
+      })
+      bridges.set(key, bridge)
+      await bridge.start()
+      if (!cfg.mcpBridge || bridges.get(key) !== bridge) { await bridge.dispose(); return [] }
+      const spec = bridge.getMcpServerSpec()
       return spec ? [spec] : []
     },
     log,
   })
 
-  permissions.on('change', () => {
-    pool.notifyStatusChange()
-  })
+  const boundaryEvents = new Set(['sandbox/mode', 'approval/policy', 'permission/preset', 'working-directory/change'])
+  ctx.on('session/event' as never, ((session: { id: string }, event: { type: string }) => {
+    if (boundaryEvents.has(event.type)) pool.invalidate(session.id)
+  }) as never, { global: true })
+  ctx.on('session/disposed' as never, ((session: { id: string }) => pool.invalidate(session.id)) as never, { global: true })
   multiAccountPool?.on('change', () => {
     pool.notifyStatusChange()
   })
@@ -116,65 +134,12 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       { prepend: true, global: true },
     )
 
-    let localBridge: ReverseMcpBridge | null = null
-    const ensureBridgeState = async (): Promise<void> => {
-      const want = cfg.enabled && cfg.mcpBridge && typeof tools.schemas === 'function' && typeof tools.execute === 'function'
-      if (want && !localBridge) {
-        const toolsSvc = tools
-        const b = new ReverseMcpBridge({
-          listTools: (): BridgeToolSchema[] =>
-            (toolsSvc.schemas?.() ?? []).map((t) => ({
-              name: t.name,
-              description: t.description,
-              inputSchema: t.parameters,
-            })),
-          callTool: async (toolName, args, signal) => {
-            const result = await toolsSvc.execute!({
-              callId: `mcp:${randomUUID().slice(0, 12)}` as ToolCallId,
-              name: toolName,
-              arguments: args,
-              signal,
-            })
-            const textParts = result.content
-              .map((b) => (b.type === 'text' ? b.text : JSON.stringify(b)))
-              .filter((t) => t.length > 0)
-            return {
-              content: [{ type: 'text', text: textParts.join('\n') || '(no output)' }],
-              isError: result.isError,
-            }
-          },
-          log,
-        })
-        localBridge = b
-        mcpBridge = b
-        try {
-          await b.start()
-        } catch (err) {
-          log(`reverse MCP bridge failed to start: ${err instanceof Error ? err.message : String(err)}`)
-        }
-        pool.notifyStatusChange()
-      } else if (!want && localBridge) {
-        const closing = localBridge
-        localBridge = null
-        if (mcpBridge === closing) mcpBridge = null
-        await closing.dispose()
-        pool.notifyStatusChange()
-      }
-    }
-
-    syncMcpBridge = ensureBridgeState
-    void ensureBridgeState()
-
+    bridgeTools = tools
     return () => {
-      if (syncMcpBridge === ensureBridgeState) syncMcpBridge = null
+      bridgeTools = undefined
+      for (const key of bridges.keys()) releaseBridge(key)
       if (typeof unlisten === 'function') unlisten()
       if (typeof disposeTool === 'function') disposeTool()
-      if (localBridge) {
-        const closing = localBridge
-        localBridge = null
-        if (mcpBridge === closing) mcpBridge = null
-        void closing.dispose().finally(() => pool.notifyStatusChange())
-      }
     }
   })
 
@@ -192,9 +157,8 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
           `Connected: ${s.connected ? 'yes' : 'no'} (${s.agentName ?? 'idle'} ${s.agentVersion ?? ''})`,
           `Tier: ${s.tierName ?? 'unknown'}`,
           `Active Sessions: ${s.activeSessions}`,
-          `Pending Permissions: ${s.pendingPermissions.length}`,
           `MCP Bridge: ${s.mcpBridgeActive ? 'active' : 'off'}`,
-          `Permission Mode: ${s.permissionMode}`,
+          'Permission policy: DSH conversation',
           `Tokens: in=${s.usageTotals.inputTokens} cached=${s.usageTotals.cachedReadTokens} out=${s.usageTotals.outputTokens} think=${s.usageTotals.reasoningTokens}`,
           `Models Cached: ${s.models.length}`,
         ].join('\n'),
@@ -206,16 +170,12 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   ctx.inject(['webServer'], (sub) => {
     const webServer = sub.get('webServer') as WebServerLike | undefined
     if (!webServer) return
-    return registerAcpRoutes(webServer, pool, permissions)
+    return registerAcpRoutes(webServer, pool)
   })
 
   // 5. Cleanup on plugin unload
   ctx.effect(() => () => {
-    permissions.dispose()
     pool.dispose()
-    if (mcpBridge) {
-      void mcpBridge.dispose()
-      mcpBridge = null
-    }
+    for (const key of bridges.keys()) releaseBridge(key)
   })
 }

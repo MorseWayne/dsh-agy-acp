@@ -1,3 +1,4 @@
+import { fakeHost } from './fixtures/session-policy.ts'
 import assert from 'node:assert/strict'
 import { chmodSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -134,7 +135,6 @@ test('MultiAccountPool isolates HOME/proxy, tracks 5h+7d buckets, and cools down
 test('AcpAdapter.stream() automatically fails over to secondary account on 429 quota error', async () => {
   const cfg = resolveConfig({
     enabled: true,
-    permissionMode: 'accept-edits',
     requestTimeoutMs: 10_000,
     accounts: [
       { id: 'primary', env: { FAKE_FORCE_429: '1', FAKE_ACCOUNT_TAG: 'primary' } },
@@ -145,6 +145,7 @@ test('AcpAdapter.stream() automatically fails over to secondary account on 429 q
   const accountPool = new MultiAccountPool({ accounts: cfg.accounts })
   const runs = new AcpRunStore()
   const pool = new AcpSessionPool({
+    ...fakeHost,
     getConfig: () => cfg,
     resolveBin: () => FAKE_AGY_BIN,
     accountProvider: accountPool,

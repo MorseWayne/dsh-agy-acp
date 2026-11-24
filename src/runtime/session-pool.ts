@@ -1,11 +1,13 @@
+import { cancelled, policyKey, type SessionPolicy, type FilePolicy } from './permission-manager.ts'
 import { EventEmitter } from 'node:events'
-import { AcpClient, type PermissionHandler } from '../acp/client.ts'
+import { AcpClient } from '../acp/client.ts'
 import type {
   AcpConfigOption,
   AcpMcpServerSpec,
   AcpUsage,
   InitializeResult,
   SessionNewResult,
+  RequestPermissionParams, RequestPermissionResult,
 } from '../acp/protocol.ts'
 import {
   PROVIDER_ID,
@@ -13,8 +15,6 @@ import {
   type AccountLease,
   type AccountProvider,
   type AcpModelOption,
-  type PendingPermission,
-  type PermissionMode,
   type PluginConfig,
   type SessionSummary,
   type StatusSnapshot,
@@ -45,25 +45,30 @@ export class SingleAccountProvider implements AccountProvider {
 export interface SessionPoolDeps {
   getConfig: () => PluginConfig
   resolveBin: () => string | null
-  onPermission?: PermissionHandler
-  getPendingPermissions?: () => PendingPermission[]
+  readPolicy: (key: string) => SessionPolicy
+  prepareArgv: (argv: string[], policy: FilePolicy, signal?: AbortSignal) => Promise<string[]>
+  onPermission?: (req: RequestPermissionParams, key: string, signal: AbortSignal) => Promise<RequestPermissionResult>
   isMcpBridgeActive?: () => boolean
-  onPermissionModeChange?: (mode: PermissionMode) => void
   onConfigPatch?: (patch: Partial<PluginConfig>) => void | Promise<void>
-  onSessionClosed?: (acpSessionId: string) => void
+  onSessionClosed?: (key: string) => void
   accountProvider?: AccountProvider
-  getMcpServers?: (sessionKey: string) => AcpMcpServerSpec[]
+  getMcpServers?: (sessionKey: string) => Promise<AcpMcpServerSpec[]>
   log?: (msg: string) => void
 }
 
 /**
- * Manages persistent `agy acp` processes (one per active account) and maps DSH session keys
+ * Manages persistent `agy acp` processes (one per DSH session and policy) and maps DSH session keys
  * to long-lived ACP sessions, eliminating per-turn CLI cold starts while supporting
  * multi-account isolation and failover.
  */
 export class AcpSessionPool extends EventEmitter {
   private readonly clients = new Map<string, AcpClient>()
-  private readonly initPromises = new Map<string, Promise<AcpClient>>()
+  private readonly policies = new Map<string, string>()
+  private readonly opening = new Map<string, AbortController>()
+  private readonly active = new Map<string, { controller: AbortController; done: Promise<void>; settle(): void }>()
+  private readonly lifetime = new AbortController()
+  private disposed = false
+  private catalogProbe?: Promise<AcpModelOption[]>
   private initResult: InitializeResult | null = null
   private readonly sessions = new Map<string, ManagedAcpSession>()
   private readonly accountProvider: AccountProvider
@@ -85,10 +90,6 @@ export class AcpSessionPool extends EventEmitter {
       void this.sweepIdleSessions()
     }, 60_000)
     this.sweepTimer.unref?.()
-  }
-
-  getClient(accountId = 'default'): AcpClient | null {
-    return this.clients.get(accountId) ?? this.clients.values().next().value ?? null
   }
 
   notifyStatusChange(): void {
@@ -136,29 +137,8 @@ export class AcpSessionPool extends EventEmitter {
     this.emitStatus()
   }
 
-  async setPermissionMode(mode: PermissionMode): Promise<void> {
-    this.deps.onPermissionModeChange?.(mode)
-    if (mode !== 'skip') {
-      for (const sess of this.sessions.values()) {
-        const client = this.clients.get(sess.accountId)
-        if (client?.isRunning) {
-          await this.syncSessionOptions(client, sess, { mode }).catch(() => undefined)
-        }
-      }
-    }
-    this.emitStatus()
-  }
-
   async updateConfig(patch: Partial<PluginConfig>): Promise<void> {
     await this.deps.onConfigPatch?.(patch)
-    if (patch.permissionMode && patch.permissionMode !== 'skip') {
-      for (const sess of this.sessions.values()) {
-        const client = this.clients.get(sess.accountId)
-        if (client?.isRunning) {
-          await this.syncSessionOptions(client, sess, { mode: patch.permissionMode }).catch(() => undefined)
-        }
-      }
-    }
     this.emitStatus()
   }
 
@@ -185,12 +165,10 @@ export class AcpSessionPool extends EventEmitter {
       tierName: this.cachedTier,
       activeSessions: sessions.length,
       sessions,
-      pendingPermissions: this.deps.getPendingPermissions?.() ?? [],
       mcpBridgeActive: this.deps.isMcpBridgeActive?.() ?? false,
       usageTotals: { ...this.usageTotals },
       accounts: this.getAccountHealthSnapshots(),
       models: this.cachedModels,
-      permissionMode: cfg.permissionMode,
       config: {
         agyBin: cfg.agyBin,
         workspaceRoot: cfg.workspaceRoot,
@@ -205,115 +183,113 @@ export class AcpSessionPool extends EventEmitter {
     }
   }
 
-  async ensureClient(accountId = 'default', env?: NodeJS.ProcessEnv): Promise<AcpClient> {
-    const existing = this.clients.get(accountId)
-    if (existing?.isRunning) return existing
-    const pending = this.initPromises.get(accountId)
-    if (pending) return pending
-
-    const promise = this.startClient(accountId, env).finally(() => {
-      this.initPromises.delete(accountId)
-    })
-    this.initPromises.set(accountId, promise)
-    return promise
+  policy(key: string): SessionPolicy {
+    const p = this.deps.readPolicy(key)
+    if (p.sessionId !== key) throw new Error('DSH permission owner mismatch')
+    return p
   }
 
-  private async startClient(accountId: string, env?: NodeJS.ProcessEnv): Promise<AcpClient> {
-    const cfg = this.deps.getConfig()
+  owns(session: ManagedAcpSession): boolean {
+    return this.sessions.get(session.dshSessionKey) === session
+  }
+
+  activeSignal(key: string): AbortSignal | undefined {
+    const signal = this.active.get(key)?.controller.signal
+    if (!signal || signal.aborted || this.policies.get(key) !== policyKey(this.policy(key))) return undefined
+    return signal
+  }
+
+  beginPrompt(session: ManagedAcpSession, signal?: AbortSignal): { cancel(): void; finish(): void } {
+    const key = session.dshSessionKey
+    if (this.sessions.get(key) !== session || this.active.has(key) || this.policies.get(key) !== policyKey(this.policy(key))) {
+      throw new Error('ACP session policy changed or session is busy; retry the turn')
+    }
+    signal?.throwIfAborted()
+    const ac = new AbortController()
+    const cancel = () => ac.abort()
+    signal?.addEventListener('abort', cancel, { once: true })
+    const { promise: done, resolve: settle } = Promise.withResolvers<void>()
+    this.active.set(key, { controller: ac, done, settle })
+    return { cancel, finish: () => {
+      signal?.removeEventListener('abort', cancel)
+      cancel()
+      settle()
+      if (this.active.get(key)?.controller === ac) this.active.delete(key)
+    } }
+  }
+
+  private async newClient(policy: FilePolicy, env: NodeJS.ProcessEnv | undefined, signal: AbortSignal, onPermission?: (r: RequestPermissionParams) => Promise<RequestPermissionResult>): Promise<AcpClient> {
     const bin = this.deps.resolveBin()
-    if (!bin) {
-      this.lastError = 'agy binary not found'
-      this.emitStatus()
-      throw new Error('agy binary not found — install Antigravity CLI first')
-    }
-
-    const args: string[] = []
-    if (cfg.permissionMode === 'skip') {
-      args.push('--dangerously-skip-permissions')
-    }
-
-    const client = new AcpClient({
-      bin,
-      args,
-      cwd: cfg.workspaceRoot || process.cwd(),
-      env,
-      defaultTimeoutMs: cfg.requestTimeoutMs,
-      onPermission: this.deps.onPermission,
-      onLog: this.deps.log,
-      onExit: (code, signal) => {
-        this.deps.log?.(`agy acp [${accountId}] exited (code=${String(code)}, signal=${String(signal)})`)
-        for (const [key, sess] of this.sessions) {
-          if (sess.accountId === accountId) {
-            this.sessions.delete(key)
-            this.deps.onSessionClosed?.(sess.acpSessionId)
-          }
-        }
-        if (this.clients.get(accountId) === client) {
-          this.clients.delete(accountId)
-        }
-        this.emitStatus()
-      },
-    })
-
-    client.start()
-    const initRes = await client.initialize()
-    this.clients.set(accountId, client)
-    this.initResult = initRes
-    this.lastError = null
-    this.deps.log?.(
-      `connected [${accountId}] to ${initRes.agentInfo?.name ?? 'agy acp'} ${initRes.agentInfo?.version ?? ''}`.trim(),
-    )
-    this.emitStatus()
-    return client
+    if (!bin) throw new Error('agy binary not found — install Antigravity CLI first')
+    const [exe, ...args] = await this.deps.prepareArgv([bin, 'acp'], policy, signal)
+    signal.throwIfAborted()
+    if (!exe || this.disposed) throw new Error('ACP launch unavailable')
+    const client = new AcpClient({ bin: exe, args, env, cwd: policy.workspaceRoot,
+      defaultTimeoutMs: this.deps.getConfig().requestTimeoutMs, onPermission, onLog: this.deps.log })
+    const stop = () => client.dispose()
+    signal.addEventListener('abort', stop, { once: true })
+    try {
+      client.start()
+      this.initResult = await client.initialize()
+      return client
+    } catch (err) { client.dispose(); throw err }
+    finally { signal.removeEventListener('abort', stop) }
   }
 
-  async getOrCreateSession(
-    dshSessionKey: string,
-    cwd: string,
-    model = '',
-    excludeAccountIds?: ReadonlySet<string>,
-  ): Promise<{ client: AcpClient; session: ManagedAcpSession; created: boolean }> {
-    const existing = this.sessions.get(dshSessionKey)
-    if (existing && !excludeAccountIds?.has(existing.accountId)) {
-      const client = this.clients.get(existing.accountId)
-      if (client?.isRunning) {
-        existing.lastActiveAt = Date.now()
-        return { client, session: existing, created: false }
-      }
-      this.sessions.delete(dshSessionKey)
-    } else if (existing && excludeAccountIds?.has(existing.accountId)) {
-      await this.closeSession(dshSessionKey)
+  async getOrCreateSession(key: string, cwd: string, model = '', exclude?: ReadonlySet<string>): Promise<{ client: AcpClient; session: ManagedAcpSession; created: boolean }> {
+    if (this.disposed || this.opening.has(key)) throw new Error('ACP session unavailable or opening')
+    const previous = this.active.get(key)
+    if (previous?.controller.signal.aborted) await previous.done
+    else if (previous) throw new Error('ACP session already has an active turn')
+    const policy = this.policy(key)
+    if (cwd !== policy.workspaceRoot) throw new Error('DSH workspace changed during startup')
+    const fingerprint = policyKey(policy)
+    const existing = this.sessions.get(key)
+    const current = this.clients.get(key)
+    if (existing && current?.isRunning && !exclude?.has(existing.accountId) && this.policies.get(key) === fingerprint) {
+      existing.lastActiveAt = Date.now()
+      return { client: current, session: existing, created: false }
     }
-
-    // Acquire account lease (and optional cross-process credential slot) only across
-    // process startup + session/new authentication, then release immediately.
-    const lease = await this.accountProvider.acquire(dshSessionKey, model, excludeAccountIds)
+    if (existing) this.invalidate(key)
+    const opening = new AbortController()
+    this.opening.set(key, opening)
+    const stopOpening = () => client?.dispose()
+    opening.signal.addEventListener('abort', stopOpening, { once: true })
+    let lease: AccountLease | undefined
+    let client: AcpClient | undefined
     try {
-      const client = await this.ensureClient(lease.accountId, lease.env)
-      const mcpServers = this.deps.getMcpServers?.(dshSessionKey) ?? []
+      lease = await this.accountProvider.acquire(key, model, exclude)
+      opening.signal.throwIfAborted()
+      client = await this.newClient(policy, lease.env, opening.signal, async req => {
+        const signal = this.activeSignal(key)
+        if (!signal || this.clients.get(key) !== client || req.sessionId !== this.sessions.get(key)?.acpSessionId) return cancelled()
+        return await this.deps.onPermission?.(req, key, signal) ?? cancelled()
+      })
+      opening.signal.throwIfAborted()
+      const mcpServers = await this.deps.getMcpServers?.(key) ?? []
+      opening.signal.throwIfAborted()
       const res = await client.sessionNew({ cwd, mcpServers })
+      opening.signal.throwIfAborted()
+      if (policyKey(this.policy(key)) !== fingerprint) throw new Error('DSH session policy changed during startup')
       this.captureCatalogFromSession(res)
-
       const configOptions = res.configOptions ?? []
       const session: ManagedAcpSession = {
-        dshSessionKey,
-        acpSessionId: res.sessionId,
-        accountId: lease.accountId,
-        cwd,
+        dshSessionKey: key, acpSessionId: res.sessionId, accountId: lease.accountId, cwd,
         currentModel: findCurrentOption(configOptions, 'model') ?? res.models?.currentModelId ?? '',
         currentEffort: findCurrentOption(configOptions, 'thought_level') ?? '',
-        currentMode: findCurrentOption(configOptions, 'mode') ?? res.modes?.currentModeId ?? 'default',
-        configOptions,
-        contextUsed: 0,
-        contextSize: 0,
-        lastActiveAt: Date.now(),
+        currentMode: findCurrentOption(configOptions, 'mode') ?? res.modes?.currentModeId ?? '',
+        configOptions, contextUsed: 0, contextSize: 0, lastActiveAt: Date.now(),
       }
-      this.sessions.set(dshSessionKey, session)
+      this.clients.set(key, client)
+      this.sessions.set(key, session)
+      this.policies.set(key, fingerprint)
       this.emitStatus()
       return { client, session, created: true }
-    } finally {
-      lease.release()
-    }
+    } catch (err) {
+      client?.dispose()
+      this.deps.onSessionClosed?.(key)
+      throw err
+    } finally { opening.signal.removeEventListener('abort', stopOpening); this.opening.delete(key); lease?.release() }
   }
 
   async syncSessionOptions(
@@ -354,7 +330,7 @@ export class AcpSessionPool extends EventEmitter {
       }
     }
 
-    if (desired.mode && desired.mode !== 'skip' && desired.mode !== session.currentMode) {
+    if (desired.mode && desired.mode !== session.currentMode) {
       const res = await client.sessionSetConfigOption({
         sessionId: session.acpSessionId,
         configId: 'mode',
@@ -371,40 +347,46 @@ export class AcpSessionPool extends EventEmitter {
 
   async refreshModels(cwd?: string): Promise<AcpModelOption[]> {
     if (this.cachedModels.length > 0) return this.cachedModels
-    const lease = await this.accountProvider.acquire('__catalog__', '')
-    try {
-      const client = await this.ensureClient(lease.accountId, lease.env)
-      const res = await client.sessionNew({
-        cwd: cwd || this.deps.getConfig().workspaceRoot || process.cwd(),
-        mcpServers: [],
-      })
-      this.captureCatalogFromSession(res)
-      await client.sessionClose(res.sessionId).catch(() => undefined)
-      this.emitStatus()
-      return this.cachedModels
-    } finally {
-      lease.release()
-    }
+    if (!this.catalogProbe) this.catalogProbe = this.probeCatalog(cwd).finally(() => { this.catalogProbe = undefined })
+    return this.catalogProbe
   }
 
-  async closeSession(dshSessionKey: string): Promise<void> {
-    const sess = this.sessions.get(dshSessionKey)
-    if (!sess) return
-    this.sessions.delete(dshSessionKey)
-    this.deps.onSessionClosed?.(sess.acpSessionId)
-    const client = this.clients.get(sess.accountId)
-    if (client?.isRunning) {
-      await client.sessionClose(sess.acpSessionId).catch(() => undefined)
-    }
+  private async probeCatalog(cwd?: string): Promise<AcpModelOption[]> {
+    const lease = await this.accountProvider.acquire('__catalog__', '')
+    let client: AcpClient | undefined
+    try {
+      const root = cwd || this.deps.getConfig().workspaceRoot || process.cwd()
+      // No initiating agent: never prompt, attach MCP, or start an unrestricted helper.
+      client = await this.newClient({ sessionId: '__catalog__', workspaceRoot: root, mode: 'read-only' }, lease.env, this.lifetime.signal)
+      this.lifetime.signal.throwIfAborted()
+      const stop = () => client?.dispose()
+      this.lifetime.signal.addEventListener('abort', stop, { once: true })
+      try { this.captureCatalogFromSession(await client.sessionNew({ cwd: root, mcpServers: [] })) }
+      finally { this.lifetime.signal.removeEventListener('abort', stop) }
+      return this.cachedModels
+    } finally { client?.dispose(); lease.release() }
+  }
+
+  invalidate(key: string): void {
+    if (!this.opening.has(key) && !this.sessions.has(key)) return
+    this.opening.get(key)?.abort()
+    this.active.get(key)?.controller.abort()
+    this.active.get(key)?.settle()
+    this.active.delete(key)
+    this.sessions.delete(key)
+    this.policies.delete(key)
+    this.clients.get(key)?.dispose()
+    this.clients.delete(key)
+    this.deps.onSessionClosed?.(key)
     this.emitStatus()
   }
 
+  async closeSession(key: string): Promise<void> { this.invalidate(key) }
+
   async resetAllSessions(): Promise<number> {
-    const keys = Array.from(this.sessions.keys())
-    for (const key of keys) {
-      await this.closeSession(key)
-    }
-    return keys.length
+    const keys = new Set([...this.sessions.keys(), ...this.opening.keys()])
+    for (const key of keys) this.invalidate(key)
+    return keys.size
   }
 
   async sweepIdleSessions(): Promise<void> {
@@ -422,12 +404,9 @@ export class AcpSessionPool extends EventEmitter {
       clearInterval(this.sweepTimer)
       this.sweepTimer = null
     }
-    this.sessions.clear()
-    for (const client of this.clients.values()) {
-      client.dispose()
-    }
-    this.clients.clear()
-    this.initPromises.clear()
+    this.disposed = true
+    this.lifetime.abort()
+    void this.resetAllSessions()
     this.accountProvider.dispose?.()
     this.removeAllListeners()
   }

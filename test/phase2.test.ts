@@ -1,3 +1,4 @@
+import { fakeHost } from './fixtures/session-policy.ts'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
@@ -5,9 +6,8 @@ import type { AddressInfo } from 'node:net'
 import { createInterface } from 'node:readline'
 import test from 'node:test'
 import { resolveConfig } from '../src/common/config.ts'
-import { MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME, type PermissionMode } from '../src/common/types.ts'
+import { MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME } from '../src/common/types.ts'
 import { ReverseMcpBridge } from '../src/mcp/server.ts'
-import { PermissionManager } from '../src/runtime/permission-manager.ts'
 import { AcpSessionPool } from '../src/runtime/session-pool.ts'
 import { registerAcpRoutes, type WebServerLike } from '../src/transport/sse.ts'
 
@@ -83,69 +83,8 @@ test('ReverseMcpBridge + stdio bridge.mjs enforces auth, filters recursive tools
   }
 })
 
-test('PermissionManager handles interactive approvals, always-allow memory, and mode policies', async () => {
-  let mode: PermissionMode = 'default'
-  const pm = new PermissionManager({ getMode: () => mode, timeoutMs: 5_000 })
-
-  const sampleReq = (kind: string, name: string) => ({
-    sessionId: 'sess_1',
-    toolCall: { sessionUpdate: 'tool_call_update' as const, toolCallId: 'tc_1', name, kind, status: 'pending' as const },
-    options: [
-      { optionId: 'allow_once', name: 'Allow Once', kind: 'allow_once' },
-      { optionId: 'allow_always', name: 'Always Allow', kind: 'allow_always' },
-      { optionId: 'reject_once', name: 'Deny', kind: 'reject_once' },
-    ],
-  })
-
-  try {
-    // default mode suspends and waits for decide()
-    const pendingPromise = pm.handleRequest(sampleReq('execute', 'run_command'))
-    assert.equal(pm.listPending().length, 1)
-    const reqId = pm.listPending()[0]!.requestId
-    assert.equal(pm.decide(reqId, { optionId: 'allow_always' }), true)
-    assert.deepEqual(await pendingPromise, { outcome: { outcome: 'selected', optionId: 'allow_always' } })
-    assert.equal(pm.listPending().length, 0)
-
-    // Subsequent call to same tool in same session auto-approves via remembered rule
-    const remembered = await pm.handleRequest(sampleReq('execute', 'run_command'))
-    assert.deepEqual(remembered, { outcome: { outcome: 'selected', optionId: 'allow_once' } })
-
-    // plan mode rejects execute and allows read
-    mode = 'plan'
-    const planDenied = await pm.handleRequest(sampleReq('execute', 'bash'))
-    assert.deepEqual(planDenied, { outcome: { outcome: 'selected', optionId: 'reject_once' } })
-    const planRead = await pm.handleRequest(sampleReq('read', 'read_file'))
-    assert.deepEqual(planRead, { outcome: { outcome: 'selected', optionId: 'allow_once' } })
-
-    // accept-edits auto-allows edit but asks for execute
-    mode = 'accept-edits'
-    pm.clearSessionRules('sess_1')
-    const autoEdit = await pm.handleRequest(sampleReq('edit', 'edit_file'))
-    assert.deepEqual(autoEdit, { outcome: { outcome: 'selected', optionId: 'allow_once' } })
-
-    const askExec = pm.handleRequest(sampleReq('execute', 'run_command'))
-    assert.equal(pm.listPending().length, 1)
-    pm.decide(pm.listPending()[0]!.requestId, { cancel: true })
-    assert.deepEqual(await askExec, { outcome: { outcome: 'cancelled' } })
-  } finally {
-    pm.dispose()
-  }
-})
-
-test('HTTP control routes switch permission mode and decide pending permissions', async () => {
-  let cfg = resolveConfig({ enabled: true, permissionMode: 'default' })
-  const pm = new PermissionManager({ getMode: () => cfg.permissionMode, timeoutMs: 5_000 })
-  const pool = new AcpSessionPool({
-    getConfig: () => cfg,
-    resolveBin: () => null,
-    getPendingPermissions: () => pm.listPending(),
-    isMcpBridgeActive: () => true,
-    onPermissionModeChange: (m) => {
-      cfg = { ...cfg, permissionMode: m }
-    },
-  })
-  pm.on('change', () => pool.notifyStatusChange())
-
+test('HTTP configuration cannot override a DSH session permission or approve ACP requests', async () => {
+  const pool = new AcpSessionPool({ ...fakeHost, getConfig: () => resolveConfig({}), resolveBin: () => null })
   const routes = new Map<string, (req: IncomingMessage, res: ServerResponse) => void | Promise<void>>()
   const webServer: WebServerLike = {
     route(method, routePath, handler) {
@@ -154,7 +93,7 @@ test('HTTP control routes switch permission mode and decide pending permissions'
     },
   }
 
-  const disposeRoutes = registerAcpRoutes(webServer, pool, pm)
+  const disposeRoutes = registerAcpRoutes(webServer, pool)
   const server = createServer((req, res) => {
     const key = `${req.method ?? 'GET'} ${req.url ?? '/'}`
     const handler = routes.get(key)
@@ -170,41 +109,12 @@ test('HTTP control routes switch permission mode and decide pending permissions'
   const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
 
   try {
-    // 1. Check initial status
-    const s1 = (await (await fetch(`${baseUrl}/plugins/agy-acp/status`)).json()) as {
-      permissionMode: string
-      mcpBridgeActive: boolean
-      pendingPermissions: unknown[]
+    const status = await (await fetch(`${baseUrl}/plugins/agy-acp/status`)).json()
+    assert.equal('permissionMode' in status, false)
+    for (const [path, expected] of [['config', 400], ['mode', 404], ['permissions/decide', 404]] as const) {
+      const res = await fetch(`${baseUrl}/plugins/agy-acp/${path}`, { method: 'POST', body: JSON.stringify({ permissionMode: 'skip' }) })
+      assert.equal(res.status, expected)
     }
-    assert.equal(s1.permissionMode, 'default')
-    assert.equal(s1.mcpBridgeActive, true)
-    assert.equal(s1.pendingPermissions.length, 0)
-
-    // 2. Suspend a permission request and approve via HTTP API
-    const permPromise = pm.handleRequest({
-      sessionId: 'sess_http',
-      toolCall: { sessionUpdate: 'tool_call_update', toolCallId: 'tc_9', name: 'run_command', kind: 'execute', status: 'pending' },
-      options: [{ optionId: 'allow_once', name: 'Allow', kind: 'allow_once' }],
-    })
-    const reqId = pm.listPending()[0]!.requestId
-
-    const decideRes = await fetch(`${baseUrl}/plugins/agy-acp/permissions/decide`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ requestId: reqId, optionId: 'allow_once' }),
-    })
-    assert.equal(decideRes.status, 200)
-    assert.deepEqual(await permPromise, { outcome: { outcome: 'selected', optionId: 'allow_once' } })
-
-    // 3. Switch permission mode via HTTP API
-    const modeRes = await fetch(`${baseUrl}/plugins/agy-acp/mode`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: 'plan' }),
-    })
-    assert.equal(modeRes.status, 200)
-    assert.equal(pool.getStatus().permissionMode, 'plan')
-
     // 4. Reset sessions endpoint
     const resetRes = await fetch(`${baseUrl}/plugins/agy-acp/sessions/reset`, {
       method: 'POST',
@@ -215,7 +125,6 @@ test('HTTP control routes switch permission mode and decide pending permissions'
   } finally {
     disposeRoutes()
     await new Promise<void>((resolve) => server.close(() => resolve()))
-    pm.dispose()
     pool.dispose()
   }
 })

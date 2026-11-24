@@ -34,8 +34,8 @@
 
 ### Phase 2 — 工具生态 + 交互式权限 + 前端控制台
 - [x] **会话级反向 MCP 桥接**（`src/mcp/`）：复用本地回环 HTTP + Bearer Token + 零依赖 stdio `bridge.mjs`，通过 `session/new` 的 `mcpServers` 参数动态注入（**不污染全局 `~/.gemini/config/mcp_config.json`**），并屏蔽 `run_code` / `agy_acp_tool` 防递归。
-- [x] **ACP 原生交互式权限审批**：将 `session/request_permission` 回调通过 SSE 推到前端控制台，支持用户在界面上实时点击 Allow / Deny / Always Allow（含会话级记忆与超时兜底）。
-- [x] **前端管理控制台**（`src/client/`）：基于 SSE 扩展顶栏交互控制面板（支持切换权限模式、查看活跃 ACP 会话、一键重置会话、实时查看上下文占用与 Token 用量、实时审批权限）。
+- [x] **会话权限与审批**：`session/request_permission` 仅按发起会话的 DSH 策略处理，需要确认时走宿主审批。受限子进程通过 DSH 沙箱启动，不使用进程级跳过审批参数。
+- [x] **前端管理控制台**（`src/client/`）：通过 SSE 查看连接、会话、上下文和 Token 用量，按需重置会话；权限选择与审批保留在 DSH 对话中。
 
 ### Phase 3 — 多账号池化与高可用（基于 `AccountProvider` 扩展点）
 - [x] 实现多账号池（独立 `HOME` / Keychain 沙箱、单账号独立代理注入）。

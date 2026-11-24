@@ -1,180 +1,58 @@
-import { randomUUID } from 'node:crypto'
-import { EventEmitter } from 'node:events'
-import type {
-  PermissionOption,
-  RequestPermissionParams,
-  RequestPermissionResult,
-} from '../acp/protocol.ts'
-import type { PendingPermission, PermissionMode } from '../common/types.ts'
+import path from 'node:path'
+import type { RequestPermissionParams, RequestPermissionResult } from '../acp/protocol.ts'
 
-interface PendingEntry {
-  info: PendingPermission
-  resolve: (result: RequestPermissionResult) => void
-  timer?: ReturnType<typeof setTimeout>
+export interface FilePolicy {
+  mode: 'read-only' | 'workspace-write' | 'danger-full-access'
+  workspaceRoot: string
+  additionalWritableRoots?: readonly string[]
+  sessionId: string
+}
+export interface SessionPolicy extends FilePolicy {
+  preset: string
+  approval: 'ask' | 'never'
 }
 
-export interface PermissionManagerOptions {
-  getMode: () => PermissionMode
-  /** Auto-cancel unanswered interactive prompts after this many ms (default: 5 min). */
-  timeoutMs?: number
-  log?: (msg: string) => void
+/** Only exact, single-use grants are safe: a later request may see a different DSH policy. */
+export const cancelled = (): RequestPermissionResult => ({ outcome: { outcome: 'cancelled' } })
+
+export function policyKey(policy: SessionPolicy): string {
+  return JSON.stringify([policy.sessionId, policy.mode, policy.workspaceRoot, policy.additionalWritableRoots ?? [], policy.preset, policy.approval])
 }
 
-const MUTATING_KINDS = new Set(['execute', 'edit', 'delete', 'move'])
-const AUTO_ALLOW_IN_ACCEPT_EDITS = new Set(['read', 'search', 'edit', 'fetch'])
-
-function pickOption(options: readonly PermissionOption[], match: 'allow' | 'reject'): PermissionOption | undefined {
-  if (match === 'allow') {
-    return (
-      options.find((o) => o.kind === 'allow_once') ??
-      options.find((o) => o.kind.includes('allow'))
-    )
+function disposition(p: SessionPolicy, req: RequestPermissionParams): 'allow' | 'ask' | 'deny' {
+  const kind = req.toolCall.kind
+  if (p.preset === 'auto') return 'ask' // native ACP calls do not pass through tools/pre-execute
+  if (kind === 'read' || kind === 'search') return 'allow'
+  if (p.mode === 'read-only') return 'deny'
+  if (p.mode === 'danger-full-access' && p.preset === 'danger-full-access' && p.approval === 'never') return 'allow'
+  if (p.mode === 'workspace-write' && p.preset === 'workspace-write' && kind === 'edit') {
+    const roots = [p.workspaceRoot, ...(p.additionalWritableRoots ?? [])]
+    const locations = req.toolCall.locations
+    if (Array.isArray(locations) && locations.length && locations.every(l => typeof l?.path === 'string' && l.path && roots.some(root => {
+      const rel = path.relative(root, path.resolve(p.workspaceRoot, l.path))
+      return !path.isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${path.sep}`)
+    }))) return 'allow' // the process sandbox, not this classification, enforces actual writes
   }
-  return (
-    options.find((o) => o.kind === 'reject_once') ??
-    options.find((o) => o.kind.includes('reject'))
-  )
+  return 'ask'
 }
 
-/**
- * Interactive ACP permission approval manager.
- * - Honors `skip`, `plan`, `accept-edits`, and `default` permission modes.
- * - Suspends `session/request_permission` RPCs until decided via UI/API (SSE push).
- * - Remembers per-session `allow_always` / `reject_always` choices.
- */
-export class PermissionManager extends EventEmitter {
-  private readonly pending = new Map<string, PendingEntry>()
-  private readonly sessionRules = new Map<string, Map<string, 'allow' | 'reject'>>()
-  private readonly timeoutMs: number
-
-  constructor(private readonly opts: PermissionManagerOptions) {
-    super()
-    this.timeoutMs = opts.timeoutMs ?? 5 * 60_000
-  }
-
-  listPending(): PendingPermission[] {
-    return Array.from(this.pending.values(), (e) => e.info)
-  }
-
-  async handleRequest(req: RequestPermissionParams): Promise<RequestPermissionResult> {
-    const mode = this.opts.getMode()
-    const toolName = req.toolCall.name ?? 'tool'
-    const kind = req.toolCall.kind ?? 'other'
-    const allowOpt = pickOption(req.options, 'allow')
-    const rejectOpt = pickOption(req.options, 'reject')
-
-    // 1. `skip` mode auto-approves everything
-    if (mode === 'skip') {
-      return allowOpt
-        ? { outcome: { outcome: 'selected', optionId: allowOpt.optionId } }
-        : { outcome: { outcome: 'cancelled' } }
+export async function decidePermission(req: RequestPermissionParams, readPolicy: () => SessionPolicy,
+  ask: (reason: string) => Promise<string>, signal: AbortSignal): Promise<RequestPermissionResult> {
+  try {
+    const p = readPolicy()
+    const allow = req.options.find(o => o.kind === 'allow_once')
+    const reject = req.options.find(o => o.kind === 'reject_once')
+    const denied = (): RequestPermissionResult => reject ? { outcome: { outcome: 'selected', optionId: reject.optionId } } : cancelled()
+    if (signal.aborted || !allow) return denied()
+    const action = disposition(p, req)
+    if (action === 'deny') return denied()
+    if (action === 'ask') {
+      if (p.approval !== 'ask') return denied()
+      const details = JSON.stringify({ title: req.toolCall.title, kind: req.toolCall.kind, input: req.toolCall.rawInput ?? req.toolCall.args, locations: req.toolCall.locations })
+      // Never approve an operation from a misleading truncated preview.
+      if (details.length > 8192 || await ask(`Antigravity 请求执行 ${req.toolCall.name ?? '工具'}：${details}`) !== 'allowed-once') return denied()
     }
-
-    // 2. `plan` mode denies mutating/executing tools, allows read-only
-    if (mode === 'plan') {
-      if (MUTATING_KINDS.has(kind)) {
-        return rejectOpt
-          ? { outcome: { outcome: 'selected', optionId: rejectOpt.optionId } }
-          : { outcome: { outcome: 'cancelled' } }
-      }
-      return allowOpt
-        ? { outcome: { outcome: 'selected', optionId: allowOpt.optionId } }
-        : { outcome: { outcome: 'cancelled' } }
-    }
-
-    // 3. Session-scoped remembered rule (`allow_always` / `reject_always`)
-    const remembered = this.sessionRules.get(req.sessionId)?.get(toolName)
-    if (remembered === 'allow' && allowOpt) {
-      return { outcome: { outcome: 'selected', optionId: allowOpt.optionId } }
-    }
-    if (remembered === 'reject') {
-      return rejectOpt
-        ? { outcome: { outcome: 'selected', optionId: rejectOpt.optionId } }
-        : { outcome: { outcome: 'cancelled' } }
-    }
-
-    // 4. `accept-edits` auto-approves non-destructive reads/searches/edits, asks for shell execution
-    if (mode === 'accept-edits' && AUTO_ALLOW_IN_ACCEPT_EDITS.has(kind)) {
-      return allowOpt
-        ? { outcome: { outcome: 'selected', optionId: allowOpt.optionId } }
-        : { outcome: { outcome: 'cancelled' } }
-    }
-
-    // 5. Suspend and broadcast to SSE clients for interactive approval
-    const requestId = randomUUID().slice(0, 12)
-    const info: PendingPermission = {
-      requestId,
-      sessionId: req.sessionId,
-      toolCallId: req.toolCall.toolCallId,
-      toolName,
-      ...(req.toolCall.title ? { title: req.toolCall.title } : {}),
-      ...(req.toolCall.kind ? { kind: req.toolCall.kind } : {}),
-      ...(req.toolCall.rawInput !== undefined ? { rawInput: req.toolCall.rawInput } : {}),
-      options: req.options.map((o) => ({ optionId: o.optionId, name: o.name, kind: o.kind })),
-      createdAt: Date.now(),
-    }
-
-    this.opts.log?.(`awaiting interactive permission (${requestId}): ${toolName}`)
-
-    return new Promise<RequestPermissionResult>((resolve) => {
-      const entry: PendingEntry = { info, resolve }
-      if (this.timeoutMs > 0) {
-        entry.timer = setTimeout(() => {
-          if (!this.pending.has(requestId)) return
-          this.pending.delete(requestId)
-          this.opts.log?.(`permission request ${requestId} timed out, cancelling`)
-          this.emit('change')
-          resolve({ outcome: { outcome: 'cancelled' } })
-        }, this.timeoutMs)
-        entry.timer.unref?.()
-      }
-      this.pending.set(requestId, entry)
-      this.emit('change')
-    })
-  }
-
-  decide(requestId: string, decision: { optionId?: string; cancel?: boolean }): boolean {
-    const entry = this.pending.get(requestId)
-    if (!entry) return false
-    if (entry.timer) clearTimeout(entry.timer)
-    this.pending.delete(requestId)
-
-    if (decision.cancel || !decision.optionId) {
-      this.emit('change')
-      entry.resolve({ outcome: { outcome: 'cancelled' } })
-      return true
-    }
-
-    const chosen = entry.info.options.find((o) => o.optionId === decision.optionId)
-    if (chosen && (chosen.kind === 'allow_always' || chosen.kind === 'reject_always')) {
-      let rules = this.sessionRules.get(entry.info.sessionId)
-      if (!rules) {
-        rules = new Map()
-        this.sessionRules.set(entry.info.sessionId, rules)
-      }
-      rules.set(entry.info.toolName, chosen.kind === 'allow_always' ? 'allow' : 'reject')
-    }
-
-    this.emit('change')
-    entry.resolve({ outcome: { outcome: 'selected', optionId: decision.optionId } })
-    return true
-  }
-
-  clearSessionRules(sessionId?: string): void {
-    if (sessionId) {
-      this.sessionRules.delete(sessionId)
-    } else {
-      this.sessionRules.clear()
-    }
-  }
-
-  dispose(): void {
-    for (const [id, entry] of this.pending) {
-      if (entry.timer) clearTimeout(entry.timer)
-      this.pending.delete(id)
-      entry.resolve({ outcome: { outcome: 'cancelled' } })
-    }
-    this.sessionRules.clear()
-    this.removeAllListeners()
-  }
+    return !signal.aborted && policyKey(readPolicy()) === policyKey(p)
+      ? { outcome: { outcome: 'selected', optionId: allow.optionId } } : denied()
+  } catch { return cancelled() }
 }

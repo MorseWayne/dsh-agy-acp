@@ -14,12 +14,12 @@ import { AcpRunStore, decodeMirrorCallId, encodeMirrorCallId } from '../src/prov
 test('resolveConfig applies defaults and parses env-style strings', () => {
   const cfg = resolveConfig({ enabled: 'false', permissionMode: 'plan', mcpBridge: '1' })
   assert.equal(cfg.enabled, false)
-  assert.equal(cfg.permissionMode, 'plan')
+  assert.equal('permissionMode' in cfg, false)
   assert.equal(cfg.mcpBridge, true)
 
   const fallback = resolveConfig({ permissionMode: 'invalid-mode' })
   assert.equal(fallback.enabled, true)
-  assert.equal(fallback.permissionMode, 'accept-edits')
+  assert.equal('permissionMode' in fallback, false)
 })
 
 test('encodeMirrorCallId / decodeMirrorCallId round-trip', () => {

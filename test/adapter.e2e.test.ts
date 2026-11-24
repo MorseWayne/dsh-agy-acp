@@ -1,3 +1,4 @@
+import { fakeHost } from './fixtures/session-policy.ts'
 import assert from 'node:assert/strict'
 import { chmodSync } from 'node:fs'
 import path from 'node:path'
@@ -27,12 +28,12 @@ async function collectChunks(iterable: AsyncIterable<StreamChunk>): Promise<Stre
 function createHarness() {
   const cfg = resolveConfig({
     enabled: true,
-    permissionMode: 'accept-edits',
     requestTimeoutMs: 10_000,
   })
   const permissionLog: string[] = []
   const runs = new AcpRunStore()
   const pool = new AcpSessionPool({
+    ...fakeHost,
     getConfig: () => cfg,
     resolveBin: () => FAKE_AGY_BIN,
     onPermission: async (req) => {
@@ -148,7 +149,8 @@ test('AcpAdapter.stream() splits span on tool call, replays via agy_acp_tool, an
       cwd: '/tmp',
     })
 
-    const value = (await mirrorTool.execute(parsedArgs, {} as ToolRunContext)) as Record<string, unknown>
+    await assert.rejects(mirrorTool.execute(parsedArgs, {} as ToolRunContext), /another DSH session/)
+    const value = (await mirrorTool.execute(parsedArgs, { agent: { session: { id: 'dsh-tool-conv' } } } as ToolRunContext)) as Record<string, unknown>
     const rendered = mirrorTool.output.render(parsedArgs, value as never)
     const meta = mirrorTool.output.presentationMeta?.(parsedArgs, value as never)
     const resultView = mirrorTool.presentResult?.(parsedArgs, {

@@ -145,6 +145,7 @@ export interface AcpToolCallUpdate {
   status?: 'pending' | 'in_progress' | 'completed' | 'failed'
   kind?: string
   title?: string
+  locations?: Array<{ path: string }>
   rawInput?: unknown
   rawOutput?: unknown
   content?: Array<{ type: string; content?: { type: string; text?: string } }>

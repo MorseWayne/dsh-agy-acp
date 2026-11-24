@@ -5,8 +5,6 @@ import React from 'react'
 import ReactDOM from 'react-dom'
 import type {
   AccountHealthSnapshot,
-  PendingPermission,
-  PermissionMode,
   SessionSummary,
   StatusSnapshot,
 } from '../common/types.ts'
@@ -28,27 +26,10 @@ interface ClientContext extends Context {
   }
 }
 
-const MODES: Array<{ id: PermissionMode; label: string; desc: string }> = [
-  { id: 'accept-edits', label: 'Accept Edits', desc: '自动允许读写编辑，执行命令时弹窗审批' },
-  { id: 'default', label: 'Ask All', desc: '所有敏感操作均需手动审批' },
-  { id: 'plan', label: 'Plan Only', desc: '只读规划模式，拒绝修改与执行命令' },
-  { id: 'skip', label: 'Auto Skip', desc: '全自动跳过审批（需重启子进程生效）' },
-]
-
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
   return String(n)
-}
-
-function summarizeInput(raw: unknown): string {
-  if (raw === undefined || raw === null) return ''
-  try {
-    const s = typeof raw === 'string' ? raw : JSON.stringify(raw)
-    return s.length > 200 ? s.slice(0, 200) + '…' : s
-  } catch {
-    return String(raw)
-  }
 }
 
 async function postJson(url: string, body: Record<string, unknown>): Promise<StatusSnapshot | null> {
@@ -66,7 +47,7 @@ async function postJson(url: string, body: Record<string, unknown>): Promise<Sta
   }
 }
 
-function useAgyAcpStatus(onPending?: () => void): StatusSnapshot | null {
+function useAgyAcpStatus(): StatusSnapshot | null {
   const [status, setStatus] = React.useState(null as StatusSnapshot | null)
 
   React.useEffect(() => {
@@ -83,9 +64,6 @@ function useAgyAcpStatus(onPending?: () => void): StatusSnapshot | null {
       try {
         const next = JSON.parse(ev.data) as StatusSnapshot
         setStatus(next)
-        if (next.pendingPermissions.length > 0) {
-          onPending?.()
-        }
       } catch {
         // ignore malformed frame
       }
@@ -101,116 +79,12 @@ function useAgyAcpStatus(onPending?: () => void): StatusSnapshot | null {
   return status
 }
 
-function renderPendingPermissions(
-  pending: PendingPermission[],
-  busy: boolean,
-  onDecide: (requestId: string, optionId?: string, cancel?: boolean) => Promise<void>,
-): unknown {
-  if (pending.length === 0) return null
-  return React.createElement(
-    'div',
-    {
-      style: {
-        marginBottom: '12px',
-        padding: '10px',
-        borderRadius: '8px',
-        border: '1px solid rgba(245, 158, 11, 0.5)',
-        backgroundColor: 'rgba(245, 158, 11, 0.1)',
-      },
-    },
-    React.createElement(
-      'div',
-      { style: { fontWeight: 600, marginBottom: '6px', color: '#f59e0b' } },
-      `待审批权限请求 (${pending.length})`,
-    ),
-    ...pending.map((p) =>
-      React.createElement(
-        'div',
-        {
-          key: p.requestId,
-          style: {
-            padding: '8px',
-            borderRadius: '6px',
-            backgroundColor: 'rgba(0, 0, 0, 0.16)',
-            marginBottom: '6px',
-          },
-        },
-        React.createElement(
-          'div',
-          { style: { fontWeight: 600 } },
-          p.title ? `${p.toolName} — ${p.title}` : p.toolName,
-        ),
-        p.rawInput !== undefined
-          ? React.createElement(
-              'div',
-              {
-                style: {
-                  fontFamily: 'monospace',
-                  fontSize: '11px',
-                  opacity: 0.85,
-                  marginTop: '4px',
-                  wordBreak: 'break-all',
-                },
-              },
-              summarizeInput(p.rawInput),
-            )
-          : null,
-        React.createElement(
-          'div',
-          { style: { display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '8px' } },
-          ...p.options.map((opt) =>
-            React.createElement(
-              'button',
-              {
-                key: opt.optionId,
-                type: 'button',
-                disabled: busy,
-                onClick: () => void onDecide(p.requestId, opt.optionId),
-                style: {
-                  padding: '4px 10px',
-                  borderRadius: '5px',
-                  border: 'none',
-                  cursor: 'pointer',
-                  fontSize: '12px',
-                  fontWeight: 500,
-                  backgroundColor: opt.kind.includes('allow') ? '#16a34a' : '#dc2626',
-                  color: '#fff',
-                },
-              },
-              opt.name,
-            ),
-          ),
-          React.createElement(
-            'button',
-            {
-              type: 'button',
-              disabled: busy,
-              onClick: () => void onDecide(p.requestId, undefined, true),
-              style: {
-                padding: '4px 10px',
-                borderRadius: '5px',
-                border: '1px solid rgba(148,163,184,0.4)',
-                background: 'transparent',
-                color: 'inherit',
-                cursor: 'pointer',
-                fontSize: '12px',
-              },
-            },
-            '取消',
-          ),
-        ),
-      ),
-    ),
-  )
-}
-
 /** Full Settings & Plugin Configuration page (`settings.section`, `plugins.bundle.config`, `plugins.row.config`). */
 function AgyAcpSettingsSection(): unknown {
   const status = useAgyAcpStatus()
   const [busy, setBusy] = React.useState(false)
   const [savedMsg, setSavedMsg] = React.useState('')
 
-  const [permissionMode, setPermissionMode] = React.useState('accept-edits' as PermissionMode)
   const [mcpBridge, setMcpBridge] = React.useState(false)
   const [defaultModel, setDefaultModel] = React.useState('')
   const [defaultEffort, setDefaultEffort] = React.useState('')
@@ -221,7 +95,6 @@ function AgyAcpSettingsSection(): unknown {
   React.useEffect(() => {
     if (!status || initializedRef.current) return
     initializedRef.current = true
-    setPermissionMode(status.permissionMode)
     setMcpBridge(Boolean(status.config?.mcpBridge))
     setDefaultModel(status.config?.defaultModel ?? '')
     setDefaultEffort(status.config?.defaultEffort ?? '')
@@ -230,7 +103,6 @@ function AgyAcpSettingsSection(): unknown {
   }, [status])
 
   const connected = Boolean(status?.connected)
-  const pending = status?.pendingPermissions ?? []
   const sessions = status?.sessions ?? []
   const accounts = status?.accounts ?? []
   const totals = status?.usageTotals ?? {
@@ -245,7 +117,6 @@ function AgyAcpSettingsSection(): unknown {
     setSavedMsg('')
     try {
       await postJson('/plugins/agy-acp/config', {
-        permissionMode,
         mcpBridge,
         defaultModel,
         defaultEffort,
@@ -263,23 +134,6 @@ function AgyAcpSettingsSection(): unknown {
     setBusy(true)
     try {
       await postJson('/plugins/agy-acp/sessions/reset', sessionKey ? { sessionKey } : {})
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const handleDecidePermission = async (
-    requestId: string,
-    optionId?: string,
-    cancel?: boolean,
-  ): Promise<void> => {
-    setBusy(true)
-    try {
-      await postJson('/plugins/agy-acp/permissions/decide', {
-        requestId,
-        ...(optionId ? { optionId } : {}),
-        ...(cancel ? { cancel: true } : {}),
-      })
     } finally {
       setBusy(false)
     }
@@ -357,9 +211,6 @@ function AgyAcpSettingsSection(): unknown {
       ),
     ),
 
-    // Pending approvals
-    renderPendingPermissions(pending, busy, handleDecidePermission),
-
     // Usage overview card
     React.createElement(
       'div',
@@ -382,36 +233,7 @@ function AgyAcpSettingsSection(): unknown {
       { style: cardStyle },
       React.createElement('div', { style: { fontWeight: 600, marginBottom: '10px' } }, '桥接配置'),
 
-      // Permission mode
-      React.createElement('div', { style: { marginBottom: '12px' } },
-        React.createElement('div', { style: { fontWeight: 500, marginBottom: '6px' } }, '权限审批模式'),
-        React.createElement(
-          'div',
-          { style: { display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '8px' } },
-          ...MODES.map((m) => {
-            const active = permissionMode === m.id
-            return React.createElement(
-              'button',
-              {
-                key: m.id,
-                type: 'button',
-                onClick: () => setPermissionMode(m.id),
-                style: {
-                  textAlign: 'left',
-                  padding: '8px 10px',
-                  borderRadius: '8px',
-                  border: `1px solid ${active ? '#3b82f6' : 'rgba(148,163,184,0.3)'}`,
-                  backgroundColor: active ? 'rgba(59, 130, 246, 0.16)' : 'transparent',
-                  color: 'inherit',
-                  cursor: 'pointer',
-                },
-              },
-              React.createElement('div', { style: { fontWeight: 600, fontSize: '12px' } }, m.label),
-              React.createElement('div', { style: { opacity: 0.72, fontSize: '11px', marginTop: '2px' } }, m.desc),
-            )
-          }),
-        ),
-      ),
+      React.createElement('p', null, '权限跟随当前 DSH 会话，需要确认时请在对应对话中处理。若 agy 不支持原生自动审查，将改为询问，不会自动同意。'),
 
       // Reverse MCP bridge toggle
       React.createElement(
@@ -489,11 +311,11 @@ function AgyAcpSettingsSection(): unknown {
         React.createElement(
           'div',
           null,
-          React.createElement('div', { style: { fontSize: '12px', opacity: 0.8, marginBottom: '4px' } }, '工作区根目录（留空跟随会话）'),
+          React.createElement('div', { style: { fontSize: '12px', opacity: 0.8, marginBottom: '4px' } }, '模型探测目录（不改变会话工作区）'),
           React.createElement('input', {
             type: 'text',
             value: workspaceRoot,
-            placeholder: '留空使用当前会话目录',
+            placeholder: '留空使用默认探测目录',
             onChange: (e: { target: { value: string } }) => setWorkspaceRoot(e.target.value),
             style: inputStyle,
           }),
@@ -694,7 +516,7 @@ function portalToBody(node: unknown): unknown {
 /** Compact header badge + body-portaled console modal (`conversation.session.header.actions`). */
 function AgyAcpConsoleWidget(): unknown {
   const [open, setOpen] = React.useState(false)
-  const status = useAgyAcpStatus(() => setOpen(true))
+  const status = useAgyAcpStatus()
 
   React.useEffect(() => {
     if (!open || typeof window === 'undefined') return
@@ -706,17 +528,10 @@ function AgyAcpConsoleWidget(): unknown {
   }, [open])
 
   const connected = Boolean(status?.connected)
-  const pending = status?.pendingPermissions ?? []
   const sessions = status?.sessions ?? []
 
-  const badgeLabel =
-    pending.length > 0
-      ? `AGY·ACP (${pending.length} 待审批)`
-      : connected
-        ? `AGY·ACP (${sessions.length})`
-        : 'AGY·ACP'
-
-  const dotColor = pending.length > 0 ? '#f59e0b' : connected ? '#22c55e' : '#94a3b8'
+  const badgeLabel = connected ? `AGY·ACP (${sessions.length})` : 'AGY·ACP'
+  const dotColor = connected ? '#22c55e' : '#94a3b8'
 
   const modal = open
     ? portalToBody(
@@ -807,11 +622,11 @@ function AgyAcpConsoleWidget(): unknown {
           borderRadius: '999px',
           fontSize: '12px',
           fontWeight: 500,
-          border: `1px solid ${pending.length > 0 ? '#f59e0b' : 'currentColor'}`,
+          border: '1px solid currentColor',
           background: 'transparent',
           color: 'inherit',
           cursor: 'pointer',
-          opacity: connected || pending.length > 0 ? 0.95 : 0.75,
+          opacity: connected ? 0.95 : 0.75,
         },
       },
       React.createElement('span', {
