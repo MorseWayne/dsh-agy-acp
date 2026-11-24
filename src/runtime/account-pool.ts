@@ -1,0 +1,326 @@
+import { EventEmitter } from 'node:events'
+import path from 'node:path'
+import type {
+  AccountHealthSnapshot,
+  AccountLease,
+  AccountProfileConfig,
+  AccountProvider,
+  FamilyQuotaState,
+  ModelFamily,
+  QuotaBucketState,
+} from '../common/types.ts'
+import type { CredentialSlotLeaseManager } from './credential-lease.ts'
+
+export function classifyModelFamily(model: string): ModelFamily {
+  const m = model.trim().toLowerCase()
+  if (!m) return 'other'
+  if (m.includes('claude') || m.includes('opus') || m.includes('sonnet') || m.includes('haiku')) {
+    return 'claude'
+  }
+  if (m.includes('flash')) {
+    return 'gemini-flash'
+  }
+  if (m.includes('gemini') || m.includes('neon') || m.includes('carbon') || m.includes('hydrogen') || m.includes('pro')) {
+    return 'gemini-pro'
+  }
+  return 'other'
+}
+
+export function isQuotaOrRateLimitError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error ?? '')
+  const lower = msg.toLowerCase()
+  return (
+    lower.includes('429') ||
+    lower.includes('resource_exhausted') ||
+    lower.includes('rate limit') ||
+    lower.includes('ratelimit') ||
+    lower.includes('too many requests') ||
+    lower.includes('quota') ||
+    lower.includes('limit exceeded') ||
+    lower.includes('overloaded')
+  )
+}
+
+interface InternalAccountState {
+  profile: AccountProfileConfig
+  activeLeases: number
+  families: Map<ModelFamily, FamilyQuotaState>
+  lastError: string | null
+  lastUsedAt: number | null
+}
+
+export interface MultiAccountPoolOptions {
+  accounts: AccountProfileConfig[]
+  slotManager?: CredentialSlotLeaseManager
+  baseCooldownMs?: number
+  maxCooldownMs?: number
+  now?: () => number
+  log?: (msg: string) => void
+}
+
+function buildAccountEnv(profile: AccountProfileConfig): NodeJS.ProcessEnv | undefined {
+  const env: NodeJS.ProcessEnv = { ...process.env }
+  let modified = false
+
+  if (profile.homeDir) {
+    const absHome = path.resolve(profile.homeDir)
+    env.HOME = absHome
+    env.USERPROFILE = absHome
+    env.XDG_CONFIG_HOME = path.join(absHome, '.config')
+    env.XDG_DATA_HOME = path.join(absHome, '.local', 'share')
+    env.XDG_CACHE_HOME = path.join(absHome, '.cache')
+    modified = true
+  }
+
+  if (profile.proxyUrl) {
+    env.HTTPS_PROXY = profile.proxyUrl
+    env.HTTP_PROXY = profile.proxyUrl
+    env.ALL_PROXY = profile.proxyUrl
+    env.https_proxy = profile.proxyUrl
+    env.http_proxy = profile.proxyUrl
+    env.all_proxy = profile.proxyUrl
+    modified = true
+  }
+
+  if (profile.env) {
+    for (const [k, v] of Object.entries(profile.env)) {
+      env[k] = v
+      modified = true
+    }
+  }
+
+  return modified ? env : undefined
+}
+
+/**
+ * Phase 3 multi-account pool implementing `AccountProvider`.
+ *
+ * Features:
+ * - Per-account isolated `HOME` / `XDG_*` sandbox & independent proxy injection
+ * - Optional cross-process credential slot lease (`CredentialSlotLeaseManager`)
+ * - Dual-bucket quota tracking (5h rolling + 7d weekly) per model family
+ * - Independent per-model-family cooldown & automatic 429/exhaustion failover
+ * - Session-sticky account preference to preserve prompt cache hit rates
+ */
+export class MultiAccountPool extends EventEmitter implements AccountProvider {
+  private readonly accounts = new Map<string, InternalAccountState>()
+  private readonly sessionSticky = new Map<string, string>()
+  private readonly baseCooldownMs: number
+  private readonly maxCooldownMs: number
+  private readonly now: () => number
+
+  constructor(private readonly opts: MultiAccountPoolOptions) {
+    super()
+    this.baseCooldownMs = opts.baseCooldownMs ?? 30_000
+    this.maxCooldownMs = opts.maxCooldownMs ?? 15 * 60_000
+    this.now = opts.now ?? (() => Date.now())
+
+    for (const profile of opts.accounts) {
+      this.accounts.set(profile.id, {
+        profile,
+        activeLeases: 0,
+        families: new Map(),
+        lastError: null,
+        lastUsedAt: null,
+      })
+    }
+  }
+
+  updateQuota(
+    accountId: string,
+    family: ModelFamily,
+    buckets: { fiveHour?: QuotaBucketState; sevenDay?: QuotaBucketState },
+  ): void {
+    const acc = this.accounts.get(accountId)
+    if (!acc) return
+    const state = this.getOrCreateFamily(acc, family)
+    if (buckets.fiveHour) state.fiveHour = buckets.fiveHour
+    if (buckets.sevenDay) state.sevenDay = buckets.sevenDay
+    this.emit('change')
+  }
+
+  async acquire(
+    sessionKey: string,
+    model: string,
+    excludeAccountIds?: ReadonlySet<string>,
+  ): Promise<AccountLease> {
+    const family = classifyModelFamily(model)
+    const now = this.now()
+
+    const candidates: InternalAccountState[] = []
+    let earliestReset = Number.POSITIVE_INFINITY
+
+    for (const acc of this.accounts.values()) {
+      if (acc.profile.enabled === false) continue
+      if (excludeAccountIds?.has(acc.profile.id)) continue
+      const blockedUntil = this.getBlockedUntil(acc, family, now)
+      if (blockedUntil !== null) {
+        if (blockedUntil < earliestReset) earliestReset = blockedUntil
+        continue
+      }
+      candidates.push(acc)
+    }
+
+    if (candidates.length === 0) {
+      const waitHint = Number.isFinite(earliestReset)
+        ? ` (earliest recovery in ${Math.max(1, Math.ceil((earliestReset - now) / 1000))}s)`
+        : ''
+      throw new Error(`No healthy accounts available for model family "${family}"${waitHint}`)
+    }
+
+    // Prefer sticky account for this session if still healthy
+    const stickyId = this.sessionSticky.get(sessionKey)
+    let chosen = stickyId ? candidates.find((c) => c.profile.id === stickyId) : undefined
+
+    if (!chosen) {
+      candidates.sort((a, b) => {
+        const qa = this.effectiveRemainingQuota(a, family, now)
+        const qb = this.effectiveRemainingQuota(b, family, now)
+        if (Math.abs(qb - qa) > 0.05) return qb - qa
+        if (a.activeLeases !== b.activeLeases) return a.activeLeases - b.activeLeases
+        return (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0)
+      })
+      chosen = candidates[0]!
+    }
+
+    const slotHandle = this.opts.slotManager ? await this.opts.slotManager.acquire(chosen.profile.id) : null
+    chosen.activeLeases += 1
+    chosen.lastUsedAt = now
+    this.sessionSticky.set(sessionKey, chosen.profile.id)
+    this.emit('change')
+
+    let released = false
+    const accountId = chosen.profile.id
+    return {
+      accountId,
+      env: buildAccountEnv(chosen.profile),
+      release: () => {
+        if (released) return
+        released = true
+        chosen!.activeLeases = Math.max(0, chosen!.activeLeases - 1)
+        slotHandle?.release()
+        this.emit('change')
+      },
+    }
+  }
+
+  reportSuccess(accountId: string, model: string): void {
+    const acc = this.accounts.get(accountId)
+    if (!acc) return
+    const family = classifyModelFamily(model)
+    const state = this.getOrCreateFamily(acc, family)
+    state.consecutiveFailures = 0
+    state.cooldownUntil = undefined
+    acc.lastError = null
+    this.emit('change')
+  }
+
+  reportFailure(accountId: string, model: string, error: unknown): void {
+    const acc = this.accounts.get(accountId)
+    if (!acc) return
+    const family = classifyModelFamily(model)
+    const state = this.getOrCreateFamily(acc, family)
+    const message = error instanceof Error ? error.message : String(error)
+    acc.lastError = message
+    state.consecutiveFailures += 1
+
+    if (isQuotaOrRateLimitError(error)) {
+      const backoff = Math.min(
+        this.maxCooldownMs,
+        this.baseCooldownMs * 2 ** Math.min(state.consecutiveFailures - 1, 6),
+      )
+      state.cooldownUntil = this.now() + backoff
+      this.opts.log?.(
+        `account "${accountId}" entered ${Math.round(backoff / 1000)}s cooldown for family "${family}": ${message}`,
+      )
+    }
+    this.emit('change')
+  }
+
+  clearCooldown(accountId?: string): void {
+    for (const acc of this.accounts.values()) {
+      if (accountId && acc.profile.id !== accountId) continue
+      acc.lastError = null
+      for (const state of acc.families.values()) {
+        state.cooldownUntil = undefined
+        state.consecutiveFailures = 0
+      }
+    }
+    this.emit('change')
+  }
+
+  getHealthSnapshots(): AccountHealthSnapshot[] {
+    const list: AccountHealthSnapshot[] = []
+    for (const acc of this.accounts.values()) {
+      const families: Partial<Record<ModelFamily, FamilyQuotaState>> = {}
+      for (const [fam, st] of acc.families) {
+        families[fam] = {
+          ...(st.fiveHour ? { fiveHour: { ...st.fiveHour } } : {}),
+          ...(st.sevenDay ? { sevenDay: { ...st.sevenDay } } : {}),
+          ...(st.cooldownUntil !== undefined ? { cooldownUntil: st.cooldownUntil } : {}),
+          consecutiveFailures: st.consecutiveFailures,
+        }
+      }
+      list.push({
+        id: acc.profile.id,
+        label: acc.profile.label ?? acc.profile.id,
+        enabled: acc.profile.enabled !== false,
+        hasSandboxHome: Boolean(acc.profile.homeDir),
+        hasProxy: Boolean(acc.profile.proxyUrl),
+        activeLeases: acc.activeLeases,
+        families,
+        lastError: acc.lastError,
+        lastUsedAt: acc.lastUsedAt,
+      })
+    }
+    return list
+  }
+
+  dispose(): void {
+    this.sessionSticky.clear()
+    this.removeAllListeners()
+  }
+
+  private getOrCreateFamily(acc: InternalAccountState, family: ModelFamily): FamilyQuotaState {
+    let st = acc.families.get(family)
+    if (!st) {
+      st = { consecutiveFailures: 0 }
+      acc.families.set(family, st)
+    }
+    return st
+  }
+
+  private getBlockedUntil(acc: InternalAccountState, family: ModelFamily, now: number): number | null {
+    const st = acc.families.get(family)
+    if (!st) return null
+
+    if (st.cooldownUntil !== undefined && st.cooldownUntil > now) {
+      return st.cooldownUntil
+    }
+    if (st.fiveHour && st.fiveHour.remainingFraction <= 0) {
+      if (!st.fiveHour.resetAt || st.fiveHour.resetAt > now) {
+        return st.fiveHour.resetAt ?? now + this.baseCooldownMs
+      }
+    }
+    if (st.sevenDay && st.sevenDay.remainingFraction <= 0) {
+      if (!st.sevenDay.resetAt || st.sevenDay.resetAt > now) {
+        return st.sevenDay.resetAt ?? now + this.maxCooldownMs
+      }
+    }
+    return null
+  }
+
+  private effectiveRemainingQuota(acc: InternalAccountState, family: ModelFamily, now: number): number {
+    const st = acc.families.get(family)
+    if (!st) return 1
+    const five =
+      st.fiveHour && (!st.fiveHour.resetAt || st.fiveHour.resetAt > now)
+        ? st.fiveHour.remainingFraction
+        : 1
+    const seven =
+      st.sevenDay && (!st.sevenDay.resetAt || st.sevenDay.resetAt > now)
+        ? st.sevenDay.remainingFraction
+        : 1
+    return Math.min(five, seven)
+  }
+}

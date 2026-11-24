@@ -71,8 +71,9 @@
   "scripts": {
     "build": "tsdown",
     "check": "tsc --noEmit",
+    "lint:arch": "node scripts/lint-arch.mjs",
     "test": "node --experimental-transform-types --test \"test/**/*.test.ts\"",
-    "verify": "pnpm run check && pnpm run build && pnpm test"
+    "verify": "pnpm run lint:arch && pnpm run check && pnpm run build && pnpm test"
   },
   "engines": {
     "node": ">=24.0.0"

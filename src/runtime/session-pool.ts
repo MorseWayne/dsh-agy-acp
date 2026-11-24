@@ -9,6 +9,7 @@ import type {
 } from '../acp/protocol.ts'
 import {
   PROVIDER_ID,
+  type AccountHealthSnapshot,
   type AccountLease,
   type AccountProvider,
   type AcpModelOption,
@@ -23,6 +24,7 @@ import {
 export interface ManagedAcpSession {
   dshSessionKey: string
   acpSessionId: string
+  accountId: string
   cwd: string
   currentModel: string
   currentEffort: string
@@ -33,7 +35,7 @@ export interface ManagedAcpSession {
   lastActiveAt: number
 }
 
-/** Phase 1/2 default: single local account authenticated via `agy`. */
+/** Default single-account provider (current machine login). */
 export class SingleAccountProvider implements AccountProvider {
   async acquire(): Promise<AccountLease> {
     return { accountId: 'default', release: () => {} }
@@ -54,14 +56,16 @@ export interface SessionPoolDeps {
 }
 
 /**
- * Manages a persistent `agy acp` process and maps DSH session keys to
- * long-lived ACP sessions, eliminating per-turn CLI cold starts.
+ * Manages persistent `agy acp` processes (one per active account) and maps DSH session keys
+ * to long-lived ACP sessions, eliminating per-turn CLI cold starts while supporting
+ * multi-account isolation and failover.
  */
 export class AcpSessionPool extends EventEmitter {
-  private client: AcpClient | null = null
-  private initPromise: Promise<AcpClient> | null = null
+  private readonly clients = new Map<string, AcpClient>()
+  private readonly initPromises = new Map<string, Promise<AcpClient>>()
   private initResult: InitializeResult | null = null
   private readonly sessions = new Map<string, ManagedAcpSession>()
+  private readonly accountProvider: AccountProvider
   private cachedModels: AcpModelOption[] = []
   private cachedTier: string | null = null
   private lastError: string | null = null
@@ -75,18 +79,38 @@ export class AcpSessionPool extends EventEmitter {
 
   constructor(private readonly deps: SessionPoolDeps) {
     super()
+    this.accountProvider = deps.accountProvider ?? new SingleAccountProvider()
     this.sweepTimer = setInterval(() => {
       void this.sweepIdleSessions()
     }, 60_000)
     this.sweepTimer.unref?.()
   }
 
-  getClient(): AcpClient | null {
-    return this.client
+  getClient(accountId = 'default'): AcpClient | null {
+    return this.clients.get(accountId) ?? this.clients.values().next().value ?? null
   }
 
   notifyStatusChange(): void {
     this.emitStatus()
+  }
+
+  reportAccountSuccess(accountId: string, model: string): void {
+    this.accountProvider.reportSuccess?.(accountId, model)
+    this.emitStatus()
+  }
+
+  reportAccountFailure(accountId: string, model: string, error: unknown): void {
+    this.accountProvider.reportFailure?.(accountId, model, error)
+    this.emitStatus()
+  }
+
+  clearAccountCooldown(accountId?: string): void {
+    this.accountProvider.clearCooldown?.(accountId)
+    this.emitStatus()
+  }
+
+  getAccountHealthSnapshots(): AccountHealthSnapshot[] {
+    return this.accountProvider.getHealthSnapshots?.() ?? []
   }
 
   recordContextUsage(dshSessionKey: string, used: number, size: number): void {
@@ -113,9 +137,12 @@ export class AcpSessionPool extends EventEmitter {
 
   async setPermissionMode(mode: PermissionMode): Promise<void> {
     this.deps.onPermissionModeChange?.(mode)
-    if (this.client?.isRunning && mode !== 'skip') {
+    if (mode !== 'skip') {
       for (const sess of this.sessions.values()) {
-        await this.syncSessionOptions(this.client, sess, { mode }).catch(() => undefined)
+        const client = this.clients.get(sess.accountId)
+        if (client?.isRunning) {
+          await this.syncSessionOptions(client, sess, { mode }).catch(() => undefined)
+        }
       }
     }
     this.emitStatus()
@@ -134,10 +161,11 @@ export class AcpSessionPool extends EventEmitter {
       contextSize: s.contextSize,
       lastActiveAt: s.lastActiveAt,
     }))
+    const connected = Array.from(this.clients.values()).some((c) => c.isRunning)
     return {
       providerId: PROVIDER_ID,
       enabled: cfg.enabled,
-      connected: Boolean(this.client?.isRunning),
+      connected,
       agentName: this.initResult?.agentInfo?.name ?? null,
       agentVersion: this.initResult?.agentInfo?.version ?? null,
       tierName: this.cachedTier,
@@ -146,6 +174,7 @@ export class AcpSessionPool extends EventEmitter {
       pendingPermissions: this.deps.getPendingPermissions?.() ?? [],
       mcpBridgeActive: this.deps.isMcpBridgeActive?.() ?? false,
       usageTotals: { ...this.usageTotals },
+      accounts: this.getAccountHealthSnapshots(),
       models: this.cachedModels,
       permissionMode: cfg.permissionMode,
       lastError: this.lastError,
@@ -153,17 +182,20 @@ export class AcpSessionPool extends EventEmitter {
     }
   }
 
-  async ensureClient(): Promise<AcpClient> {
-    if (this.client?.isRunning) return this.client
-    if (this.initPromise) return this.initPromise
+  async ensureClient(accountId = 'default', env?: NodeJS.ProcessEnv): Promise<AcpClient> {
+    const existing = this.clients.get(accountId)
+    if (existing?.isRunning) return existing
+    const pending = this.initPromises.get(accountId)
+    if (pending) return pending
 
-    this.initPromise = this.startClient().finally(() => {
-      this.initPromise = null
+    const promise = this.startClient(accountId, env).finally(() => {
+      this.initPromises.delete(accountId)
     })
-    return this.initPromise
+    this.initPromises.set(accountId, promise)
+    return promise
   }
 
-  private async startClient(): Promise<AcpClient> {
+  private async startClient(accountId: string, env?: NodeJS.ProcessEnv): Promise<AcpClient> {
     const cfg = this.deps.getConfig()
     const bin = this.deps.resolveBin()
     if (!bin) {
@@ -181,24 +213,32 @@ export class AcpSessionPool extends EventEmitter {
       bin,
       args,
       cwd: cfg.workspaceRoot || process.cwd(),
+      env,
       defaultTimeoutMs: cfg.requestTimeoutMs,
       onPermission: this.deps.onPermission,
       onLog: this.deps.log,
       onExit: (code, signal) => {
-        this.deps.log?.(`agy acp process exited (code=${String(code)}, signal=${String(signal)})`)
-        this.sessions.clear()
-        this.client = null
+        this.deps.log?.(`agy acp [${accountId}] exited (code=${String(code)}, signal=${String(signal)})`)
+        for (const [key, sess] of this.sessions) {
+          if (sess.accountId === accountId) {
+            this.sessions.delete(key)
+            this.deps.onSessionClosed?.(sess.acpSessionId)
+          }
+        }
+        if (this.clients.get(accountId) === client) {
+          this.clients.delete(accountId)
+        }
         this.emitStatus()
       },
     })
 
     client.start()
     const initRes = await client.initialize()
-    this.client = client
+    this.clients.set(accountId, client)
     this.initResult = initRes
     this.lastError = null
     this.deps.log?.(
-      `connected to ${initRes.agentInfo?.name ?? 'agy acp'} ${initRes.agentInfo?.version ?? ''}`.trim(),
+      `connected [${accountId}] to ${initRes.agentInfo?.name ?? 'agy acp'} ${initRes.agentInfo?.version ?? ''}`.trim(),
     )
     this.emitStatus()
     return client
@@ -207,34 +247,50 @@ export class AcpSessionPool extends EventEmitter {
   async getOrCreateSession(
     dshSessionKey: string,
     cwd: string,
+    model = '',
+    excludeAccountIds?: ReadonlySet<string>,
   ): Promise<{ client: AcpClient; session: ManagedAcpSession; created: boolean }> {
-    const client = await this.ensureClient()
     const existing = this.sessions.get(dshSessionKey)
-    if (existing) {
-      existing.lastActiveAt = Date.now()
-      return { client, session: existing, created: false }
+    if (existing && !excludeAccountIds?.has(existing.accountId)) {
+      const client = this.clients.get(existing.accountId)
+      if (client?.isRunning) {
+        existing.lastActiveAt = Date.now()
+        return { client, session: existing, created: false }
+      }
+      this.sessions.delete(dshSessionKey)
+    } else if (existing && excludeAccountIds?.has(existing.accountId)) {
+      await this.closeSession(dshSessionKey)
     }
 
-    const mcpServers = this.deps.getMcpServers?.(dshSessionKey) ?? []
-    const res = await client.sessionNew({ cwd, mcpServers })
-    this.captureCatalogFromSession(res)
+    // Acquire account lease (and optional cross-process credential slot) only across
+    // process startup + session/new authentication, then release immediately.
+    const lease = await this.accountProvider.acquire(dshSessionKey, model, excludeAccountIds)
+    try {
+      const client = await this.ensureClient(lease.accountId, lease.env)
+      const mcpServers = this.deps.getMcpServers?.(dshSessionKey) ?? []
+      const res = await client.sessionNew({ cwd, mcpServers })
+      this.captureCatalogFromSession(res)
 
-    const configOptions = res.configOptions ?? []
-    const session: ManagedAcpSession = {
-      dshSessionKey,
-      acpSessionId: res.sessionId,
-      cwd,
-      currentModel: findCurrentOption(configOptions, 'model') ?? res.models?.currentModelId ?? '',
-      currentEffort: findCurrentOption(configOptions, 'thought_level') ?? '',
-      currentMode: findCurrentOption(configOptions, 'mode') ?? res.modes?.currentModeId ?? 'default',
-      configOptions,
-      contextUsed: 0,
-      contextSize: 0,
-      lastActiveAt: Date.now(),
+      const configOptions = res.configOptions ?? []
+      const session: ManagedAcpSession = {
+        dshSessionKey,
+        acpSessionId: res.sessionId,
+        accountId: lease.accountId,
+        cwd,
+        currentModel: findCurrentOption(configOptions, 'model') ?? res.models?.currentModelId ?? '',
+        currentEffort: findCurrentOption(configOptions, 'thought_level') ?? '',
+        currentMode: findCurrentOption(configOptions, 'mode') ?? res.modes?.currentModeId ?? 'default',
+        configOptions,
+        contextUsed: 0,
+        contextSize: 0,
+        lastActiveAt: Date.now(),
+      }
+      this.sessions.set(dshSessionKey, session)
+      this.emitStatus()
+      return { client, session, created: true }
+    } finally {
+      lease.release()
     }
-    this.sessions.set(dshSessionKey, session)
-    this.emitStatus()
-    return { client, session, created: true }
   }
 
   async syncSessionOptions(
@@ -292,12 +348,20 @@ export class AcpSessionPool extends EventEmitter {
 
   async refreshModels(cwd?: string): Promise<AcpModelOption[]> {
     if (this.cachedModels.length > 0) return this.cachedModels
-    const client = await this.ensureClient()
-    const res = await client.sessionNew({ cwd: cwd || this.deps.getConfig().workspaceRoot || process.cwd(), mcpServers: [] })
-    this.captureCatalogFromSession(res)
-    await client.sessionClose(res.sessionId).catch(() => undefined)
-    this.emitStatus()
-    return this.cachedModels
+    const lease = await this.accountProvider.acquire('__catalog__', '')
+    try {
+      const client = await this.ensureClient(lease.accountId, lease.env)
+      const res = await client.sessionNew({
+        cwd: cwd || this.deps.getConfig().workspaceRoot || process.cwd(),
+        mcpServers: [],
+      })
+      this.captureCatalogFromSession(res)
+      await client.sessionClose(res.sessionId).catch(() => undefined)
+      this.emitStatus()
+      return this.cachedModels
+    } finally {
+      lease.release()
+    }
   }
 
   async closeSession(dshSessionKey: string): Promise<void> {
@@ -305,8 +369,9 @@ export class AcpSessionPool extends EventEmitter {
     if (!sess) return
     this.sessions.delete(dshSessionKey)
     this.deps.onSessionClosed?.(sess.acpSessionId)
-    if (this.client?.isRunning) {
-      await this.client.sessionClose(sess.acpSessionId).catch(() => undefined)
+    const client = this.clients.get(sess.accountId)
+    if (client?.isRunning) {
+      await client.sessionClose(sess.acpSessionId).catch(() => undefined)
     }
     this.emitStatus()
   }
@@ -335,8 +400,12 @@ export class AcpSessionPool extends EventEmitter {
       this.sweepTimer = null
     }
     this.sessions.clear()
-    this.client?.dispose()
-    this.client = null
+    for (const client of this.clients.values()) {
+      client.dispose()
+    }
+    this.clients.clear()
+    this.initPromises.clear()
+    this.accountProvider.dispose?.()
     this.removeAllListeners()
   }
 

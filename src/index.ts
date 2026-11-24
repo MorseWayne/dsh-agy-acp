@@ -9,6 +9,8 @@ import { AcpAdapter } from './provider/adapter.ts'
 import { defineAgyAcpMirrorTool } from './provider/mirror-tool.ts'
 import { AcpRunStore } from './provider/run-store.ts'
 import { resolveAgyBin } from './runtime/bin.ts'
+import { MultiAccountPool } from './runtime/account-pool.ts'
+import { CredentialSlotLeaseManager } from './runtime/credential-lease.ts'
 import { PermissionManager } from './runtime/permission-manager.ts'
 import { AcpSessionPool } from './runtime/session-pool.ts'
 import { registerAcpRoutes, type WebServerLike } from './transport/sse.ts'
@@ -41,10 +43,23 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     log,
   })
 
+  const slotManager = cfg.credentialSlotDir
+    ? new CredentialSlotLeaseManager({ slotDir: cfg.credentialSlotDir })
+    : undefined
+  const multiAccountPool =
+    cfg.accounts.length > 0
+      ? new MultiAccountPool({
+          accounts: cfg.accounts,
+          slotManager,
+          log,
+        })
+      : undefined
+
   const runs = new AcpRunStore()
   const pool = new AcpSessionPool({
     getConfig: () => cfg,
     resolveBin: () => resolveAgyBin(cfg.agyBin),
+    accountProvider: multiAccountPool,
     onPermission: (req) => permissions.handleRequest(req),
     getPendingPermissions: () => permissions.listPending(),
     isMcpBridgeActive: () => Boolean(mcpBridge?.isRunning),
@@ -62,6 +77,9 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   })
 
   permissions.on('change', () => {
+    pool.notifyStatusChange()
+  })
+  multiAccountPool?.on('change', () => {
     pool.notifyStatusChange()
   })
 

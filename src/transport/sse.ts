@@ -171,6 +171,17 @@ export function registerAcpRoutes(
     }
   })
 
+  addRoute('POST', '/plugins/agy-acp/accounts/cooldown/clear', async (req, res) => {
+    try {
+      const body = await readJsonBody(req)
+      const accountId = typeof body.accountId === 'string' && body.accountId ? body.accountId : undefined
+      pool.clearAccountCooldown(accountId)
+      sendJson(res, 200, { ok: true, status: pool.getStatus() })
+    } catch (err) {
+      sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) })
+    }
+  })
+
   return () => {
     pool.off('status', pushSnapshot)
     for (const res of sseClients) {

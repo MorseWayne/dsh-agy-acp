@@ -17,6 +17,7 @@ import {
   WRAPPER_TOOL_NAME,
   type PluginConfig,
 } from '../common/types.ts'
+import { isQuotaOrRateLimitError } from '../runtime/account-pool.ts'
 import type { AcpSessionPool } from '../runtime/session-pool.ts'
 import { buildPromptBlocks } from './prompt-builder.ts'
 import {
@@ -131,57 +132,88 @@ export class AcpAdapter extends LlmAdapter {
       }
     }
 
-    // 2. Fresh turn over persistent ACP session.
+    // 2. Fresh turn over persistent ACP session (with automatic 429/quota failover).
     const sessionKey = resolveSessionKey(options)
     const cwd = cfg.workspaceRoot || process.cwd()
-    const { client, session, created } = await this.deps.pool.getOrCreateSession(sessionKey, cwd)
+    const requestedModel = options.model || cfg.defaultModel || ''
+    const triedAccounts = new Set<string>()
+    const maxAttempts = Math.max(1, cfg.accounts.filter((a) => a.enabled !== false).length || 1)
 
-    const targetModel = options.model || cfg.defaultModel || session.currentModel
-    const targetEffort =
-      options.reasoningEffort !== undefined ? String(options.reasoningEffort) : cfg.defaultEffort || undefined
-    const targetMode = cfg.permissionMode
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const { client, session, created } = await this.deps.pool.getOrCreateSession(
+        sessionKey,
+        cwd,
+        requestedModel,
+        triedAccounts.size > 0 ? triedAccounts : undefined,
+      )
+      triedAccounts.add(session.accountId)
 
-    await this.deps.pool.syncSessionOptions(client, session, {
-      model: targetModel,
-      effort: targetEffort,
-      mode: targetMode,
-    })
+      const targetModel = requestedModel || session.currentModel
+      const targetEffort =
+        options.reasoningEffort !== undefined ? String(options.reasoningEffort) : cfg.defaultEffort || undefined
+      const targetMode = cfg.permissionMode
 
-    const promptBlocks = buildPromptBlocks(options.messages, created)
-    const rec = this.deps.runs.create()
-    rec.setCancelHandler(() => {
-      client.sessionCancel(session.acpSessionId)
-    })
+      await this.deps.pool.syncSessionOptions(client, session, {
+        model: targetModel,
+        effort: targetEffort,
+        mode: targetMode,
+      })
 
-    const unsubscribe = client.onSessionUpdate(session.acpSessionId, (update) => {
-      rec.pushUpdate(update)
-      if (update.sessionUpdate === 'usage_update' && typeof update.used === 'number') {
-        this.deps.pool.recordContextUsage(sessionKey, update.used, typeof update.size === 'number' ? update.size : 0)
+      const promptBlocks = buildPromptBlocks(options.messages, created)
+      const rec = this.deps.runs.create()
+      rec.setCancelHandler(() => {
+        client.sessionCancel(session.acpSessionId)
+      })
+
+      const unsubscribe = client.onSessionUpdate(session.acpSessionId, (update) => {
+        rec.pushUpdate(update)
+        if (update.sessionUpdate === 'usage_update' && typeof update.used === 'number') {
+          this.deps.pool.recordContextUsage(sessionKey, update.used, typeof update.size === 'number' ? update.size : 0)
+        }
+      })
+
+      const onAbort = (): void => {
+        rec.requestCancel()
       }
-    })
+      options.signal?.addEventListener('abort', onAbort, { once: true })
 
-    const onAbort = (): void => {
-      rec.requestCancel()
+      // Run `session/prompt` in background so the recording can span multiple DSH tool-mirror loops.
+      void client
+        .sessionPrompt({ sessionId: session.acpSessionId, prompt: promptBlocks }, cfg.requestTimeoutMs)
+        .then((res) => {
+          this.deps.pool.reportAccountSuccess(session.accountId, targetModel)
+          this.deps.pool.recordTurnUsage(res.usage)
+          rec.finish(res.stopReason, res.usage)
+        })
+        .catch((err: unknown) => {
+          const error = err instanceof Error ? err : new Error(String(err))
+          this.deps.pool.reportAccountFailure(session.accountId, targetModel, error)
+          rec.fail(error)
+        })
+        .finally(() => {
+          unsubscribe()
+          rec.setCancelHandler(null)
+          options.signal?.removeEventListener('abort', onAbort)
+        })
+
+      // Peek first item before yielding so quota/429 errors before any output can seamlessly fail over.
+      const firstItem = await rec.waitFor(0, options.signal)
+      if (
+        firstItem?.kind === 'error' &&
+        isQuotaOrRateLimitError(firstItem.error) &&
+        attempt + 1 < maxAttempts &&
+        !options.signal?.aborted
+      ) {
+        this.deps.log?.(
+          `account "${session.accountId}" hit quota/rate-limit on "${targetModel}", failing over (attempt ${attempt + 2}/${maxAttempts})`,
+        )
+        await this.deps.pool.closeSession(sessionKey)
+        continue
+      }
+
+      yield* this.driveRecording(rec, 0, cutOnTool, isCodeMode, options.signal)
+      return
     }
-    options.signal?.addEventListener('abort', onAbort, { once: true })
-
-    // Run `session/prompt` in background so the recording can span multiple DSH tool-mirror loops.
-    void client
-      .sessionPrompt({ sessionId: session.acpSessionId, prompt: promptBlocks }, cfg.requestTimeoutMs)
-      .then((res) => {
-        this.deps.pool.recordTurnUsage(res.usage)
-        rec.finish(res.stopReason, res.usage)
-      })
-      .catch((err: unknown) => {
-        rec.fail(err instanceof Error ? err : new Error(String(err)))
-      })
-      .finally(() => {
-        unsubscribe()
-        rec.setCancelHandler(null)
-        options.signal?.removeEventListener('abort', onAbort)
-      })
-
-    yield* this.driveRecording(rec, 0, cutOnTool, isCodeMode, options.signal)
   }
 
   private async *driveRecording(

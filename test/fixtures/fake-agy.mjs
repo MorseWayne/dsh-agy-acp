@@ -273,10 +273,20 @@ async function handleRequest(id, method, params) {
       return
     }
 
+    if (process.env.FAKE_FORCE_429 === '1') {
+      send({
+        jsonrpc: '2.0',
+        id,
+        error: { code: -32029, message: 'HTTP 429 RESOURCE_EXHAUSTED: quota exceeded for account' },
+      })
+      return
+    }
+
     // Default multi-turn echo
+    const acctPrefix = process.env.FAKE_ACCOUNT_TAG ? `<${process.env.FAKE_ACCOUNT_TAG}> ` : ''
     sendUpdate(sessionId, {
       sessionUpdate: 'agent_message_chunk',
-      content: { type: 'text', text: `[${sessionId}#${sess.turns}] ${promptText}` },
+      content: { type: 'text', text: `${acctPrefix}[${sessionId}#${sess.turns}] ${promptText}` },
     })
     send({
       jsonrpc: '2.0',
