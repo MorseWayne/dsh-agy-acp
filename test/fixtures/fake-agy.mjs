@@ -74,6 +74,7 @@ rl.on('line', (line) => {
 
 async function handleRequest(id, method, params) {
   if (method === 'initialize') {
+    const supportsAppend = process.env.FAKE_NO_SYSTEM_APPEND !== '1'
     send({
       jsonrpc: '2.0',
       id,
@@ -82,6 +83,7 @@ async function handleRequest(id, method, params) {
         agentInfo: { name: 'fake-agy-acp', version: '1.5.16-test' },
         agentCapabilities: {
           promptCapabilities: { image: true, embeddedContext: true },
+          ...(supportsAppend ? { _meta: { antigravity: { tier: true, systemPrompt: { append: true } } } } : {}),
         },
       },
     })
@@ -90,6 +92,7 @@ async function handleRequest(id, method, params) {
 
   if (method === 'session/new') {
     const sessionId = `sess_${nextSessionSeq++}`
+    const systemAppend = params?._meta?.antigravity?.systemPrompt?.append ?? null
     const configOptions = [
       {
         id: 'model',
@@ -124,7 +127,7 @@ async function handleRequest(id, method, params) {
         ],
       },
     ]
-    sessions.set(sessionId, { turns: 0, configOptions })
+    sessions.set(sessionId, { turns: 0, configOptions, systemAppend })
     send({
       jsonrpc: '2.0',
       id,
@@ -270,6 +273,191 @@ async function handleRequest(id, method, params) {
             totalTokens: 1050,
           },
         },
+      })
+      return
+    }
+
+    if (promptText.includes('LIVE_TOOL_INCREMENTAL')) {
+      sendUpdate(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'tc_live',
+        name: 'run_command',
+        kind: 'execute',
+        title: 'Run live echo',
+        status: 'in_progress',
+        rawInput: { CommandLine: 'echo live', Cwd: '/tmp' },
+      })
+      await new Promise((r) => setTimeout(r, 80))
+      // Deliberately omit name/kind/title/rawInput on completion frame to verify incremental merge
+      sendUpdate(sessionId, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'tc_live',
+        status: 'completed',
+        rawOutput: { output: 'live ok\n', exit_code: 0 },
+        content: [{ type: 'content', content: { type: 'text', text: 'live ok\n' } }],
+      })
+      await new Promise((r) => setTimeout(r, 20))
+      sendUpdate(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Live tool finished.' },
+      })
+      send({
+        jsonrpc: '2.0',
+        id,
+        result: { stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 } },
+      })
+      return
+    }
+
+    if (promptText.includes('EMPTY_PLACEHOLDER_TOOL')) {
+      sendUpdate(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'tc_empty',
+        status: 'in_progress',
+      })
+      await new Promise((r) => setTimeout(r, 60))
+      sendUpdate(sessionId, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'tc_empty',
+        name: 'run_command',
+        kind: 'execute',
+        title: 'Late metadata',
+        status: 'completed',
+        rawInput: { CommandLine: 'echo late', Cwd: '/work' },
+        rawOutput: { output: 'late\n', exit_code: 0 },
+      })
+      await new Promise((r) => setTimeout(r, 20))
+      sendUpdate(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Placeholder done.' },
+      })
+      send({
+        jsonrpc: '2.0',
+        id,
+        result: { stopReason: 'end_turn' },
+      })
+      return
+    }
+
+    if (promptText.includes('SLOW_TOOL_CANCEL')) {
+      sendUpdate(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'tc_slow',
+        name: 'run_command',
+        kind: 'execute',
+        status: 'in_progress',
+        rawInput: { CommandLine: 'sleep 10', Cwd: '/tmp' },
+      })
+      await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          activeTurns.delete(sessionId)
+          send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } })
+          resolve()
+        }, 10_000)
+        activeTurns.set(sessionId, {
+          cancel: () => {
+            clearTimeout(timer)
+            activeTurns.delete(sessionId)
+            send({ jsonrpc: '2.0', id, result: { stopReason: 'cancelled' } })
+            resolve()
+          },
+        })
+      })
+      return
+    }
+
+    if (promptText.includes('PARALLEL_TOOLS')) {
+      sendUpdate(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'tc_p1',
+        name: 'read_file',
+        kind: 'read',
+        status: 'in_progress',
+        rawInput: { Path: 'a.ts' },
+      })
+      sendUpdate(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'tc_p2',
+        name: 'read_file',
+        kind: 'read',
+        status: 'in_progress',
+        rawInput: { Path: 'b.ts' },
+      })
+      await new Promise((r) => setTimeout(r, 50))
+      // Complete out of order: tc_p2 first, then tc_p1
+      sendUpdate(sessionId, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'tc_p2',
+        status: 'completed',
+        content: [{ type: 'content', content: { type: 'text', text: 'const b = 2' } }],
+      })
+      sendUpdate(sessionId, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'tc_p1',
+        status: 'completed',
+        content: [{ type: 'content', content: { type: 'text', text: 'const a = 1' } }],
+      })
+      await new Promise((r) => setTimeout(r, 20))
+      sendUpdate(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Both parallel tools done.' },
+      })
+      send({
+        jsonrpc: '2.0',
+        id,
+        result: { stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 15, totalTokens: 95 } },
+      })
+      return
+    }
+
+    if (promptText.includes('AUX_TRY_TOOL')) {
+      const modeOpt = sess.configOptions.find((o) => o.id === 'mode')
+      const currentMode = modeOpt?.currentValue ?? ''
+      const readPerm = await requestClient('session/request_permission', {
+        sessionId,
+        toolCall: { sessionUpdate: 'tool_call_update', toolCallId: 'aux_r', name: 'read_file', kind: 'read', status: 'pending' },
+        options: [
+          { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+          { optionId: 'reject_once', name: 'Reject once', kind: 'reject_once' },
+        ],
+      })
+      const execPerm = await requestClient('session/request_permission', {
+        sessionId,
+        toolCall: { sessionUpdate: 'tool_call_update', toolCallId: 'aux_e', name: 'run_command', kind: 'execute', status: 'pending' },
+        options: [
+          { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+          { optionId: 'reject_once', name: 'Reject once', kind: 'reject_once' },
+        ],
+      })
+      const readAllowed = readPerm?.outcome?.outcome === 'selected' && readPerm.outcome.optionId === 'allow_once'
+      const execAllowed = execPerm?.outcome?.outcome === 'selected' && execPerm.outcome.optionId === 'allow_once'
+      sendUpdate(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: {
+          type: 'text',
+          text: `AUX_MODE=${currentMode}|READ=${readAllowed}|EXEC=${execAllowed}|SYS=${sess.systemAppend ? 'META' : 'NONE'}`,
+        },
+      })
+      send({
+        jsonrpc: '2.0',
+        id,
+        result: { stopReason: 'end_turn', usage: { inputTokens: 40, outputTokens: 10, totalTokens: 50 } },
+      })
+      return
+    }
+
+    if (promptText.includes('ECHO_SYSTEM')) {
+      sendUpdate(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: {
+          type: 'text',
+          text: `SYS=${sess.systemAppend ?? 'NONE'}||PROMPT=${promptText}`,
+        },
+      })
+      send({
+        jsonrpc: '2.0',
+        id,
+        result: { stopReason: 'end_turn', usage: { inputTokens: 30, outputTokens: 10, totalTokens: 40 } },
       })
       return
     }

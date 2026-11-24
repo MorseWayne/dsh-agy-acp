@@ -91,3 +91,33 @@ test('two sessions with colliding native IDs remain isolated and tightening inva
     turns.forEach(t => t.finish())
   } finally { pool.dispose() }
 })
+
+test('auxiliary prompt fails closed when read-only sandbox confinement is partial', async () => {
+  const agent = { session: { id: 's' } }
+  const host: Parameters<typeof hostPermissions>[0] = {
+    agents: { get: id => id === 's' ? agent : undefined },
+    sandboxPolicy: { resolve: () => ws },
+    permissionPresets: { current: () => ws.preset },
+    approval: { config: { policy: 'ask' }, overrideOf: () => undefined, request: async () => 'rejected' },
+    sandbox: { confine: async (argv) => ({ enforcement: 'partial', argv: [...argv] }) },
+  }
+  const perms = hostPermissions(host)
+  const pool = new AcpSessionPool({
+    ...perms,
+    getConfig: () => resolveConfig({}),
+    resolveBin: () => fileURLToPath(new URL('./fixtures/fake-agy.mjs', import.meta.url)),
+  })
+  try {
+    await assert.rejects(
+      pool.runAuxiliaryPrompt({
+        sessionKey: 's',
+        systemPromptAppend: 'no tools',
+        systemFallbackBlock: { type: 'text', text: 'no tools' },
+        prompt: [{ type: 'text', text: 'title please' }],
+      }),
+      /refusing unconfined startup/,
+    )
+  } finally {
+    pool.dispose()
+  }
+})

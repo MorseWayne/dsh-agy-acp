@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 import type { GenerateOptions, Message, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { resolveConfig } from '../src/common/config.ts'
-import { MIRROR_TOOL_NAME, PROVIDER_ID } from '../src/common/types.ts'
+import { MIRROR_TOOL_NAME, PROVIDER_ID, WRAPPER_TOOL_NAME } from '../src/common/types.ts'
 import { AcpAdapter } from '../src/provider/adapter.ts'
 import { defineAgyAcpMirrorTool } from '../src/provider/mirror-tool.ts'
 import { AcpRunStore } from '../src/provider/run-store.ts'
@@ -101,7 +101,7 @@ test('AcpAdapter.stream() reuses persistent ACP session across multi-turn conver
   }
 })
 
-test('AcpAdapter.stream() splits span on tool call, replays via agy_acp_tool, and resumes to completion', async () => {
+async function assertMirrorContinuation(format: 'legacy' | 'tool role' | 'tool role with runtime context') {
   const { adapter, pool, mirrorTool, permissionLog } = createHarness()
   try {
     const mirrorSchema = { name: MIRROR_TOOL_NAME, description: '', parameters: { type: 'object', properties: {} } }
@@ -170,27 +170,24 @@ test('AcpAdapter.stream() splits span on tool call, replays via agy_acp_tool, an
       exitCode: 0,
     })
 
-    // Span 2: DSH feeds tool-result back -> adapter resumes recording and emits final text + usage
+    // Span 2: echo the result in the host's format; keep the same ACP prompt alive.
+    const result = { toolCallId: toolBlockEnd.block.id, content: rendered, isError: false }
+    const history = [
+      { role: 'user', content: [{ type: 'text', text: 'please USE_TOOL now' }] },
+      { role: 'assistant', content: [toolBlockEnd.block] },
+      format === 'legacy'
+        ? { role: 'user', content: [{ type: 'tool-result', ...result }] }
+        : { role: 'tool', source: { kind: 'tool' }, ...result },
+    ]
+    const continuationMessages = format === 'tool role with runtime context'
+      ? [...history, { role: 'user', content: [{ type: 'text', text: 'Updated runtime context' }], source: { kind: 'runtime-context' } }]
+      : history
     const span2 = await collectChunks(
       adapter.stream({
         provider: PROVIDER_ID,
         model: 'gemini-4-neon',
         tools: [mirrorSchema],
-        messages: [
-          { role: 'user', content: [{ type: 'text', text: 'please USE_TOOL now' }] } as Message,
-          { role: 'assistant', content: [toolBlockEnd.block] } as Message,
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'tool-result',
-                toolCallId: toolBlockEnd.block.id,
-                content: rendered,
-                isError: false,
-              },
-            ],
-          } as Message,
-        ],
+        messages: continuationMessages,
         sessionId: 'dsh-tool-conv',
       } as unknown as GenerateOptions),
     )
@@ -211,9 +208,9 @@ test('AcpAdapter.stream() splits span on tool call, replays via agy_acp_tool, an
     assert.equal(usage2.usage.reasoningTokens, 120)
 
     const followUp = await collectChunks(adapter.stream({ provider: PROVIDER_ID, model: 'claude-sonnet-5-5', sessionId: 'dsh-tool-conv',
-      messages: [{ role: 'user', content: [{ type: 'text', text: 'switch model' }] }],
-    } as GenerateOptions))
-    assert.ok(followUp.some(c => c.type === 'text-delta'))
+      messages: [...history, { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'switch model' }] }],
+    } as unknown as GenerateOptions))
+    assert.equal(followUp.filter(c => c.type === 'text-delta').map(c => c.text).join(''), '[sess_1#2] switch model')
     assert.equal(pool.getStatus().sessions[0]?.contextUsed, null)
     assert.equal(pool.getStatus().sessions[0]?.contextSize, 0)
     const nextModel = await adapter.resolveModel(PROVIDER_ID, 'claude-sonnet-5-5')
@@ -226,7 +223,11 @@ test('AcpAdapter.stream() splits span on tool call, replays via agy_acp_tool, an
   } finally {
     pool.dispose()
   }
-})
+}
+
+for (const format of ['legacy', 'tool role', 'tool role with runtime context'] as const) {
+  test(`AcpAdapter.stream() resumes the original ACP prompt after a ${format} mirror result`, () => assertMirrorContinuation(format))
+}
 
 test('resolved reasoning defaults match persistent ACP selection after returning to Default', async () => {
   const { adapter, pool, cfg } = createHarness()
@@ -297,6 +298,339 @@ test('AcpAdapter.stream() propagates AbortSignal to session/cancel and finishes 
       .map((c) => c.text)
       .join('')
     assert.equal(followText, '[sess_1#2] after cancel')
+  } finally {
+    pool.dispose()
+  }
+})
+
+test('AcpAdapter.stream() emits live pending tool card immediately, merges incremental completion, and resumes', async () => {
+  const { adapter, pool, mirrorTool } = createHarness()
+  const mirrorSchema = { name: MIRROR_TOOL_NAME, description: '', parameters: { type: 'object', properties: {} } }
+  try {
+    const t0 = Date.now()
+    const span1 = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        tools: [mirrorSchema],
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'run LIVE_TOOL_INCREMENTAL' }] } as Message],
+        sessionId: 'dsh-live-tool',
+      } as unknown as GenerateOptions),
+    )
+    const toolBlockEnd = span1.find((c) => c.type === 'block-end' && c.block.type === 'tool-call')
+    assert.ok(toolBlockEnd && toolBlockEnd.type === 'block-end' && toolBlockEnd.block.type === 'tool-call')
+    const parsedArgs = JSON.parse(toolBlockEnd.block.arguments) as Record<string, unknown>
+    assert.equal(parsedArgs.toolCallId, 'tc_live')
+    assert.deepEqual(mirrorTool.presentCall?.(parsedArgs), {
+      card: 'terminal',
+      title: 'echo live',
+      description: 'Run live echo',
+      cwd: '/tmp',
+    })
+
+    // mirrorTool.execute awaits the delayed completion frame (which omits name/rawInput)
+    const value = (await mirrorTool.execute(parsedArgs, { agent: { session: { id: 'dsh-live-tool' } } } as ToolRunContext)) as Record<string, unknown>
+    assert.ok(Date.now() - t0 >= 60)
+    const rendered = mirrorTool.output.render(parsedArgs, value as never)
+    const meta = mirrorTool.output.presentationMeta?.(parsedArgs, value as never)
+    assert.deepEqual(mirrorTool.presentResult?.(parsedArgs, { content: rendered, isError: false, meta }), {
+      card: 'terminal',
+      title: 'echo live',
+      output: 'live ok\n',
+      exitCode: 0,
+    })
+
+    const span2 = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        tools: [mirrorSchema],
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'run LIVE_TOOL_INCREMENTAL' }] },
+          { role: 'assistant', content: [toolBlockEnd.block] },
+          { role: 'tool', toolCallId: toolBlockEnd.block.id, content: rendered, isError: false },
+        ],
+        sessionId: 'dsh-live-tool',
+      } as unknown as GenerateOptions),
+    )
+    assert.equal(span2.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'Live tool finished.')
+  } finally {
+    pool.dispose()
+  }
+})
+
+test('empty placeholder in_progress tool emits immediately and upgrades via presentationMeta on completion', async () => {
+  const { adapter, pool, mirrorTool } = createHarness()
+  const mirrorSchema = { name: MIRROR_TOOL_NAME, description: '', parameters: { type: 'object', properties: {} } }
+  try {
+    const span1 = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        tools: [mirrorSchema],
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'EMPTY_PLACEHOLDER_TOOL' }] } as Message],
+        sessionId: 'dsh-empty-tool',
+      } as unknown as GenerateOptions),
+    )
+    const toolBlockEnd = span1.find((c) => c.type === 'block-end' && c.block.type === 'tool-call')
+    assert.ok(toolBlockEnd && toolBlockEnd.type === 'block-end' && toolBlockEnd.block.type === 'tool-call')
+    const parsedArgs = JSON.parse(toolBlockEnd.block.arguments) as Record<string, unknown>
+    assert.equal(mirrorTool.presentCall?.(parsedArgs)?.card, 'generic')
+
+    const value = (await mirrorTool.execute(parsedArgs, { agent: { session: { id: 'dsh-empty-tool' } } } as ToolRunContext)) as Record<string, unknown>
+    const rendered = mirrorTool.output.render(parsedArgs, value as never)
+    const meta = mirrorTool.output.presentationMeta?.(parsedArgs, value as never)
+    assert.deepEqual(mirrorTool.presentResult?.(parsedArgs, { content: rendered, isError: false, meta }), {
+      card: 'terminal',
+      title: 'echo late',
+      output: 'late\n',
+      exitCode: 0,
+    })
+  } finally {
+    pool.dispose()
+  }
+})
+
+test('aborting exec.signal during live mirrorTool.execute cancels the underlying ACP turn', async () => {
+  const { adapter, pool, mirrorTool } = createHarness()
+  const mirrorSchema = { name: MIRROR_TOOL_NAME, description: '', parameters: { type: 'object', properties: {} } }
+  try {
+    const span1 = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        tools: [mirrorSchema],
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'SLOW_TOOL_CANCEL' }] } as Message],
+        sessionId: 'dsh-tool-abort',
+      } as unknown as GenerateOptions),
+    )
+    const toolBlockEnd = span1.find((c) => c.type === 'block-end' && c.block.type === 'tool-call')
+    assert.ok(toolBlockEnd && toolBlockEnd.type === 'block-end' && toolBlockEnd.block.type === 'tool-call')
+    const parsedArgs = JSON.parse(toolBlockEnd.block.arguments) as Record<string, unknown>
+
+    const ac = new AbortController()
+    setTimeout(() => ac.abort(), 40)
+    const value = (await mirrorTool.execute(parsedArgs, {
+      agent: { session: { id: 'dsh-tool-abort' } },
+      signal: ac.signal,
+    } as ToolRunContext)) as { output: string; isError: boolean }
+    assert.equal(value.isError, true)
+    assert.match(value.output, /aborted/i)
+
+    // Wait briefly for cancelled turn to settle, then verify session remains usable
+    await new Promise(r => setTimeout(r, 30))
+    const follow = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'ping after abort' }] } as Message],
+        sessionId: 'dsh-tool-abort',
+      } as GenerateOptions),
+    )
+    assert.equal(follow.filter(c => c.type === 'text-delta').map(c => c.text).join(''), '[sess_1#2] ping after abort')
+  } finally {
+    pool.dispose()
+  }
+})
+
+test('parallel tool calls with out-of-order completion resume cleanly without duplicates and Code Mode retains input', async () => {
+  const { adapter, pool, mirrorTool } = createHarness()
+  const mirrorSchema = { name: MIRROR_TOOL_NAME, description: '', parameters: { type: 'object', properties: {} } }
+  const codeSchema = { name: WRAPPER_TOOL_NAME, description: '', parameters: { type: 'object', properties: {} } }
+  try {
+    const span1 = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        tools: [mirrorSchema],
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'PARALLEL_TOOLS' }] } as Message],
+        sessionId: 'dsh-parallel',
+      } as unknown as GenerateOptions),
+    )
+    const toolBlocks = span1
+      .filter((c): c is Extract<StreamChunk, { type: 'block-end' }> => c.type === 'block-end' && c.block.type === 'tool-call')
+      .map(c => c.block as Extract<typeof c.block, { type: 'tool-call' }>)
+    assert.ok(toolBlocks.length >= 1)
+
+    // Execute every emitted tool call concurrently and feed results back in reverse order
+    const results = await Promise.all(
+      toolBlocks.map(async (b) => {
+        const args = JSON.parse(b.arguments) as Record<string, unknown>
+        const value = await mirrorTool.execute(args, { agent: { session: { id: 'dsh-parallel' } } } as ToolRunContext)
+        return {
+          role: 'tool',
+          toolCallId: b.id,
+          content: mirrorTool.output.render(args, value as never),
+          isError: false,
+        }
+      }),
+    )
+
+    let messages: unknown[] = [
+      { role: 'user', content: [{ type: 'text', text: 'PARALLEL_TOOLS' }] },
+      { role: 'assistant', content: toolBlocks },
+      ...results.reverse(),
+    ]
+    let finalText = ''
+    const seenToolCallIds = new Set(toolBlocks.map(b => (JSON.parse(b.arguments) as { toolCallId?: string }).toolCallId))
+
+    for (let hop = 0; hop < 3; hop++) {
+      const nextSpan = await collectChunks(
+        adapter.stream({
+          provider: PROVIDER_ID,
+          model: 'gemini-4-neon',
+          tools: [mirrorSchema],
+          messages,
+          sessionId: 'dsh-parallel',
+        } as unknown as GenerateOptions),
+      )
+      finalText += nextSpan.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+      const moreTools = nextSpan
+        .filter((c): c is Extract<StreamChunk, { type: 'block-end' }> => c.type === 'block-end' && c.block.type === 'tool-call')
+        .map(c => c.block as Extract<typeof c.block, { type: 'tool-call' }>)
+      if (moreTools.length === 0) break
+      const moreResults = await Promise.all(
+        moreTools.map(async (b) => {
+          const args = JSON.parse(b.arguments) as Record<string, unknown>
+          assert.equal(seenToolCallIds.has(args.toolCallId as string), false)
+          seenToolCallIds.add(args.toolCallId as string)
+          const value = await mirrorTool.execute(args, { agent: { session: { id: 'dsh-parallel' } } } as ToolRunContext)
+          return { role: 'tool', toolCallId: b.id, content: mirrorTool.output.render(args, value as never), isError: false }
+        }),
+      )
+      messages = [...messages, { role: 'assistant', content: moreTools }, ...moreResults]
+    }
+    assert.equal(seenToolCallIds.size, 2)
+    assert.equal(finalText, 'Both parallel tools done.')
+
+    // Code Mode preserves bounded input inside run_code wrapper
+    const codeSpan = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        tools: [codeSchema],
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'LIVE_TOOL_INCREMENTAL' }] } as Message],
+        sessionId: 'dsh-code-mode',
+      } as unknown as GenerateOptions),
+    )
+    const codeBlock = codeSpan.find((c) => c.type === 'block-end' && c.block.type === 'tool-call')
+    assert.ok(codeBlock && codeBlock.type === 'block-end' && codeBlock.block.type === 'tool-call')
+    assert.equal(codeBlock.block.name, WRAPPER_TOOL_NAME)
+    const wrapperArgs = JSON.parse(codeBlock.block.arguments) as { code: string }
+    assert.match(wrapperArgs.code, /echo live/)
+  } finally {
+    pool.dispose()
+  }
+})
+
+test('options.system passes via ACP systemPrompt.append, updates inline on change, and falls back when unsupported', async () => {
+  const { adapter, pool } = createHarness()
+  try {
+    const t1 = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        system: 'Rule Alpha',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'ECHO_SYSTEM 1' }] } as Message],
+        sessionId: 'dsh-sys',
+      } as GenerateOptions),
+    )
+    const out1 = t1.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+    assert.match(out1, /^SYS=Rule Alpha/)
+    assert.equal(out1.includes('<host_system_instructions>'), false)
+
+    // Unchanged system prompt should not inject updated tag
+    const t2 = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        system: 'Rule Alpha',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'ECHO_SYSTEM 2' }] } as Message],
+        sessionId: 'dsh-sys',
+      } as GenerateOptions),
+    )
+    const out2 = t2.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+    assert.equal(out2.includes('<host_system_instructions_updated>'), false)
+
+    // Changed system prompt injects updated tag without destroying persistent session
+    const t3 = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        system: 'Rule Beta',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'ECHO_SYSTEM 3' }] } as Message],
+        sessionId: 'dsh-sys',
+      } as GenerateOptions),
+    )
+    const out3 = t3.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+    assert.match(out3, /<host_system_instructions_updated>[\s\S]*Rule Beta[\s\S]*<\/host_system_instructions_updated>/)
+    assert.equal(pool.getStatus().activeSessions, 1)
+
+    // Clearing system prompt does NOT inject an empty updated tag
+    const t4 = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'ECHO_SYSTEM 4' }] } as Message],
+        sessionId: 'dsh-sys',
+      } as GenerateOptions),
+    )
+    const out4 = t4.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+    assert.equal(out4.includes('<host_system_instructions_updated>'), false)
+  } finally {
+    pool.dispose()
+  }
+
+  // Fallback when peer does not advertise systemPrompt.append
+  const prevEnv = process.env.FAKE_NO_SYSTEM_APPEND
+  process.env.FAKE_NO_SYSTEM_APPEND = '1'
+  const fallbackHarness = createHarness()
+  try {
+    const fb = await collectChunks(
+      fallbackHarness.adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        system: 'Fallback Rule',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'ECHO_SYSTEM fb' }] } as Message],
+        sessionId: 'dsh-sys-fb',
+      } as GenerateOptions),
+    )
+    const out = fb.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+    assert.match(out, /^SYS=NONE\|\|PROMPT=<host_system_instructions>[\s\S]*Fallback Rule/)
+  } finally {
+    if (prevEnv === undefined) delete process.env.FAKE_NO_SYSTEM_APPEND
+    else process.env.FAKE_NO_SYSTEM_APPEND = prevEnv
+    fallbackHarness.pool.dispose()
+  }
+})
+
+test('options.purpose auxiliary calls enforce mode=default, deny all permissions, stay out of main sessions, and anonymous non-purpose still rejects', async () => {
+  const { adapter, pool } = createHarness()
+  try {
+    const auxChunks = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        purpose: 'session-title',
+        system: 'Generate a short title.',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'AUX_TRY_TOOL' }] } as Message],
+      } as GenerateOptions),
+    )
+    const auxText = auxChunks.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+    assert.equal(auxText, 'AUX_MODE=default|READ=false|EXEC=false|SYS=META')
+    assert.equal(pool.getStatus().activeSessions, 0)
+    const usage = auxChunks.find(c => c.type === 'usage')
+    assert.ok(usage && usage.type === 'usage' && usage.usage.inputTokens === 40)
+
+    // Missing sessionId WITHOUT purpose must still throw
+    await assert.rejects(
+      async () => collectChunks(adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'anonymous' }] } as Message],
+      } as GenerateOptions)),
+      /identified DSH conversation turn/,
+    )
   } finally {
     pool.dispose()
   }

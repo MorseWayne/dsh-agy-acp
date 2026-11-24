@@ -6,7 +6,10 @@ import type {
   AcpMcpServerSpec,
   AcpUsage,
   InitializeResult,
+  PromptContentBlock,
   SessionNewResult,
+  SessionPromptResult,
+  SessionUpdatePayload,
   RequestPermissionParams, RequestPermissionResult,
 } from '../acp/protocol.ts'
 import {
@@ -38,9 +41,23 @@ export interface ManagedAcpSession {
   currentEffort: string
   currentMode: string
   configOptions: AcpConfigOption[]
+  supportsSystemPromptAppend?: boolean
+  appliedSystemHash?: string | null
   contextUsed: number | null
   contextSize: number
   lastActiveAt: number
+}
+
+export interface AuxiliaryPromptParams {
+  sessionKey?: string
+  model?: string
+  effort?: string
+  systemPromptAppend: string
+  systemFallbackBlock: PromptContentBlock
+  prompt: PromptContentBlock[]
+  signal?: AbortSignal
+  timeoutMs?: number
+  onUpdate?: (update: SessionUpdatePayload) => void
 }
 
 /** Default single-account provider (current machine login). */
@@ -304,7 +321,12 @@ export class AcpSessionPool extends EventEmitter {
     } }
   }
 
-  private async newClient(policy: FilePolicy, env: NodeJS.ProcessEnv | undefined, signal: AbortSignal, onPermission?: (r: RequestPermissionParams) => Promise<RequestPermissionResult>): Promise<AcpClient> {
+  private async newClient(
+    policy: FilePolicy,
+    env: NodeJS.ProcessEnv | undefined,
+    signal: AbortSignal,
+    onPermission?: (r: RequestPermissionParams) => Promise<RequestPermissionResult>,
+  ): Promise<{ client: AcpClient; initResult: InitializeResult }> {
     const bin = this.deps.resolveBin()
     if (!bin) throw new Error('agy binary not found — install Antigravity CLI first')
     const [exe, ...args] = await this.deps.prepareArgv([bin, 'acp'], policy, signal)
@@ -316,13 +338,20 @@ export class AcpSessionPool extends EventEmitter {
     signal.addEventListener('abort', stop, { once: true })
     try {
       client.start()
-      this.initResult = await client.initialize()
-      return client
+      const initResult = await client.initialize()
+      this.initResult = initResult
+      return { client, initResult }
     } catch (err) { client.dispose(); throw err }
     finally { signal.removeEventListener('abort', stop) }
   }
 
-  async getOrCreateSession(key: string, cwd: string, model = '', exclude?: ReadonlySet<string>): Promise<{ client: AcpClient; session: ManagedAcpSession; created: boolean }> {
+  async getOrCreateSession(
+    key: string,
+    cwd: string,
+    model = '',
+    exclude?: ReadonlySet<string>,
+    systemPrompt?: { append: string; hash: string },
+  ): Promise<{ client: AcpClient; session: ManagedAcpSession; created: boolean }> {
     if (this.disposed || this.opening.has(key)) throw new Error('ACP session unavailable or opening')
     const previous = this.active.get(key)
     if (previous?.controller.signal.aborted) await previous.done
@@ -346,15 +375,23 @@ export class AcpSessionPool extends EventEmitter {
     try {
       lease = await this.accountProvider.acquire(key, model, exclude)
       opening.signal.throwIfAborted()
-      client = await this.newClient(policy, lease.env, opening.signal, async req => {
+      const launched = await this.newClient(policy, lease.env, opening.signal, async req => {
         const signal = this.activeSignal(key)
         if (!signal || this.clients.get(key) !== client || req.sessionId !== this.sessions.get(key)?.acpSessionId) return cancelled()
         return await this.deps.onPermission?.(req, key, signal) ?? cancelled()
       })
+      client = launched.client
+      const supportsSystemPromptAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
       opening.signal.throwIfAborted()
       const mcpServers = await this.deps.getMcpServers?.(key) ?? []
       opening.signal.throwIfAborted()
-      const res = await client.sessionNew({ cwd, mcpServers })
+      const res = await client.sessionNew({
+        cwd,
+        mcpServers,
+        ...(supportsSystemPromptAppend && systemPrompt?.append
+          ? { _meta: { antigravity: { systemPrompt: { append: systemPrompt.append } } } }
+          : {}),
+      })
       opening.signal.throwIfAborted()
       if (policyKey(this.policy(key)) !== fingerprint) throw new Error('DSH session policy changed during startup')
       const { routes: modelRoutes, models } = this.captureCatalogFromSession(res)
@@ -366,7 +403,10 @@ export class AcpSessionPool extends EventEmitter {
         currentModel: findCurrentOption(configOptions, 'model') ?? res.models?.currentModelId ?? '',
         currentEffort: findCurrentOption(configOptions, 'thought_level') ?? '',
         currentMode: findCurrentOption(configOptions, 'mode') ?? res.modes?.currentModeId ?? '',
-        configOptions, contextUsed: null, contextSize: 0, lastActiveAt: Date.now(),
+        configOptions,
+        supportsSystemPromptAppend,
+        appliedSystemHash: supportsSystemPromptAppend && systemPrompt ? systemPrompt.hash : null,
+        contextUsed: null, contextSize: 0, lastActiveAt: Date.now(),
       }
       this.clients.set(key, client)
       this.sessions.set(key, session)
@@ -378,6 +418,146 @@ export class AcpSessionPool extends EventEmitter {
       this.deps.onSessionClosed?.(key)
       throw err
     } finally { opening.signal.removeEventListener('abort', stopOpening); this.opening.delete(key); lease?.release() }
+  }
+
+  /**
+   * Stateless, read-only, tool-free auxiliary prompt execution (e.g. `session-title`, `compaction`).
+   * Never enters `this.sessions`, refuses all permissions, enforces `mode=default`, and cleans up immediately.
+   */
+  async runAuxiliaryPrompt(params: AuxiliaryPromptParams): Promise<SessionPromptResult> {
+    if (this.disposed) throw new Error('ACP session pool disposed')
+    const cfg = this.deps.getConfig()
+    const runSignal = params.signal ? AbortSignal.any([this.lifetime.signal, params.signal]) : this.lifetime.signal
+    runSignal.throwIfAborted()
+
+    let cwd = params.sessionKey ? this.sessions.get(params.sessionKey)?.cwd : undefined
+    if (!cwd && params.sessionKey) {
+      try { cwd = this.policy(params.sessionKey).workspaceRoot } catch { /* fallback to workspaceRoot/cwd */ }
+    }
+    cwd = cwd || cfg.workspaceRoot || process.cwd()
+
+    const requestedModel = params.model || cfg.defaultModel || ''
+    const lease = await this.accountProvider.acquire('__auxiliary__', requestedModel)
+    let client: AcpClient | undefined
+    let acpSessionId: string | undefined
+    let unsub: (() => void) | undefined
+    const onAbort = (): void => {
+      if (acpSessionId && client?.isRunning) client.sessionCancel(acpSessionId)
+    }
+
+    const denyAllPermissions = async (req: RequestPermissionParams): Promise<RequestPermissionResult> => {
+      const reject = req.options.find(o => o.kind === 'reject_once')
+      return reject ? { outcome: { outcome: 'selected', optionId: reject.optionId } } : cancelled()
+    }
+
+    try {
+      runSignal.throwIfAborted()
+      const launched = await this.newClient(
+        { sessionId: '__auxiliary__', mode: 'read-only', workspaceRoot: cwd },
+        lease.env,
+        runSignal,
+        denyAllPermissions,
+      )
+      client = launched.client
+      const supportsAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
+      runSignal.throwIfAborted()
+
+      const res = await client.sessionNew({
+        cwd,
+        mcpServers: [],
+        ...(supportsAppend && params.systemPromptAppend
+          ? { _meta: { antigravity: { systemPrompt: { append: params.systemPromptAppend } } } }
+          : {}),
+      })
+      acpSessionId = res.sessionId
+      runSignal.throwIfAborted()
+
+      let configOptions = res.configOptions ?? []
+      const modeOpt = selectOption(configOptions, 'mode')
+      let currentMode = modeOpt?.currentValue ?? res.modes?.currentModeId ?? ''
+      if (currentMode !== 'default') {
+        const canSetDefault =
+          values(modeOpt).some(o => o.value === 'default') ||
+          Boolean(res.modes?.availableModes?.some(m => m.id === 'default'))
+        if (canSetDefault) {
+          const modeRes = await client.sessionSetConfigOption({
+            sessionId: acpSessionId,
+            configId: modeOpt?.id ?? 'mode',
+            value: 'default',
+          })
+          if (modeRes.configOptions) configOptions = modeRes.configOptions
+          currentMode = modeRes.configOptions ? (findCurrentOption(modeRes.configOptions, 'mode') ?? '') : 'default'
+        }
+        if (currentMode !== 'default' && currentMode !== 'plan' && currentMode !== '') {
+          throw new Error(`Antigravity auxiliary call refused unsafe permission mode "${currentMode}"`)
+        }
+      }
+
+      const { routes } = modelCatalog(res)
+      let currentModel = findCurrentOption(configOptions, 'model') ?? res.models?.currentModelId ?? ''
+      if (requestedModel) {
+        const route = routes.get(requestedModel)
+        const targetModel = route?.value ?? requestedModel
+        if (targetModel && targetModel !== currentModel) {
+          if (route?.kind === 'legacy') {
+            await client.request('session/set_model', { sessionId: acpSessionId, modelId: targetModel }, 15_000)
+            currentModel = targetModel
+          } else if (route?.kind === 'config' || values(selectOption(configOptions, 'model')).some(o => o.value === targetModel)) {
+            const mRes = await client.sessionSetConfigOption({
+              sessionId: acpSessionId,
+              configId: selectOption(configOptions, 'model')?.id ?? 'model',
+              value: targetModel,
+            })
+            if (mRes.configOptions) configOptions = mRes.configOptions
+            currentModel = mRes.configOptions ? (findCurrentOption(mRes.configOptions, 'model') ?? targetModel) : targetModel
+          }
+        }
+      }
+
+      if (params.effort) {
+        const thoughtOpt = selectOption(configOptions, 'thought_level')
+        if (thoughtOpt && values(thoughtOpt).some(o => o.value === params.effort) && thoughtOpt.currentValue !== params.effort) {
+          const eRes = await client.sessionSetConfigOption({
+            sessionId: acpSessionId,
+            configId: thoughtOpt.id,
+            value: params.effort,
+          })
+          if (eRes.configOptions) configOptions = eRes.configOptions
+        }
+      }
+
+      if (params.onUpdate) {
+        unsub = client.onSessionUpdate(acpSessionId, params.onUpdate)
+      }
+      runSignal.addEventListener('abort', onAbort, { once: true })
+      runSignal.throwIfAborted()
+
+      const promptBlocks = supportsAppend ? params.prompt : [params.systemFallbackBlock, ...params.prompt]
+      const timeoutMs = params.timeoutMs ?? Math.min(cfg.requestTimeoutMs, 90_000)
+      const result = await client.sessionPrompt({ sessionId: acpSessionId, prompt: promptBlocks }, timeoutMs)
+      this.reportAccountSuccess(lease.accountId, requestedModel)
+      this.recordTurnUsage(result.usage)
+      return result
+    } catch (err) {
+      this.reportAccountFailure(lease.accountId, requestedModel, err)
+      throw err
+    } finally {
+      runSignal.removeEventListener('abort', onAbort)
+      unsub?.()
+      if (acpSessionId && client?.isRunning && !runSignal.aborted) {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        await Promise.race([
+          client.sessionClose(acpSessionId).catch(() => {}),
+          new Promise<void>(resolve => {
+            timer = setTimeout(resolve, 1_000)
+            timer.unref?.()
+          }),
+        ])
+        if (timer) clearTimeout(timer)
+      }
+      client?.dispose()
+      lease.release()
+    }
   }
 
   async syncSessionOptions(
@@ -480,7 +660,7 @@ export class AcpSessionPool extends EventEmitter {
     try {
       const root = cwd || this.deps.getConfig().workspaceRoot || process.cwd()
       // No initiating agent: never prompt, attach MCP, or start an unrestricted helper.
-      client = await this.newClient({ sessionId: '__catalog__', workspaceRoot: root, mode: 'read-only' }, lease.env, this.lifetime.signal)
+      client = (await this.newClient({ sessionId: '__catalog__', workspaceRoot: root, mode: 'read-only' }, lease.env, this.lifetime.signal)).client
       this.lifetime.signal.throwIfAborted()
       const stop = () => client?.dispose()
       this.lifetime.signal.addEventListener('abort', stop, { once: true })
