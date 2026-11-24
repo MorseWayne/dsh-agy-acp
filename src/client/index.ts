@@ -3,8 +3,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import React from 'react'
 // @ts-expect-error runtime ReactDOM is supplied by the DSH web host
 import ReactDOM from 'react-dom'
+import { effortLabel, sortedEfforts } from '../common/effort.ts'
+import { AccountCard } from './account-card.ts'
+import { sessionAccountLabel } from './account-display.ts'
+import { initialSnapshot, reduceSnapshot, snapshotNotice, type SnapshotState } from './snapshot-state.ts'
 import type {
-  AccountHealthSnapshot,
   SessionSummary,
   StatusSnapshot,
 } from '../common/types.ts'
@@ -13,6 +16,7 @@ export const name = 'dsh-agy-acp-client'
 export const inject = ['slots']
 
 interface SlotOwnerProps {
+  sessionId?: string
   view?: string
 }
 
@@ -20,7 +24,7 @@ interface ClientContext extends Context {
   slots: {
     inject(name: string, register: () => () => void): void
     register(
-      opts: { name: string; id?: string; key?: string; order?: number; label?: string },
+      opts: { name: string; id?: string; key?: string; order?: number; label?: string; inject?: (sessionId: string) => SlotOwnerProps },
       Component: (props?: SlotOwnerProps) => unknown,
     ): () => void
   }
@@ -30,6 +34,12 @@ function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
   return String(n)
+}
+
+function contextLabel(s: SessionSummary): string {
+  if (s.contextUsed == null) return '待上报'
+  if (!(s.contextSize > 0)) return `${formatTokens(s.contextUsed)}（容量未知）`
+  return `${formatTokens(s.contextUsed)} / ${formatTokens(s.contextSize)}（${(100 * s.contextUsed / s.contextSize).toFixed(1)}%）`
 }
 
 async function postJson(url: string, body: Record<string, unknown>): Promise<StatusSnapshot | null> {
@@ -47,41 +57,55 @@ async function postJson(url: string, body: Record<string, unknown>): Promise<Sta
   }
 }
 
-function useAgyAcpStatus(): StatusSnapshot | null {
-  const [status, setStatus] = React.useState(null as StatusSnapshot | null)
+interface StatusView extends SnapshotState {
+  applyStatus: (next: StatusSnapshot) => void
+}
+
+function useAgyAcpStatus(): StatusView {
+  const [state, dispatch] = React.useReducer(reduceSnapshot, initialSnapshot)
+  const applyStatus = React.useCallback((value: StatusSnapshot) => dispatch({ type: 'action', value }), [])
 
   React.useEffect(() => {
     let active = true
     void fetch('/plugins/agy-acp/status')
       .then((r) => (r.ok ? r.json() : null))
       .then((snap) => {
-        if (active && snap) setStatus(snap as StatusSnapshot)
+        if (!active) return
+        dispatch(snap ? { type: 'initial', value: snap } : { type: 'readFailed' })
       })
-      .catch(() => undefined)
+      .catch(() => { if (active) dispatch({ type: 'readFailed' }) })
 
     const es = new EventSource('/plugins/agy-acp/events')
     const onStatus = (ev: MessageEvent<string>): void => {
       try {
         const next = JSON.parse(ev.data) as StatusSnapshot
-        setStatus(next)
+        if (active && Number.isFinite(next?.updatedAt) && Array.isArray(next.sessions) && Array.isArray(next.accounts)) {
+          dispatch({ type: 'sse', value: next })
+        }
       } catch {
         // ignore malformed frame
       }
     }
+    const onError = (): void => { if (active) dispatch({ type: 'disconnect' }) }
+    es.addEventListener('error', onError)
     es.addEventListener('status', onStatus as EventListener)
     return () => {
       active = false
+      es.removeEventListener('error', onError)
       es.removeEventListener('status', onStatus as EventListener)
       es.close()
     }
   }, [])
 
-  return status
+  return { ...state, applyStatus }
 }
 
 /** Full Settings & Plugin Configuration page (`settings.section`, `plugins.bundle.config`, `plugins.row.config`). */
 function AgyAcpSettingsSection(): unknown {
-  const status = useAgyAcpStatus()
+  return React.createElement(SettingsView, useAgyAcpStatus())
+}
+
+function SettingsView({ status, stream, failed, applyStatus }: StatusView): unknown {
   const [busy, setBusy] = React.useState(false)
   const [savedMsg, setSavedMsg] = React.useState('')
 
@@ -102,13 +126,22 @@ function AgyAcpSettingsSection(): unknown {
     setWorkspaceRoot(status.config?.workspaceRoot ?? '')
   }, [status])
 
-  const connected = Boolean(status?.connected)
-  const sessions = status?.sessions ?? []
-  const accounts = status?.accounts ?? []
+  if (!status) return React.createElement('p', { role: 'status' }, stream === 'offline' || failed ? '暂时无法读取 ACP 状态，等待连接恢复。' : '正在读取 ACP 状态…')
+
+  const notice = snapshotNotice({ status, stream })
+  const connected = !notice && status.connected
+  const sessions = status.sessions
+  const accounts = status.accounts
+  const models = status?.models ?? []
+  const selected = models.find(m => m.value === defaultModel.trim())
+  const effortChoices = selected?.efforts ?? sortedEfforts(models.flatMap(m => m.efforts))
+  const knownEfforts = !!selected || (!defaultModel.trim() && models.length > 0)
+  const incompatible = knownEfforts && defaultEffort !== '' && !effortChoices.includes(defaultEffort)
   const totals = status?.usageTotals ?? {
     inputTokens: 0,
     outputTokens: 0,
     cachedReadTokens: 0,
+    cachedWriteTokens: 0,
     reasoningTokens: 0,
   }
 
@@ -116,15 +149,16 @@ function AgyAcpSettingsSection(): unknown {
     setBusy(true)
     setSavedMsg('')
     try {
-      await postJson('/plugins/agy-acp/config', {
+      const saved = await postJson('/plugins/agy-acp/config', {
         mcpBridge,
         defaultModel,
         defaultEffort,
         agyBin,
         workspaceRoot,
       })
-      setSavedMsg('配置已生效')
-      setTimeout(() => setSavedMsg(''), 2500)
+      setSavedMsg(saved ? '已应用到当前插件进程' : '保存失败，请重试')
+    } catch {
+      setSavedMsg('未能连接到插件，请重试')
     } finally {
       setBusy(false)
     }
@@ -134,15 +168,6 @@ function AgyAcpSettingsSection(): unknown {
     setBusy(true)
     try {
       await postJson('/plugins/agy-acp/sessions/reset', sessionKey ? { sessionKey } : {})
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const handleClearCooldown = async (accountId?: string): Promise<void> => {
-    setBusy(true)
-    try {
-      await postJson('/plugins/agy-acp/accounts/cooldown/clear', accountId ? { accountId } : {})
     } finally {
       setBusy(false)
     }
@@ -205,9 +230,9 @@ function AgyAcpSettingsSection(): unknown {
             backgroundColor: connected ? '#22c55e' : '#94a3b8',
           },
         }),
-        connected
+        notice || (connected
           ? `${status?.agentName ?? 'agy acp'} ${status?.agentVersion ?? ''} (${status?.tierName ?? '已连接'})`
-          : '待机中（首轮对话自动建连）',
+          : '待机中（首轮对话自动建连）'),
       ),
     ),
 
@@ -221,7 +246,7 @@ function AgyAcpSettingsSection(): unknown {
         { style: { display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '8px', textAlign: 'center' } },
         React.createElement('div', null, React.createElement('div', { style: { opacity: 0.65, fontSize: '11px' } }, '活跃会话'), String(sessions.length)),
         React.createElement('div', null, React.createElement('div', { style: { opacity: 0.65, fontSize: '11px' } }, 'Input'), formatTokens(totals.inputTokens)),
-        React.createElement('div', null, React.createElement('div', { style: { opacity: 0.65, fontSize: '11px' } }, 'Cached'), formatTokens(totals.cachedReadTokens)),
+        React.createElement('div', null, React.createElement('div', { style: { opacity: 0.65, fontSize: '11px' } }, '缓存读 / 写'), `${formatTokens(totals.cachedReadTokens)} / ${formatTokens(totals.cachedWriteTokens ?? 0)}`),
         React.createElement('div', null, React.createElement('div', { style: { opacity: 0.65, fontSize: '11px' } }, 'Output'), formatTokens(totals.outputTokens)),
         React.createElement('div', null, React.createElement('div', { style: { opacity: 0.65, fontSize: '11px' } }, 'Thinking'), formatTokens(totals.reasoningTokens)),
       ),
@@ -287,14 +312,18 @@ function AgyAcpSettingsSection(): unknown {
         React.createElement(
           'div',
           null,
-          React.createElement('div', { style: { fontSize: '12px', opacity: 0.8, marginBottom: '4px' } }, '默认思考档位（留空自动）'),
-          React.createElement('input', {
-            type: 'text',
-            value: defaultEffort,
-            placeholder: 'low / medium / high',
-            onChange: (e: { target: { value: string } }) => setDefaultEffort(e.target.value),
-            style: inputStyle,
-          }),
+          React.createElement('label', null, '默认推理强度',
+            knownEfforts ? React.createElement('select', {
+              style: inputStyle, value: defaultEffort,
+              onChange: (e: { target: { value: string } }) => setDefaultEffort(e.target.value),
+            }, React.createElement('option', { value: '' }, '使用模型默认档位'),
+            incompatible ? React.createElement('option', { value: defaultEffort, disabled: true }, `${defaultEffort}（不适用于当前选择）`) : null,
+            ...effortChoices.map(id => React.createElement('option', { key: id, value: id }, effortLabel(id))))
+            : React.createElement('input', {
+              type: 'text', value: defaultEffort, placeholder: '目录尚未确认，留空使用模型默认档位',
+              onChange: (e: { target: { value: string } }) => setDefaultEffort(e.target.value), style: inputStyle,
+            }),
+          ),
         ),
         React.createElement(
           'div',
@@ -329,7 +358,7 @@ function AgyAcpSettingsSection(): unknown {
           'button',
           {
             type: 'button',
-            disabled: busy,
+            disabled: busy || !status || incompatible,
             onClick: () => void handleSaveConfig(),
             style: {
               padding: '6px 14px',
@@ -345,7 +374,7 @@ function AgyAcpSettingsSection(): unknown {
           busy ? '保存中…' : '保存并应用',
         ),
         savedMsg
-          ? React.createElement('span', { style: { color: '#22c55e', fontSize: '12px' } }, savedMsg)
+          ? React.createElement('span', { role: 'status', style: { fontSize: '12px' } }, savedMsg)
           : null,
       ),
     ),
@@ -400,10 +429,11 @@ function AgyAcpSettingsSection(): unknown {
                 'div',
                 null,
                 React.createElement('div', { style: { fontWeight: 500 } }, `${s.currentModel || 'default'} · ${s.currentMode}`),
+                React.createElement('div', { style: { overflowWrap: 'anywhere', fontSize: '12px' } }, `使用账号${notice ? '（上次快照）' : ''}：${sessionAccountLabel(s.accountId, accounts)}`),
                 React.createElement(
                   'div',
                   { style: { opacity: 0.7, fontSize: '11px' } },
-                  `会话 ${s.dshSessionKey} · 思考 ${s.currentEffort || 'auto'} · 上下文 ${formatTokens(s.contextUsed)}${s.contextSize > 0 ? '/' + formatTokens(s.contextSize) : ''}`,
+                  `会话 ${s.dshSessionKey} · 推理强度 ${s.currentEffort ? effortLabel(s.currentEffort) : '未报告'} · ACP 上下文 ${contextLabel(s)}`,
                 ),
               ),
               React.createElement(
@@ -428,81 +458,14 @@ function AgyAcpSettingsSection(): unknown {
           ),
     ),
 
-    // Multi-account pool health card (shown when accounts configured)
-    accounts.length > 0
-      ? React.createElement(
-          'div',
-          { style: cardStyle },
-          React.createElement(
-            'div',
-            { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' } },
-            React.createElement('div', { style: { fontWeight: 600 } }, `多账号池 (${accounts.length})`),
-            React.createElement(
-              'button',
-              {
-                type: 'button',
-                disabled: busy,
-                onClick: () => void handleClearCooldown(),
-                style: {
-                  padding: '3px 8px',
-                  borderRadius: '5px',
-                  border: '1px solid rgba(148,163,184,0.35)',
-                  background: 'transparent',
-                  color: 'inherit',
-                  cursor: 'pointer',
-                  fontSize: '12px',
-                },
-              },
-              '清除全部冷却',
-            ),
-          ),
-          ...accounts.map((acc: AccountHealthSnapshot) =>
-            React.createElement(
-              'div',
-              {
-                key: acc.id,
-                style: {
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  padding: '8px 10px',
-                  borderRadius: '6px',
-                  backgroundColor: 'rgba(148, 163, 184, 0.08)',
-                  marginBottom: '6px',
-                },
-              },
-              React.createElement(
-                'div',
-                null,
-                React.createElement('div', { style: { fontWeight: 500 } }, `${acc.label} (${acc.id})`),
-                React.createElement(
-                  'div',
-                  { style: { opacity: 0.7, fontSize: '11px' } },
-                  `${acc.hasSandboxHome ? '独立 HOME · ' : ''}${acc.hasProxy ? '独立代理 · ' : ''}活跃租约 ${acc.activeLeases}${acc.lastError ? ' · ' + acc.lastError : ''}`,
-                ),
-              ),
-              React.createElement(
-                'button',
-                {
-                  type: 'button',
-                  disabled: busy,
-                  onClick: () => void handleClearCooldown(acc.id),
-                  style: {
-                    padding: '3px 8px',
-                    borderRadius: '5px',
-                    border: '1px solid rgba(148,163,184,0.35)',
-                    background: 'transparent',
-                    color: 'inherit',
-                    cursor: 'pointer',
-                    fontSize: '11px',
-                  },
-                },
-                '清除冷却',
-              ),
-            ),
-          ),
-        )
-      : null,
+    React.createElement('section', { style: cardStyle },
+      React.createElement('h3', { style: { fontSize: '14px', margin: 0 } }, `账号状态 (${accounts.length})`),
+      notice ? React.createElement('div', { role: 'status', style: { marginTop: '4px', fontWeight: 550 } }, notice) : null,
+      React.createElement('p', { style: { margin: '4px 0 10px', opacity: 0.8, fontSize: '12px' } },
+        '配额仅在手动刷新时向上游查询，不按 Token 用量推算。清除本地冷却不会恢复上游额度。'),
+      accounts.length ? accounts.map(account => React.createElement(AccountCard, { key: account.id, account, applyStatus }))
+        : React.createElement('div', null, '暂无账号状态。'),
+    ),
   )
 }
 
@@ -514,9 +477,10 @@ function portalToBody(node: unknown): unknown {
 }
 
 /** Compact header badge + body-portaled console modal (`conversation.session.header.actions`). */
-function AgyAcpConsoleWidget(): unknown {
+function AgyAcpConsoleWidget(props?: SlotOwnerProps): unknown {
   const [open, setOpen] = React.useState(false)
-  const status = useAgyAcpStatus()
+  const state = useAgyAcpStatus()
+  const { status } = state
 
   React.useEffect(() => {
     if (!open || typeof window === 'undefined') return
@@ -527,11 +491,11 @@ function AgyAcpConsoleWidget(): unknown {
     return () => window.removeEventListener('keydown', onKey)
   }, [open])
 
-  const connected = Boolean(status?.connected)
-  const sessions = status?.sessions ?? []
-
-  const badgeLabel = connected ? `AGY·ACP (${sessions.length})` : 'AGY·ACP'
-  const dotColor = connected ? '#22c55e' : '#94a3b8'
+  const notice = snapshotNotice(state)
+  const current = !notice ? status?.sessions.find(s => s.dshSessionKey === props?.sessionId) : undefined
+  const badgeLabel = notice ? `AGY·ACP · ${state.stream === 'offline' ? '实时连接中断' : '连接中'}`
+    : current ? `AGY·ACP · 上下文 ${current.contextUsed == null ? '待上报' : formatTokens(current.contextUsed)}` : 'AGY·ACP'
+  const dotColor = current ? '#22c55e' : '#94a3b8'
 
   const modal = open
     ? portalToBody(
@@ -594,7 +558,7 @@ function AgyAcpConsoleWidget(): unknown {
               },
               '×',
             ),
-            React.createElement(AgyAcpSettingsSection),
+            React.createElement(SettingsView, state),
           ),
         ),
       )
@@ -611,9 +575,9 @@ function AgyAcpConsoleWidget(): unknown {
           ev.stopPropagation?.()
           setOpen((v: boolean) => !v)
         },
-        title: connected
-          ? `${status?.agentName ?? 'Antigravity ACP'} ${status?.agentVersion ?? ''} (${status?.tierName ?? '已连接'})`
-          : '打开 Antigravity ACP 控制台',
+        title: current
+          ? `${current.currentModel} · 使用账号 ${sessionAccountLabel(current.accountId, status?.accounts ?? [])} · 推理强度 ${effortLabel(current.currentEffort) || '未报告'} · ACP 上下文 ${contextLabel(current)}`
+          : notice || '打开 Antigravity ACP 控制台',
         style: {
           display: 'inline-flex',
           alignItems: 'center',
@@ -626,7 +590,7 @@ function AgyAcpConsoleWidget(): unknown {
           background: 'transparent',
           color: 'inherit',
           cursor: 'pointer',
-          opacity: connected ? 0.95 : 0.75,
+          opacity: current ? 0.95 : 0.75,
         },
       },
       React.createElement('span', {
@@ -650,6 +614,7 @@ export function apply(ctx: ClientContext): void {
       {
         name: 'conversation.session.header.actions',
         id: 'agy-acp-status',
+        inject: sessionId => ({ sessionId }),
         order: 12,
         label: 'Antigravity ACP',
       },

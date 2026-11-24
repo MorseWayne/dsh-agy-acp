@@ -214,7 +214,7 @@ async function handleRequest(id, method, params) {
       sendUpdate(sessionId, {
         sessionUpdate: 'usage_update',
         used: 320,
-        size: 1048576,
+        size: 65536,
       })
 
       const permRes = await requestClient('session/request_permission', {
@@ -264,6 +264,7 @@ async function handleRequest(id, method, params) {
           usage: {
             inputTokens: 1000,
             cachedReadTokens: 400,
+            cachedWriteTokens: 100,
             outputTokens: 50,
             thoughtTokens: 120,
             totalTokens: 1050,

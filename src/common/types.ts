@@ -30,7 +30,21 @@ export interface FamilyQuotaState {
   consecutiveFailures: number
 }
 
+/** Upstream CLI groups need not match the local scheduler's model families. */
+export interface AccountQuotaGroup {
+  name: string
+  fiveHour?: QuotaBucketState
+  sevenDay?: QuotaBucketState
+}
+
+export interface AccountQuotaSample {
+  sampledAt: number
+  groups: AccountQuotaGroup[]
+}
+
 export interface AccountHealthSnapshot {
+  quota?: AccountQuotaSample
+  quotaRefreshUnavailable?: string
   id: string
   label: string
   enabled: boolean
@@ -62,16 +76,20 @@ export interface AcpModelOption {
   value: string
   name: string
   efforts: string[]
+  nativeEffort?: string
+  /** Fixed-effort compatibility route; only its base belongs in a model picker. */
+  variantOf?: string
 }
 
 export interface SessionSummary {
+  accountId: string
   dshSessionKey: string
   acpSessionId: string
   cwd: string
   currentModel: string
   currentEffort: string
   currentMode: string
-  contextUsed: number
+  contextUsed: number | null
   contextSize: number
   lastActiveAt: number
 }
@@ -80,6 +98,7 @@ export interface UsageTotals {
   inputTokens: number
   outputTokens: number
   cachedReadTokens: number
+  cachedWriteTokens: number
   reasoningTokens: number
 }
 
@@ -124,6 +143,8 @@ export interface AccountProvider {
   acquire(sessionKey: string, model: string, excludeAccountIds?: ReadonlySet<string>): Promise<AccountLease>
   reportSuccess?(accountId: string, model: string): void
   reportFailure?(accountId: string, model: string, error: unknown): void
+  /** Acquire only this profile's environment, without invoking model selection or changing stickiness. */
+  acquireQuotaLease?(accountId: string): Promise<AccountLease & { requiresFileCredentialMode?: boolean }>
   getHealthSnapshots?(): AccountHealthSnapshot[]
   clearCooldown?(accountId?: string): void
   dispose?(): void

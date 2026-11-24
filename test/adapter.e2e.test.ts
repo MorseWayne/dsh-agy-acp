@@ -50,7 +50,7 @@ function createHarness() {
     runs,
   })
   const mirrorTool = defineAgyAcpMirrorTool(runs)
-  return { adapter, pool, runs, mirrorTool, permissionLog }
+  return { adapter, pool, cfg, runs, mirrorTool, permissionLog }
 }
 
 test('AcpAdapter.stream() reuses persistent ACP session across multi-turn conversation', async () => {
@@ -118,6 +118,11 @@ test('AcpAdapter.stream() splits span on tool call, replays via agy_acp_tool, an
     )
 
     assert.deepEqual(permissionLog, ['run_command'])
+    assert.equal(span1.some(c => c.type === 'usage'), false)
+    const observed = pool.getStatus().sessions[0]!
+    assert.equal(observed.contextUsed, 320)
+    assert.equal(observed.contextSize, 65536)
+    assert.equal((await adapter.resolveModel(PROVIDER_ID, 'gemini-4-neon')).context?.contextWindow, 65536)
 
     const reasoning1 = span1
       .filter((c) => c.type === 'reasoning-delta')
@@ -198,9 +203,22 @@ test('AcpAdapter.stream() splits span on tool call, replays via agy_acp_tool, an
 
     const usage2 = span2.find((c) => c.type === 'usage')
     assert.ok(usage2 && usage2.type === 'usage')
-    assert.equal(usage2.usage.inputTokens, 600) // 1000 - 400
+    assert.equal(usage2.usage.inputTokens, 500) // 1000 - 400 read - 100 write
+    assert.equal(usage2.usage.cacheWriteTokens, 100)
+    assert.equal(pool.getStatus().usageTotals.inputTokens, 500)
+    assert.equal(pool.getStatus().usageTotals.cachedWriteTokens, 100)
     assert.equal(usage2.usage.cacheReadTokens, 400)
     assert.equal(usage2.usage.reasoningTokens, 120)
+
+    const followUp = await collectChunks(adapter.stream({ provider: PROVIDER_ID, model: 'claude-sonnet-5-5', sessionId: 'dsh-tool-conv',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'switch model' }] }],
+    } as GenerateOptions))
+    assert.ok(followUp.some(c => c.type === 'text-delta'))
+    assert.equal(pool.getStatus().sessions[0]?.contextUsed, null)
+    assert.equal(pool.getStatus().sessions[0]?.contextSize, 0)
+    const nextModel = await adapter.resolveModel(PROVIDER_ID, 'claude-sonnet-5-5')
+    assert.notEqual(nextModel.context?.contextWindow, 65536)
+    assert.equal(nextModel.reasoning?.defaultEffort, 'medium') // returned on model switch, not guessed at session/new
 
     const finish2 = span2.find((c) => c.type === 'finish')
     assert.ok(finish2 && finish2.type === 'finish')
@@ -208,6 +226,32 @@ test('AcpAdapter.stream() splits span on tool call, replays via agy_acp_tool, an
   } finally {
     pool.dispose()
   }
+})
+
+test('resolved reasoning defaults match persistent ACP selection after returning to Default', async () => {
+  const { adapter, pool, cfg } = createHarness()
+  const model = 'gemini-4-neon'
+  const resolve = async () => (await adapter.resolveModel(PROVIDER_ID, model)).reasoning
+  const turn = (effort?: string) => collectChunks(adapter.stream({ provider: PROVIDER_ID, model,
+    reasoningEffort: effort, sessionId: 'reasoning', messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+  } as GenerateOptions))
+  try {
+    const listed = (await adapter.listModels(PROVIDER_ID)).map(m => m.id)
+    assert.deepEqual(listed, ['gemini-4-neon', 'claude-sonnet-5-5'])
+    assert.deepEqual(pool.getStatus().models.map(m => m.value), listed)
+    assert.deepEqual((await resolve())?.efforts.map(e => e.id), ['low', 'medium', 'high'])
+    assert.equal((await resolve())?.defaultEffort, 'medium')
+    cfg.defaultEffort = 'invalid'
+    assert.equal((await resolve())?.defaultEffort, 'medium')
+    cfg.defaultEffort = 'high'
+    assert.equal((await resolve())?.defaultEffort, 'high')
+    assert.equal((await adapter.resolveModel(PROVIDER_ID, `${model}-low`)).reasoning?.defaultEffort, 'low')
+    await turn('low')
+    assert.equal(pool.getStatus().sessions[0]?.currentEffort, 'low')
+    await turn()
+    assert.equal(pool.getStatus().sessions[0]?.currentEffort, 'high')
+    assert.equal(pool.getStatus().sessions[0]?.contextUsed, null) // billing alone is not occupancy
+  } finally { pool.dispose() }
 })
 
 test('AcpAdapter.stream() propagates AbortSignal to session/cancel and finishes as aborted', async () => {

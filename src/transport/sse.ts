@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { StatusSnapshot } from '../common/types.ts'
+import { AccountQuotaError } from '../runtime/account-quota.ts'
 import type { AcpSessionPool } from '../runtime/session-pool.ts'
 
 export interface ExactRouteSpec {
@@ -168,6 +169,27 @@ export function registerAcpRoutes(
       }
     } catch (err) {
       sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) })
+    }
+  })
+
+  addRoute('POST', '/plugins/agy-acp/accounts/quota/refresh', async (req, res) => {
+    if (req.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !== 'application/json') {
+      sendJson(res, 415, { error: '请使用 JSON 请求' })
+      return
+    }
+    let body: Record<string, unknown>
+    try { body = await readJsonBody(req) } catch { sendJson(res, 400, { error: '无效的 JSON 请求' }); return }
+    if (typeof body.accountId !== 'string' || !body.accountId.trim()) {
+      sendJson(res, 400, { error: '请选择要刷新的账号' })
+      return
+    }
+    try {
+      await pool.refreshAccountQuota(body.accountId)
+      sendJson(res, 200, { ok: true, status: pool.getStatus() })
+    } catch (err) {
+      // Never expose child stderr, slot paths, sandbox argv or inherited env values.
+      sendJson(res, err instanceof AccountQuotaError ? err.status : 503,
+        { error: err instanceof AccountQuotaError ? err.message : '无法在对应账号的只读环境中查询配额' })
     }
   })
 

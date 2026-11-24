@@ -20,6 +20,12 @@ test('preserves all 27 CLI IDs, grouped base selectors, and independent orchestr
   assert.equal(ids.length, 27)
   assert.deepEqual(new Set(models.map(m => m.value)), new Set([...ids, ...bases]))
   assert.equal(models.length, new Set(models.map(m => m.value)).size)
+  assert.deepEqual(models.find(m => m.value === bases[0])?.efforts, ['low', 'medium', 'high', 'xhigh'])
+  assert.equal(models.find(m => m.value === bases[0])?.nativeEffort, 'medium')
+  assert.deepEqual(models.find(m => m.value === 'gemini-4-hydrogen-xhigh')?.efforts, ['xhigh'])
+  assert.deepEqual(models.filter(m => !m.variantOf).map(m => m.value), [...bases, ...standalone])
+  assert.deepEqual(models.find(m => m.value === 'claude-opus-5-5')?.efforts, ['low', 'medium', 'high'])
+  assert.equal(models.find(m => m.value === 'claude-opus-5-5-high')?.variantOf, 'claude-opus-5-5')
   assert.equal(routes.get('gpt-oss-120b-medium')?.kind, 'legacy')
   assert.equal(routes.has('gpt-oss-120b'), false)
   assert.deepEqual(modelCatalog({ models: setup().models }).models.map(m => m.value), ids)
@@ -36,10 +42,12 @@ test('routes a fixed variant through the real config IDs and an independent lega
     },
     async request(method: string, params: unknown) { calls.push([method, params]) },
   } as unknown as AcpClient
-  const session: ManagedAcpSession = { modelRoutes: modelCatalog(data).routes, dshSessionKey: 'd', acpSessionId: 's', accountId: 'a', cwd: '.', currentModel: bases[0]!, currentEffort: 'medium', currentMode: '', configOptions: options, contextUsed: 0, contextSize: 0, lastActiveAt: 0 }
+  const session: ManagedAcpSession = { models: modelCatalog(data).models, modelRoutes: modelCatalog(data).routes, dshSessionKey: 'd', acpSessionId: 's', accountId: 'a', cwd: '.', currentModel: bases[0]!, currentEffort: 'medium', currentMode: '', configOptions: options, contextUsed: 0, contextSize: 0, lastActiveAt: 0 }
   const sync = AcpSessionPool.prototype.syncSessionOptions
   await sync(client, session, {model: 'gemini-4-hydrogen-xhigh', effort: 'low'})
   await sync(client, session, {model: 'gemini-pro-orchestrator-argon', effort: 'medium'})
   assert.deepEqual(calls, [['engine', 'gemini-4-hydrogen'], ['thinking', 'xhigh'], ['session/set_model', { sessionId: 's', modelId: 'gemini-pro-orchestrator-argon' }]])
-  assert.equal(session.currentModel, 'gemini-pro-orchestrator-argon')
+  await assert.rejects(sync(client, session, { model: bases[0], effort: 'impossible' }), /did not select reasoning effort/)
+  const refusing = { sessionSetConfigOption: async () => ({ configOptions: options }) } as unknown as AcpClient
+  await assert.rejects(sync(refusing, session, { model: bases[0], effort: 'low' }), /did not select reasoning effort/)
 })

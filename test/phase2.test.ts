@@ -115,6 +115,14 @@ test('HTTP configuration cannot override a DSH session permission or approve ACP
       const res = await fetch(`${baseUrl}/plugins/agy-acp/${path}`, { method: 'POST', body: JSON.stringify({ permissionMode: 'skip' }) })
       assert.equal(res.status, expected)
     }
+    // Manual quota reads have no implicit 'default' account and require a JSON POST.
+    for (const [accountId, expected] of [[undefined, 400], ['missing', 404], ['default', 503]] as const) {
+      const reply = await fetch(`${baseUrl}/plugins/agy-acp/accounts/quota/refresh`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accountId }),
+      })
+      assert.equal(reply.status, expected)
+      assert.equal(typeof (await reply.json()).error, 'string')
+    }
     // 4. Reset sessions endpoint
     const resetRes = await fetch(`${baseUrl}/plugins/agy-acp/sessions/reset`, {
       method: 'POST',

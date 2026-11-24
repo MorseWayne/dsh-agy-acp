@@ -18,7 +18,21 @@ dsh plugin --profile web add @morsewayne/dsh-agy-acp --registry=https://registry
 - **原生多模态与精确计量**（`src/provider/prompt-builder.ts` + `src/provider/adapter.ts`）：直接使用 ACP `image` content block 传递图片，直接映射精确的 `inputTokens` / `cachedReadTokens` / `reasoningTokens`。
 - **DSH 原生工具卡片镜像**（`src/provider/mirror-tool.ts` + `src/provider/run-store.ts`）：保留 Span 切分与 `agy_acp_tool` 镜像，利用 ACP `tool_call_update` 原生携带的完整 `rawInput` / `rawOutput` 渲染工具卡片，无需反查本地 DB。
 - **SSE 实时推送**（`src/transport/sse.ts` + `src/client/index.ts`）：通过 `/plugins/agy-acp/events` 实时向前端推送连接与会话状态，替代轮询。
-- **扩展预留**：`AccountProvider` 接口已预留在 `src/common/types.ts`，后续可无缝挂载多账号池化、配额监控与故障转移。
+- **账号与配额**：会话按实际租约标明账号，账号卡分别展示本地路由冷却和上游配额。两者不共用状态。
+
+## 上下文与推理强度
+
+- 对话标题栏 **AGY·ACP** 显示本会话最近一次 ACP 上下文读数；悬停可见容量和占比，点击可在控制台查看。未收到 `usage_update` 时显示「待上报」，不把缺失值当成 0。DSH 自带的上下文压力指标按请求用量计算，不一定与 ACP 内部占用相同；插件在后续解析同一模型时优先使用 ACP 报告的窗口容量。
+- 工具卡片是同一个 ACP 请求的中间步骤，不单独计费。请求结束时才向 DSH 上报实际用量，非缓存输入、缓存读取、缓存写入分开统计。
+- **先选模型，再调强度**：当 ACP 提供基础模型及其推理档位时，DSH 模型列表只展示一行。选中后点击输入框旁的推理等级即可切换，不需要换模型。旧配置中的 `-high`、`-xhigh` 等固定变体仍可由适配器解析，但不会作为独立选项列出。可选值按模型目录提供，`Extra` 对应 `xhigh`。未显式选择时，先取该模型支持的插件默认值，再取 ACP 公布的初始档位；仅有变体列表时优先取已公布的 High、Medium、Low。不会沿用上一轮的手动覆盖。
+
+## 在控制台查看账号
+
+打开对话标题栏的 **AGY·ACP** 或设置里的 **Antigravity ACP**。未配置账号池时，卡片显示「本机默认账号」：这是 CLI 的运行环境，不代表插件验证过登录、邮箱或套餐。配置多个账号时，会话行显示实际使用的账号，包括故障转移后的新归属。租约数不是正在对话的会话数。
+
+- **本地路由冷却**按模型族展示截止时间；「清除本地冷却」不会改变服务端配额。
+- **刷新配额**只查询所点的账号，在宿主只读约束中运行 `agy -p /usage --output-format stream-json`。按 CLI 原始分组展示 5 小时和 7 天剩余量、重置时间及上次成功采集时间。无读数不等于 0%，窗口已过期也不等于已经补满。刷新失败保留上次成功结果；数据仅在内存中保存，不参与账号调度。
+- **账号环境无法区分时不会查询。** 多账号需要各自独立的 `homeDir` 和凭据路径，以及对应 CLI 的文件凭据模式（支持该模式的 agy 版本、已有 SSH 登录环境，或 Linux 上显式隔离的私有凭据总线）。只有代理、共享 HOME 或公共桌面钥匙串不能作为账号标识。插件不会伪造 SSH 标记、读取 token 或切换登录来取得配额。未配置账号池或单个使用宿主环境的账号可直接查询。
 
 ## 权限：跟随发起请求的 DSH 会话
 

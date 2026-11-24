@@ -1,4 +1,5 @@
 import type { AcpConfigOption, SessionNewResult } from '../acp/protocol.ts'
+import { sortedEfforts } from '../common/effort.ts'
 import type { AcpModelOption } from '../common/types.ts'
 
 export function selectOption(options: AcpConfigOption[] | undefined, key: string) {
@@ -14,14 +15,17 @@ type Route = { kind: 'config'; value: string; effort?: string } | { kind: 'legac
 export function modelCatalog(setup: Pick<SessionNewResult, 'configOptions' | 'models'>) {
   const model = selectOption(setup.configOptions, 'model')
   const entries = values(model)
-  const currentEfforts = values(selectOption(setup.configOptions, 'thought_level')).map(o => o.value)
+  const thought = selectOption(setup.configOptions, 'thought_level')
+  const currentEfforts = values(thought).map(o => o.value)
   const routes = new Map<string, Route>()
   const catalog = new Map<string, AcpModelOption>()
   const names = new Set<string>()
   function add(id: string, label: string, route: Route, efforts: string[] = []) {
     if (!id.trim() || routes.has(id)) return
     const name = label.trim() || id
-    catalog.set(id, { value: id, name: names.has(name) ? `${name} (${id})` : name, efforts: [...efforts] })
+    catalog.set(id, { value: id, name: names.has(name) ? `${name} (${id})` : name, efforts: [...efforts],
+      ...(route.kind === 'config' && route.effort ? { variantOf: route.value } : {}),
+    })
     names.add(name)
     routes.set(id, route)
   }
@@ -36,10 +40,14 @@ export function modelCatalog(setup: Pick<SessionNewResult, 'configOptions' | 'mo
     if (match && base && entries.some(e => e.value === base.value)) {
       const effort = match[2]!
       if (!base.efforts.includes(effort)) base.efforts.push(effort)
-      add(modelId, name, { kind: 'config', value: base.value, effort })
+      add(modelId, name, { kind: 'config', value: base.value, effort }, [effort])
     } else {
       add(modelId, name, { kind: 'legacy', value: modelId })
     }
+  }
+  for (const m of catalog.values()) {
+    m.efforts = sortedEfforts(m.efforts)
+    if (m.value === model?.currentValue && thought && m.efforts.includes(thought.currentValue)) m.nativeEffort = thought.currentValue
   }
   return { models: [...catalog.values()], routes }
 }

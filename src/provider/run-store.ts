@@ -21,7 +21,6 @@ export class AcpRunRecording {
   private waiters: Array<() => void> = []
   private settled = false
   private cancelHandler: (() => void) | null = null
-  lastContextUsed = 0
 
   constructor(id?: string, readonly owner?: string) {
     this.id = id ?? randomUUID().slice(0, 12)
@@ -43,9 +42,6 @@ export class AcpRunRecording {
     if (this.settled) return this.items.length - 1
     const idx = this.items.length
     this.items.push({ kind: 'update', update })
-    if (update.sessionUpdate === 'usage_update' && typeof update.used === 'number') {
-      this.lastContextUsed = update.used
-    }
     if (
       (update.sessionUpdate === 'tool_call_update' || update.sessionUpdate === 'tool_call') &&
       (update.status === 'completed' || update.status === 'failed')

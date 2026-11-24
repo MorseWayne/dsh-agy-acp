@@ -172,6 +172,7 @@ test('AcpAdapter.stream() automatically fails over to secondary account on 429 q
       .map((c) => c.text)
       .join('')
     assert.match(text, /^<backup> \[sess_1#1\] hello failover$/)
+    assert.equal(pool.getStatus().sessions.find(s => s.dshSessionKey === 'dsh-failover-conv')?.accountId, 'backup')
 
     const finish = chunks.find((c) => c.type === 'finish')
     assert.ok(finish && finish.type === 'finish')

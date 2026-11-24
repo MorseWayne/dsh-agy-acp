@@ -14,6 +14,7 @@ import {
   type AccountHealthSnapshot,
   type AccountLease,
   type AccountProvider,
+  type AccountQuotaSample,
   type AcpModelOption,
   type PluginConfig,
   type SessionSummary,
@@ -21,9 +22,13 @@ import {
   type UsageTotals,
 } from '../common/types.ts'
 
+import { AccountQuotaError, readAccountQuota, requireFileCredentialMode } from './account-quota.ts'
+import { defaultEffort, sortedEfforts } from '../common/effort.ts'
+import { mapUsage } from '../acp/usage.ts'
 import { modelCatalog, selectOption, values } from './model-catalog.ts'
 
 export interface ManagedAcpSession {
+  models: AcpModelOption[]
   modelRoutes: ReturnType<typeof modelCatalog>['routes']
   dshSessionKey: string
   acpSessionId: string
@@ -33,15 +38,38 @@ export interface ManagedAcpSession {
   currentEffort: string
   currentMode: string
   configOptions: AcpConfigOption[]
-  contextUsed: number
+  contextUsed: number | null
   contextSize: number
   lastActiveAt: number
 }
 
 /** Default single-account provider (current machine login). */
 export class SingleAccountProvider implements AccountProvider {
+  private leases = 0
+  private lastUsedAt: number | null = null
+  constructor(private readonly onChange?: () => void) {}
+
   async acquire(): Promise<AccountLease> {
-    return { accountId: 'default', release: () => {} }
+    this.lastUsedAt = Date.now()
+    this.leases++
+    this.onChange?.()
+    let released = false
+    return { accountId: 'default', release: () => {
+      if (released) return
+      released = true
+      this.leases--
+      this.onChange?.()
+    } }
+  }
+
+  async acquireQuotaLease(id: string): Promise<AccountLease> {
+    if (id !== 'default') throw new AccountQuotaError('未知账号', 404)
+    return { accountId: id, release: () => {} }
+  }
+
+  getHealthSnapshots(): AccountHealthSnapshot[] {
+    return [{ id: 'default', label: '本机默认账号', enabled: true, hasSandboxHome: false, hasProxy: false,
+      activeLeases: this.leases, lastUsedAt: this.lastUsedAt, families: {}, lastError: null }]
   }
 }
 
@@ -71,11 +99,14 @@ export class AcpSessionPool extends EventEmitter {
   private readonly active = new Map<string, { controller: AbortController; done: Promise<void>; settle(): void }>()
   private readonly lifetime = new AbortController()
   private disposed = false
+  private readonly quotaSamples = new Map<string, AccountQuotaSample>()
+  private readonly quotaReads = new Map<string, Promise<void>>()
   private catalogProbe?: Promise<AcpModelOption[]>
   private initResult: InitializeResult | null = null
   private readonly sessions = new Map<string, ManagedAcpSession>()
   private readonly accountProvider: AccountProvider
   private cachedModels: AcpModelOption[] = []
+  private readonly observedWindows = new Map<string, number>()
   private catalogExpiresAt = 0
   private cachedTier: string | null = null
   private lastError: string | null = null
@@ -84,12 +115,13 @@ export class AcpSessionPool extends EventEmitter {
     inputTokens: 0,
     outputTokens: 0,
     cachedReadTokens: 0,
+    cachedWriteTokens: 0,
     reasoningTokens: 0,
   }
 
   constructor(private readonly deps: SessionPoolDeps) {
     super()
-    this.accountProvider = deps.accountProvider ?? new SingleAccountProvider()
+    this.accountProvider = deps.accountProvider ?? new SingleAccountProvider(() => this.emitStatus())
     this.sweepTimer = setInterval(() => {
       void this.sweepIdleSessions()
     }, 60_000)
@@ -116,27 +148,73 @@ export class AcpSessionPool extends EventEmitter {
   }
 
   getAccountHealthSnapshots(): AccountHealthSnapshot[] {
-    return this.accountProvider.getHealthSnapshots?.() ?? []
+    return (this.accountProvider.getHealthSnapshots?.() ?? []).map(account => ({
+      ...account, quota: this.quotaSamples.get(account.id),
+      quotaRefreshUnavailable: !this.deps.getConfig().enabled ? 'ACP 插件未启用' : account.quotaRefreshUnavailable,
+    }))
   }
 
-  recordContextUsage(dshSessionKey: string, used: number, size: number): void {
-    const sess = this.sessions.get(dshSessionKey)
-    if (!sess) return
+  /** Manual observation only: never acquire a scheduler-selected fallback or change local cooldowns. */
+  async refreshAccountQuota(id: string): Promise<void> {
+    if (this.disposed || !this.deps.getConfig().enabled) throw new AccountQuotaError('ACP 插件未启用', 409)
+    const account = this.getAccountHealthSnapshots().find(a => a.id === id)
+    if (!account) throw new AccountQuotaError('未找到该账号', 404)
+    if (account.quotaRefreshUnavailable || !account.enabled || !this.accountProvider.acquireQuotaLease) {
+      throw new AccountQuotaError(account.quotaRefreshUnavailable || '此账号不支持配额查询', 409)
+    }
+    const pending = this.quotaReads.get(id)
+    if (pending) return pending
+    const task = this.probeAccountQuota(id).finally(() => this.quotaReads.delete(id))
+    this.quotaReads.set(id, task)
+    return task
+  }
+
+  private async probeAccountQuota(id: string): Promise<void> {
+    const bin = this.deps.resolveBin()
+    if (!bin) throw new AccountQuotaError('未找到 agy CLI', 503)
+    const cwd = this.deps.getConfig().workspaceRoot || process.cwd()
+    const signal = this.lifetime.signal
+    const lease = await this.accountProvider.acquireQuotaLease!(id)
+    try {
+      signal.throwIfAborted()
+      if (lease.accountId !== id) throw new AccountQuotaError('账号环境不匹配，未查询配额', 409)
+      const policy: FilePolicy = { sessionId: '__quota__', mode: 'read-only', workspaceRoot: cwd }
+      if (lease.requiresFileCredentialMode) {
+        const versionArgv = await this.deps.prepareArgv([bin, '--version'], policy, signal)
+        await requireFileCredentialMode(versionArgv, lease.env, cwd, signal)
+      }
+      const argv = await this.deps.prepareArgv([bin, '-p', '/usage', '--output-format', 'stream-json'], policy, signal)
+      const groups = await readAccountQuota(argv, lease.env, cwd, signal)
+      signal.throwIfAborted()
+      this.quotaSamples.set(id, { groups, sampledAt: Date.now() })
+      this.emitStatus()
+    } finally { lease.release() }
+  }
+
+  contextWindowFor(model: string): number | undefined {
+    return this.observedWindows.get(model) ?? (model.startsWith('claude') ? 200_000 : model.startsWith('gemini') ? 1_048_576 : undefined)
+  }
+
+  recordContextUsage(sess: ManagedAcpSession, model: string, used: number, size: number): void {
+    if (!this.owns(sess) || !Number.isSafeInteger(used) || used < 0) return
     sess.contextUsed = used
-    if (size > 0) sess.contextSize = size
+    if (Number.isSafeInteger(size) && size > 0) {
+      sess.contextSize = size
+      this.observedWindows.set(model, size)
+    }
     sess.lastActiveAt = Date.now()
     this.emitStatus()
   }
 
   recordTurnUsage(usage: AcpUsage | undefined): void {
     if (!usage) return
-    const cached = usage.cachedReadTokens ?? 0
-    const input = Math.max(0, (usage.inputTokens ?? 0) - cached)
+    const sample = mapUsage(usage)
     this.usageTotals = {
-      inputTokens: this.usageTotals.inputTokens + input,
-      outputTokens: this.usageTotals.outputTokens + (usage.outputTokens ?? 0),
-      cachedReadTokens: this.usageTotals.cachedReadTokens + cached,
-      reasoningTokens: this.usageTotals.reasoningTokens + (usage.thoughtTokens ?? 0),
+      inputTokens: this.usageTotals.inputTokens + sample.inputTokens,
+      outputTokens: this.usageTotals.outputTokens + sample.outputTokens,
+      cachedReadTokens: this.usageTotals.cachedReadTokens + (sample.cacheReadTokens ?? 0),
+      cachedWriteTokens: this.usageTotals.cachedWriteTokens + (sample.cacheWriteTokens ?? 0),
+      reasoningTokens: this.usageTotals.reasoningTokens + (sample.reasoningTokens ?? 0),
     }
     this.emitStatus()
   }
@@ -151,6 +229,7 @@ export class AcpSessionPool extends EventEmitter {
     const sessions: SessionSummary[] = Array.from(this.sessions.values(), (s) => ({
       dshSessionKey: s.dshSessionKey,
       acpSessionId: s.acpSessionId,
+      accountId: s.accountId,
       cwd: s.cwd,
       currentModel: s.currentModel,
       currentEffort: s.currentEffort,
@@ -172,7 +251,7 @@ export class AcpSessionPool extends EventEmitter {
       mcpBridgeActive: this.deps.isMcpBridgeActive?.() ?? false,
       usageTotals: { ...this.usageTotals },
       accounts: this.getAccountHealthSnapshots(),
-      models: this.cachedModels,
+      models: this.cachedModels.filter(m => !m.variantOf),
       config: {
         agyBin: cfg.agyBin,
         workspaceRoot: cfg.workspaceRoot,
@@ -278,12 +357,13 @@ export class AcpSessionPool extends EventEmitter {
       const modelRoutes = this.captureCatalogFromSession(res)
       const configOptions = res.configOptions ?? []
       const session: ManagedAcpSession = {
+        models: this.cachedModels,
         modelRoutes,
         dshSessionKey: key, acpSessionId: res.sessionId, accountId: lease.accountId, cwd,
         currentModel: findCurrentOption(configOptions, 'model') ?? res.models?.currentModelId ?? '',
         currentEffort: findCurrentOption(configOptions, 'thought_level') ?? '',
         currentMode: findCurrentOption(configOptions, 'mode') ?? res.modes?.currentModeId ?? '',
-        configOptions, contextUsed: 0, contextSize: 0, lastActiveAt: Date.now(),
+        configOptions, contextUsed: null, contextSize: 0, lastActiveAt: Date.now(),
       }
       this.clients.set(key, client)
       this.sessions.set(key, session)
@@ -300,11 +380,13 @@ export class AcpSessionPool extends EventEmitter {
   async syncSessionOptions(
     client: AcpClient,
     session: ManagedAcpSession,
-    desired: { model?: string; effort?: string; mode?: string },
+    desired: { model?: string; effort?: string; configuredEffort?: string; mode?: string },
   ): Promise<void> {
     const route = desired.model ? session.modelRoutes.get(desired.model) : undefined
     const model = route?.value ?? desired.model
     if (model && model !== session.currentModel) {
+      session.contextUsed = null
+      session.contextSize = 0
       if (route?.kind === 'legacy') {
         await client.request('session/set_model', { sessionId: session.acpSessionId, modelId: model }, 15_000)
         session.currentModel = model
@@ -318,18 +400,27 @@ export class AcpSessionPool extends EventEmitter {
         session.currentModel = res.configOptions ? findCurrentOption(res.configOptions, 'model') ?? model : model
         session.currentEffort = findCurrentOption(res.configOptions ?? [], 'thought_level') ?? ''
         if (session.currentModel !== model) throw new Error(`agy did not select model ${model}`)
+        // Some peers advertise levels only after switching the model. Never
+        // copy the previous model's selector into this model's capabilities.
+        const base = session.models.find(m => m.value === model)
+        const thought = selectOption(res.configOptions, 'thought_level')
+        if (base && !base.efforts.length && thought) {
+          base.efforts = sortedEfforts(values(thought).map(o => o.value))
+          base.nativeEffort = thought.currentValue
+        }
       }
     }
     const fixedEffort = route?.kind === 'config' ? route.effort : undefined
     const effort = route?.kind === 'legacy' ? undefined : fixedEffort ?? desired.effort
+      ?? defaultEffort(session.models.find(m => m.value === model), desired.configuredEffort ?? '')
     if (effort && effort !== session.currentEffort) {
       const option = selectOption(session.configOptions, 'thought_level')
       if (option && values(option).some(o => o.value === effort)) {
         const res = await client.sessionSetConfigOption({ sessionId: session.acpSessionId, configId: option.id, value: effort })
         if (res.configOptions) session.configOptions = res.configOptions
-        session.currentEffort = findCurrentOption(res.configOptions ?? [], 'thought_level') ?? effort
+        session.currentEffort = res.configOptions ? findCurrentOption(res.configOptions, 'thought_level') ?? '' : effort
       }
-      if (fixedEffort && session.currentEffort !== fixedEffort) throw new Error(`agy did not select ${desired.model}`)
+      if (session.currentEffort !== effort) throw new Error(`agy did not select reasoning effort ${effort} for ${desired.model}`)
     }
 
     if (desired.mode && desired.mode !== session.currentMode) {
@@ -341,6 +432,10 @@ export class AcpSessionPool extends EventEmitter {
       if (res.configOptions) {
         session.configOptions = res.configOptions
         session.currentMode = findCurrentOption(res.configOptions, 'mode') ?? desired.mode
+        if (route?.kind === 'config') {
+          session.currentEffort = findCurrentOption(res.configOptions, 'thought_level') ?? ''
+          if (effort && session.currentEffort !== effort) throw new Error(`agy did not retain reasoning effort ${effort} for ${desired.model}`)
+        }
       } else {
         session.currentMode = desired.mode
       }

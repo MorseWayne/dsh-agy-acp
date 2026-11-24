@@ -7,10 +7,11 @@ import {
   type LlmResolvedModelInfo,
   type Message,
   type StreamChunk,
-  type TokenUsage,
 } from '@deepseek-ai/dsh-llm'
-import type { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
-import type { AcpToolCallUpdate, AcpUsage } from '../acp/protocol.ts'
+import { ReasoningEffortId, type ToolCallId } from '@deepseek-ai/dsh-llm/brand'
+import type { AcpToolCallUpdate } from '../acp/protocol.ts'
+import { mapUsage } from '../acp/usage.ts'
+import { defaultEffort, effortLabel } from '../common/effort.ts'
 import {
   MIRROR_TOOL_NAME,
   PROVIDER_ID,
@@ -45,7 +46,7 @@ export class AcpAdapter extends LlmAdapter {
 
   override async listModels(_provider: string): Promise<LlmModelInfo[]> {
     const models = await this.deps.pool.refreshModels()
-    return models.map((m) => ({
+    return models.filter(m => !m.variantOf).map((m) => ({
       provider: PROVIDER_ID, id: m.value, name: m.name, inputModalities: ['text', 'image'],
     }))
   }
@@ -53,19 +54,21 @@ export class AcpAdapter extends LlmAdapter {
   override async resolveModel(_provider: string, model: string): Promise<LlmResolvedModelInfo> {
     const models = await this.deps.pool.refreshModels().catch(() => [])
     const matched = models.find((m) => m.value === model)
-    const contextWindow = model.startsWith('claude') ? 200_000 : 1_048_576
+    const contextWindow = this.deps.pool.contextWindowFor(model)
+    const effort = defaultEffort(matched, this.deps.getConfig().defaultEffort)
     return {
       provider: PROVIDER_ID,
       id: model,
       name: matched?.name ?? model,
       inputModalities: ['text', 'image'],
-      context: { contextWindow },
-      ...(matched && matched.efforts.length > 0
+      ...(contextWindow ? { context: { contextWindow } } : {}),
+      ...(matched && effort
         ? {
             reasoning: {
+              defaultEffort: ReasoningEffortId(effort),
               efforts: matched.efforts.map((e) => ({
-                id: e as never,
-                name: e.toUpperCase(),
+                id: ReasoningEffortId(e),
+                name: effortLabel(e),
               })),
             },
           }
@@ -131,18 +134,18 @@ export class AcpAdapter extends LlmAdapter {
       triedAccounts.add(session.accountId)
 
       const targetModel = requestedModel || session.currentModel
-      const targetEffort =
-        options.reasoningEffort !== undefined ? String(options.reasoningEffort) : cfg.defaultEffort || undefined
       const policy = this.deps.pool.policy(sessionKey)
       const nativeAuto = session.configOptions.find(o => o.id === 'mode')?.options?.some(o => 'value' in o ? o.value === 'auto' : o.options.some(v => v.value === 'auto'))
       const targetMode = policy.preset === 'auto' && policy.mode === 'danger-full-access' && nativeAuto ? 'auto' : 'default'
 
       await this.deps.pool.syncSessionOptions(client, session, {
         model: targetModel,
-        effort: targetEffort,
+        effort: options.reasoningEffort,
+        configuredEffort: cfg.defaultEffort,
         mode: targetMode,
       })
 
+      this.deps.pool.notifyStatusChange()
       const promptBlocks = buildPromptBlocks(options.messages, created)
       if (session.currentMode !== targetMode) throw new Error(`Antigravity did not accept permission mode ${targetMode}`)
       const turn = this.deps.pool.beginPrompt(session, options.signal)
@@ -155,7 +158,7 @@ export class AcpAdapter extends LlmAdapter {
       const unsubscribe = client.onSessionUpdate(session.acpSessionId, (update) => {
         rec.pushUpdate(update)
         if (update.sessionUpdate === 'usage_update' && typeof update.used === 'number') {
-          this.deps.pool.recordContextUsage(sessionKey, update.used, typeof update.size === 'number' ? update.size : 0)
+          this.deps.pool.recordContextUsage(session, targetModel, update.used, typeof update.size === 'number' ? update.size : 0)
         }
       })
 
@@ -349,32 +352,13 @@ export class AcpAdapter extends LlmAdapter {
             arguments: argsJson,
           },
         }
-        yield {
-          type: 'usage',
-          usage: { inputTokens: rec.lastContextUsed, outputTokens: 0 },
-        }
+        // A mirror boundary is not another ACP request. Only the final response carries usage.
         yield { type: 'finish', reason: { kind: 'tool-calls' } }
         return
       }
 
       idx++
     }
-  }
-}
-
-function mapUsage(raw: AcpUsage): TokenUsage {
-  const inputTotal = raw.inputTokens ?? 0
-  const cachedRead = raw.cachedReadTokens ?? 0
-  const cachedWrite = raw.cachedWriteTokens ?? 0
-  return {
-    inputTokens: Math.max(0, inputTotal - cachedRead),
-    outputTokens: raw.outputTokens ?? 0,
-    ...(raw.totalTokens !== undefined ? { totalTokens: raw.totalTokens } : {}),
-    ...(cachedRead > 0 ? { cacheReadTokens: cachedRead } : {}),
-    ...(cachedWrite > 0 ? { cacheWriteTokens: cachedWrite } : {}),
-    ...(raw.thoughtTokens !== undefined && raw.thoughtTokens > 0
-      ? { reasoningTokens: raw.thoughtTokens }
-      : {}),
   }
 }
 

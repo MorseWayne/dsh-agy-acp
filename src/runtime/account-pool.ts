@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events'
 import path from 'node:path'
+import { realpathSync } from 'node:fs'
 import type {
   AccountHealthSnapshot,
   AccountLease,
@@ -92,6 +93,36 @@ function buildAccountEnv(profile: AccountProfileConfig): NodeJS.ProcessEnv | und
   return modified ? env : undefined
 }
 
+function canonicalPath(dir: string): string {
+  let resolved = path.resolve(dir)
+  try { resolved = realpathSync(resolved) } catch { /* agy may not have created it yet */ }
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+}
+
+/** A proxy or slot lock alone does not identify an agy credential store. Do not invent SSH markers. */
+function quotaUnavailable(profile: AccountProfileConfig, profiles: AccountProfileConfig[]): string | undefined {
+  if (profile.enabled === false) return '账号已停用'
+  if (profiles.length === 1 && !profile.homeDir) return undefined // one explicitly ambient profile, like the machine default
+  if (!profile.homeDir) return '多账号查询需要独立的账号 HOME'
+  const env = buildAccountEnv(profile)!
+  const home = canonicalPath(profile.homeDir)
+  const effectiveHome = (e: NodeJS.ProcessEnv) => process.platform === 'win32' ? e.USERPROFILE : e.HOME
+  if (canonicalPath(effectiveHome(env) || '.') !== home) return '账号环境覆盖了独立 HOME'
+  const storePaths = (e: NodeJS.ProcessEnv) => {
+    const gemini = path.join(effectiveHome(e) || '.', '.gemini')
+    return [e.GEMINI_CLI_HOME || gemini, e.ANTIGRAVITY_GEMINI_DIR || gemini, e.ANTIGRAVITY_APP_DATA_DIR || path.join(gemini, 'antigravity-cli')].map(canonicalPath)
+  }
+  const stores = storePaths(env)
+  if (stores.some(dir => dir !== home && !dir.startsWith(home + path.sep))) return '账号凭据目录未隔离'
+  if (profiles.some(p => p !== profile && storePaths(buildAccountEnv(p) ?? process.env).some(dir => stores.includes(dir)))) return '多个账号共享凭据目录，无法归属配额'
+  // Desktop keyrings are user-wide even when HOME differs. Only accept the CLI's
+  // existing file-backed SSH mode, or an explicitly private Linux bus inside this HOME.
+  const privateBusPath = /^unix:path=([^,;%]+)$/.exec(env.DBUS_SESSION_BUS_ADDRESS ?? '')?.[1]
+  const privateLinuxBus = process.platform === 'linux' && privateBusPath && canonicalPath(privateBusPath).startsWith(home + path.sep)
+  if (!env.SSH_CONNECTION?.trim() && !privateLinuxBus) return '无法确认独立凭据环境；请检查该账号的 agy 登录环境'
+  return undefined
+}
+
 /**
  * Phase 3 multi-account pool implementing `AccountProvider`.
  *
@@ -104,6 +135,7 @@ function buildAccountEnv(profile: AccountProfileConfig): NodeJS.ProcessEnv | und
  */
 export class MultiAccountPool extends EventEmitter implements AccountProvider {
   private readonly accounts = new Map<string, InternalAccountState>()
+  private readonly quotaRestrictions = new Map<string, string | undefined>()
   private readonly sessionSticky = new Map<string, string>()
   private readonly baseCooldownMs: number
   private readonly maxCooldownMs: number
@@ -116,6 +148,7 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     this.now = opts.now ?? (() => Date.now())
 
     for (const profile of opts.accounts) {
+      this.quotaRestrictions.set(profile.id, quotaUnavailable(profile, opts.accounts))
       this.accounts.set(profile.id, {
         profile,
         activeLeases: 0,
@@ -124,6 +157,16 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
         lastUsedAt: null,
       })
     }
+  }
+
+  async acquireQuotaLease(accountId: string): Promise<AccountLease & { requiresFileCredentialMode: boolean }> {
+    const acc = this.accounts.get(accountId)
+    if (!acc) throw new Error('未知账号')
+    const reason = quotaUnavailable(acc.profile, this.opts.accounts)
+    if (reason) throw new Error(reason)
+    const slot = await this.opts.slotManager?.acquire(accountId)
+    const env = buildAccountEnv(acc.profile)
+    return { accountId, env, requiresFileCredentialMode: Boolean(acc.profile.homeDir && env?.SSH_CONNECTION?.trim()), release: () => slot?.release() }
   }
 
   updateQuota(
@@ -265,6 +308,7 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
         id: acc.profile.id,
         label: acc.profile.label ?? acc.profile.id,
         enabled: acc.profile.enabled !== false,
+        quotaRefreshUnavailable: this.quotaRestrictions.get(acc.profile.id),
         hasSandboxHome: Boolean(acc.profile.homeDir),
         hasProxy: Boolean(acc.profile.proxyUrl),
         activeLeases: acc.activeLeases,
