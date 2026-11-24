@@ -860,7 +860,7 @@ export function apply(ctx: ClientContext): void {
     ctx.slots.register(
       {
         name: 'plugins.bundle.config',
-        key: 'dsh-agy-acp',
+        key: '@morsewayne/dsh-agy-acp',
       },
       (ownerProps?: SlotOwnerProps) => {
         if (ownerProps?.view === 'summary') return null
@@ -873,7 +873,7 @@ export function apply(ctx: ClientContext): void {
     ctx.slots.register(
       {
         name: 'plugins.row.config',
-        key: 'dsh-agy-acp#agy-acp',
+        key: '@morsewayne/dsh-agy-acp#agy-acp',
       },
       (ownerProps?: SlotOwnerProps) => {
         if (ownerProps?.view === 'summary') return null

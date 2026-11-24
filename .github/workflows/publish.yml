@@ -1,0 +1,81 @@
+name: Publish to npm
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pack:
+    if: github.event_name == 'workflow_dispatch' || !github.event.deleted
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      dist_tag: ${{ steps.version.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Check release version
+        id: version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Expected tag v$version for this package version"
+            exit 1
+          fi
+          if [[ "$version" == *-* ]]; then
+            echo "dist_tag=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: '12.18.0'
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run verify
+
+      - name: Pack verified build
+        run: |
+          mkdir "$RUNNER_TEMP/npm-release"
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/npm-release"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/npm-release/*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: pack
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: release
+
+      - name: Publish verified tarball with npm trusted publishing
+        env:
+          DIST_TAG: ${{ needs.pack.outputs.dist_tag }}
+        run: npm publish release/*.tgz --ignore-scripts --access public --registry=https://registry.npmjs.org --tag "$DIST_TAG"

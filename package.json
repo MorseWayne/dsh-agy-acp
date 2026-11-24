@@ -1,9 +1,17 @@
 {
-  "name": "dsh-agy-acp",
+  "name": "@morsewayne/dsh-agy-acp",
   "version": "0.1.0",
   "description": "Next-generation Google Antigravity (agy acp) bridge plugin for DeepSeek Harness — persistent ACP JSON-RPC sessions, interactive permission callbacks, native tool mirroring, and SSE status stream.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MorseWayne/dsh-agy-acp.git"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "keywords": [
     "dsh-plugin",
     "dsh",
@@ -69,6 +77,7 @@
     "README.md"
   ],
   "scripts": {
+    "prepack": "npm run build",
     "build": "tsdown",
     "check": "tsc --noEmit",
     "lint:arch": "node scripts/lint-arch.mjs",

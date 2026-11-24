@@ -15,7 +15,7 @@ import { PermissionManager } from './runtime/permission-manager.ts'
 import { AcpSessionPool } from './runtime/session-pool.ts'
 import { registerAcpRoutes, type WebServerLike } from './transport/sse.ts'
 
-export const name = 'dsh-agy-acp'
+export const name = '@morsewayne/dsh-agy-acp'
 export const inject = ['llm', 'commands']
 
 interface DshToolsServiceLike {

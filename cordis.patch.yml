@@ -1,7 +1,7 @@
 # dsh-agy-acp bundle patch — registers the Antigravity ACP provider plugin.
 - insert:
     - id: agy-acp
-      name: 'dsh-agy-acp'
+      name: '@morsewayne/dsh-agy-acp'
       config:
         enabled: !!js "process.env.DSH_AGY_ACP_ENABLED ?? 'true'"
         agyBin: !!js "process.env.DSH_AGY_BIN ?? ''"
