@@ -70,7 +70,7 @@ export interface AcpConfigOption {
   category?: string
   type: string
   currentValue: string
-  options?: AcpConfigOptionValue[]
+  options?: Array<AcpConfigOptionValue | { groupId: string; name: string; options: AcpConfigOptionValue[] }>
 }
 
 export interface AcpMcpServerSpec {

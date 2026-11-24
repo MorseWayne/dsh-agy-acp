@@ -21,7 +21,10 @@ import {
   type UsageTotals,
 } from '../common/types.ts'
 
+import { modelCatalog, selectOption, values } from './model-catalog.ts'
+
 export interface ManagedAcpSession {
+  modelRoutes: ReturnType<typeof modelCatalog>['routes']
   dshSessionKey: string
   acpSessionId: string
   accountId: string
@@ -73,6 +76,7 @@ export class AcpSessionPool extends EventEmitter {
   private readonly sessions = new Map<string, ManagedAcpSession>()
   private readonly accountProvider: AccountProvider
   private cachedModels: AcpModelOption[] = []
+  private catalogExpiresAt = 0
   private cachedTier: string | null = null
   private lastError: string | null = null
   private sweepTimer: ReturnType<typeof setInterval> | null = null
@@ -271,9 +275,10 @@ export class AcpSessionPool extends EventEmitter {
       const res = await client.sessionNew({ cwd, mcpServers })
       opening.signal.throwIfAborted()
       if (policyKey(this.policy(key)) !== fingerprint) throw new Error('DSH session policy changed during startup')
-      this.captureCatalogFromSession(res)
+      const modelRoutes = this.captureCatalogFromSession(res)
       const configOptions = res.configOptions ?? []
       const session: ManagedAcpSession = {
+        modelRoutes,
         dshSessionKey: key, acpSessionId: res.sessionId, accountId: lease.accountId, cwd,
         currentModel: findCurrentOption(configOptions, 'model') ?? res.models?.currentModelId ?? '',
         currentEffort: findCurrentOption(configOptions, 'thought_level') ?? '',
@@ -297,37 +302,34 @@ export class AcpSessionPool extends EventEmitter {
     session: ManagedAcpSession,
     desired: { model?: string; effort?: string; mode?: string },
   ): Promise<void> {
-    if (desired.model && desired.model !== session.currentModel) {
-      const res = await client.sessionSetConfigOption({
-        sessionId: session.acpSessionId,
-        configId: 'model',
-        value: desired.model,
-      })
-      if (res.configOptions) {
-        session.configOptions = res.configOptions
-        session.currentModel = findCurrentOption(res.configOptions, 'model') ?? desired.model
-        session.currentEffort = findCurrentOption(res.configOptions, 'thought_level') ?? session.currentEffort
+    const route = desired.model ? session.modelRoutes.get(desired.model) : undefined
+    const model = route?.value ?? desired.model
+    if (model && model !== session.currentModel) {
+      if (route?.kind === 'legacy') {
+        await client.request('session/set_model', { sessionId: session.acpSessionId, modelId: model }, 15_000)
+        session.currentModel = model
+        session.currentEffort = ''
       } else {
-        session.currentModel = desired.model
-      }
-    }
-
-    if (desired.effort && desired.effort !== session.currentEffort) {
-      const thoughtOpt = session.configOptions.find((o) => o.id === 'thought_level')
-      const allowed = thoughtOpt?.options?.map((o) => o.value) ?? []
-      if (allowed.length === 0 || allowed.includes(desired.effort)) {
         const res = await client.sessionSetConfigOption({
           sessionId: session.acpSessionId,
-          configId: 'thought_level',
-          value: desired.effort,
+          configId: selectOption(session.configOptions, 'model')?.id ?? 'model', value: model,
         })
-        if (res.configOptions) {
-          session.configOptions = res.configOptions
-          session.currentEffort = findCurrentOption(res.configOptions, 'thought_level') ?? desired.effort
-        } else {
-          session.currentEffort = desired.effort
-        }
+        if (res.configOptions) session.configOptions = res.configOptions
+        session.currentModel = res.configOptions ? findCurrentOption(res.configOptions, 'model') ?? model : model
+        session.currentEffort = findCurrentOption(res.configOptions ?? [], 'thought_level') ?? ''
+        if (session.currentModel !== model) throw new Error(`agy did not select model ${model}`)
       }
+    }
+    const fixedEffort = route?.kind === 'config' ? route.effort : undefined
+    const effort = route?.kind === 'legacy' ? undefined : fixedEffort ?? desired.effort
+    if (effort && effort !== session.currentEffort) {
+      const option = selectOption(session.configOptions, 'thought_level')
+      if (option && values(option).some(o => o.value === effort)) {
+        const res = await client.sessionSetConfigOption({ sessionId: session.acpSessionId, configId: option.id, value: effort })
+        if (res.configOptions) session.configOptions = res.configOptions
+        session.currentEffort = findCurrentOption(res.configOptions ?? [], 'thought_level') ?? effort
+      }
+      if (fixedEffort && session.currentEffort !== fixedEffort) throw new Error(`agy did not select ${desired.model}`)
     }
 
     if (desired.mode && desired.mode !== session.currentMode) {
@@ -346,7 +348,7 @@ export class AcpSessionPool extends EventEmitter {
   }
 
   async refreshModels(cwd?: string): Promise<AcpModelOption[]> {
-    if (this.cachedModels.length > 0) return this.cachedModels
+    if (this.cachedModels.length > 0 && Date.now() < this.catalogExpiresAt) return this.cachedModels
     if (!this.catalogProbe) this.catalogProbe = this.probeCatalog(cwd).finally(() => { this.catalogProbe = undefined })
     return this.catalogProbe
   }
@@ -411,30 +413,13 @@ export class AcpSessionPool extends EventEmitter {
     this.removeAllListeners()
   }
 
-  private captureCatalogFromSession(res: SessionNewResult): void {
+  private captureCatalogFromSession(res: SessionNewResult) {
     const tier = res._meta?.antigravity?.tier?.name
     if (tier) this.cachedTier = tier
-
-    const modelOpt = res.configOptions?.find((o) => o.id === 'model')
-    const defaultEfforts =
-      res.configOptions?.find((o) => o.id === 'thought_level')?.options?.map((o) => o.value) ?? []
-
-    // Derive per-model efforts from availableModels slugs (e.g. gemini-3.8-flash-low/medium/high)
-    const availableSlugs = res.models?.availableModels.map((m) => m.modelId) ?? []
-    if (modelOpt?.options && modelOpt.options.length > 0) {
-      this.cachedModels = modelOpt.options.map((opt) => {
-        const prefix = opt.value + '-'
-        const matchedEfforts = availableSlugs
-          .filter((slug) => slug.startsWith(prefix))
-          .map((slug) => slug.slice(prefix.length))
-          .filter((e) => ['low', 'medium', 'high', 'xhigh'].includes(e))
-        return {
-          value: opt.value,
-          name: opt.name,
-          efforts: matchedEfforts.length > 0 ? matchedEfforts : defaultEfforts,
-        }
-      })
-    }
+    const { models, routes } = modelCatalog(res)
+    this.cachedModels = models
+    this.catalogExpiresAt = Date.now() + 5 * 60_000
+    return routes
   }
 
   private emitStatus(): void {
@@ -443,5 +428,5 @@ export class AcpSessionPool extends EventEmitter {
 }
 
 function findCurrentOption(options: AcpConfigOption[], id: string): string | undefined {
-  return options.find((o) => o.id === id)?.currentValue
+  return selectOption(options, id)?.currentValue
 }

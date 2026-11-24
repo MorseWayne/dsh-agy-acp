@@ -34,15 +34,6 @@ export interface AcpAdapterDeps {
   log?: (msg: string) => void
 }
 
-const FALLBACK_MODELS: LlmModelInfo[] = [
-  { provider: PROVIDER_ID, id: 'gemini-4-neon', name: 'Gemini 4 Neon', inputModalities: ['text', 'image'] },
-  { provider: PROVIDER_ID, id: 'gemini-4-carbon', name: 'Gemini 4 Carbon', inputModalities: ['text', 'image'] },
-  { provider: PROVIDER_ID, id: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen', inputModalities: ['text', 'image'] },
-  { provider: PROVIDER_ID, id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', inputModalities: ['text', 'image'] },
-  { provider: PROVIDER_ID, id: 'claude-opus-5-5', name: 'Claude Opus 5.5', inputModalities: ['text', 'image'] },
-  { provider: PROVIDER_ID, id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', inputModalities: ['text', 'image'] },
-]
-
 export class AcpAdapter extends LlmAdapter {
   constructor(private readonly deps: AcpAdapterDeps) {
     super()
@@ -53,20 +44,10 @@ export class AcpAdapter extends LlmAdapter {
   }
 
   override async listModels(_provider: string): Promise<LlmModelInfo[]> {
-    try {
-      const models = await this.deps.pool.refreshModels()
-      if (models.length > 0) {
-        return models.map((m) => ({
-          provider: PROVIDER_ID,
-          id: m.value,
-          name: m.name,
-          inputModalities: ['text', 'image'] as const,
-        }))
-      }
-    } catch (err) {
-      this.deps.log?.(`listModels fallback: ${err instanceof Error ? err.message : String(err)}`)
-    }
-    return FALLBACK_MODELS
+    const models = await this.deps.pool.refreshModels()
+    return models.map((m) => ({
+      provider: PROVIDER_ID, id: m.value, name: m.name, inputModalities: ['text', 'image'],
+    }))
   }
 
   override async resolveModel(_provider: string, model: string): Promise<LlmResolvedModelInfo> {
@@ -153,7 +134,7 @@ export class AcpAdapter extends LlmAdapter {
       const targetEffort =
         options.reasoningEffort !== undefined ? String(options.reasoningEffort) : cfg.defaultEffort || undefined
       const policy = this.deps.pool.policy(sessionKey)
-      const nativeAuto = session.configOptions.find(o => o.id === 'mode')?.options?.some(o => o.value === 'auto')
+      const nativeAuto = session.configOptions.find(o => o.id === 'mode')?.options?.some(o => 'value' in o ? o.value === 'auto' : o.options.some(v => v.value === 'auto'))
       const targetMode = policy.preset === 'auto' && policy.mode === 'danger-full-access' && nativeAuto ? 'auto' : 'default'
 
       await this.deps.pool.syncSessionOptions(client, session, {
