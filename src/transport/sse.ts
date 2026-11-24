@@ -3,8 +3,17 @@ import type { PermissionMode, StatusSnapshot } from '../common/types.ts'
 import type { PermissionManager } from '../runtime/permission-manager.ts'
 import type { AcpSessionPool } from '../runtime/session-pool.ts'
 
+export interface ExactRouteSpec {
+  kind: 'exact'
+  path: string
+  handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+}
+
 export interface WebServerLike {
-  route(
+  /** Native DSH webServer API. */
+  register?(route: ExactRouteSpec): (() => void) | void
+  /** Legacy / test convenience API. */
+  route?(
     method: string,
     path: string,
     handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>,
@@ -82,8 +91,25 @@ export function registerAcpRoutes(
     path: string,
     handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>,
   ): void => {
-    const d = webServer.route(method, path, handler)
-    if (typeof d === 'function') disposers.push(d)
+    if (typeof webServer.register === 'function') {
+      const d = webServer.register({
+        kind: 'exact',
+        path,
+        handler: (req, res) => {
+          if ((req.method ?? 'GET').toUpperCase() !== method.toUpperCase()) {
+            sendJson(res, 405, { error: `Method ${req.method ?? 'UNKNOWN'} not allowed` })
+            return
+          }
+          return handler(req, res)
+        },
+      })
+      if (typeof d === 'function') disposers.push(d)
+      return
+    }
+    if (typeof webServer.route === 'function') {
+      const d = webServer.route(method, path, handler)
+      if (typeof d === 'function') disposers.push(d)
+    }
   }
 
   addRoute('GET', '/plugins/agy-acp/status', (_req, res) => {

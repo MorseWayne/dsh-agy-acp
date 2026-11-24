@@ -30,7 +30,7 @@
 ### Phase 1.5 — 端到端联调与健壮性补齐
 - [x] 编写真实 `AcpAdapter.stream()` 端到端集成测试（覆盖多轮上下文复用、工具调用 Span 切分续跑、`AbortSignal -> session/cancel` 中途取消）。
 - [x] 完善 `agy_acp_tool` 的 `presentCall` / `presentResult` 卡片投影（让 `run_command` 渲染为终端卡片、文件编辑渲染为 diff 卡片，对齐 DSH 原生观感）。
-- [ ] 在本地 DSH 实例中实际加载 `dsh-agy-acp` 并完成端到端联调。
+- [x] 在本地 DSH 实例中实际加载 `dsh-agy-acp` 并完成端到端联调。
 
 ### Phase 2 — 工具生态 + 交互式权限 + 前端控制台
 - [x] **会话级反向 MCP 桥接**（`src/mcp/`）：复用本地回环 HTTP + Bearer Token + 零依赖 stdio `bridge.mjs`，通过 `session/new` 的 `mcpServers` 参数动态注入（**不污染全局 `~/.gemini/config/mcp_config.json`**），并屏蔽 `run_code` / `agy_acp_tool` 防递归。

@@ -160,19 +160,22 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   commands?.register({
     name: 'agy-acp',
     description: 'Inspect Antigravity ACP bridge status',
-    async execute() {
+    async handler() {
       const s = pool.getStatus()
-      return [
-        `Antigravity ACP (${s.providerId})`,
-        `Connected: ${s.connected ? 'yes' : 'no'} (${s.agentName ?? 'idle'} ${s.agentVersion ?? ''})`,
-        `Tier: ${s.tierName ?? 'unknown'}`,
-        `Active Sessions: ${s.activeSessions}`,
-        `Pending Permissions: ${s.pendingPermissions.length}`,
-        `MCP Bridge: ${s.mcpBridgeActive ? 'active' : 'off'}`,
-        `Permission Mode: ${s.permissionMode}`,
-        `Tokens: in=${s.usageTotals.inputTokens} cached=${s.usageTotals.cachedReadTokens} out=${s.usageTotals.outputTokens} think=${s.usageTotals.reasoningTokens}`,
-        `Models Cached: ${s.models.length}`,
-      ].join('\n')
+      return {
+        kind: 'success' as const,
+        text: [
+          `Antigravity ACP (${s.providerId})`,
+          `Connected: ${s.connected ? 'yes' : 'no'} (${s.agentName ?? 'idle'} ${s.agentVersion ?? ''})`,
+          `Tier: ${s.tierName ?? 'unknown'}`,
+          `Active Sessions: ${s.activeSessions}`,
+          `Pending Permissions: ${s.pendingPermissions.length}`,
+          `MCP Bridge: ${s.mcpBridgeActive ? 'active' : 'off'}`,
+          `Permission Mode: ${s.permissionMode}`,
+          `Tokens: in=${s.usageTotals.inputTokens} cached=${s.usageTotals.cachedReadTokens} out=${s.usageTotals.outputTokens} think=${s.usageTotals.reasoningTokens}`,
+          `Models Cached: ${s.models.length}`,
+        ].join('\n'),
+      }
     },
   })
 
