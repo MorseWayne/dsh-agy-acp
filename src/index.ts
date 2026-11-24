@@ -113,11 +113,23 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     log,
   })
 
+  // Plugin status SSE and the host model menu are separate subscriptions.
+  // Publish only changed/recovered catalogs, after the cache is ready for re-entry.
+  pool.on('models-updated', () => {
+    // The running host declares this event; the oldest supported peer typings do not.
+    (ctx.emit as (event: 'llm/models-updated', provider: string) => void)('llm/models-updated', PROVIDER_ID)
+  })
+
   // 1. Register LLM provider route
   if (cfg.enabled) {
     const llm = ctx.get('llm') as { registerAdapter(providers: string[], a: unknown): unknown } | undefined
-    llm?.registerAdapter([PROVIDER_ID], adapter)
-    log(`registered provider route: ${PROVIDER_ID}`)
+    if (llm) {
+      llm.registerAdapter([PROVIDER_ID], adapter)
+      log(`registered provider route: ${PROVIDER_ID}`)
+      // A menu may already hold a catalog from before this plugin was reloaded.
+      // Prime the actual read-only ACP catalog (no prompt, MCP or fabricated model IDs).
+      void pool.refreshModels().catch(() => { /* status and bounded retry are owned by the pool */ })
+    }
   }
 
   // 2. Register synthetic mirror tool, pre-execute bypass, and optional session-scoped reverse MCP bridge

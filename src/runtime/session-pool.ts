@@ -102,6 +102,9 @@ export class AcpSessionPool extends EventEmitter {
   private readonly quotaSamples = new Map<string, AccountQuotaSample>()
   private readonly quotaReads = new Map<string, Promise<void>>()
   private catalogProbe?: Promise<AcpModelOption[]>
+  private catalogRetry?: ReturnType<typeof setTimeout>
+  private catalogRetryCount = 0
+  private catalogSignature = ''
   private initResult: InitializeResult | null = null
   private readonly sessions = new Map<string, ManagedAcpSession>()
   private readonly accountProvider: AccountProvider
@@ -354,10 +357,10 @@ export class AcpSessionPool extends EventEmitter {
       const res = await client.sessionNew({ cwd, mcpServers })
       opening.signal.throwIfAborted()
       if (policyKey(this.policy(key)) !== fingerprint) throw new Error('DSH session policy changed during startup')
-      const modelRoutes = this.captureCatalogFromSession(res)
+      const { routes: modelRoutes, models } = this.captureCatalogFromSession(res)
       const configOptions = res.configOptions ?? []
       const session: ManagedAcpSession = {
-        models: this.cachedModels,
+        models,
         modelRoutes,
         dshSessionKey: key, acpSessionId: res.sessionId, accountId: lease.accountId, cwd,
         currentModel: findCurrentOption(configOptions, 'model') ?? res.models?.currentModelId ?? '',
@@ -444,7 +447,30 @@ export class AcpSessionPool extends EventEmitter {
 
   async refreshModels(cwd?: string): Promise<AcpModelOption[]> {
     if (this.cachedModels.length > 0 && Date.now() < this.catalogExpiresAt) return this.cachedModels
-    if (!this.catalogProbe) this.catalogProbe = this.probeCatalog(cwd).finally(() => { this.catalogProbe = undefined })
+    if (!this.catalogProbe) this.catalogProbe = this.probeCatalog(cwd).catch(err => {
+      if (this.disposed) throw err
+      // A failed group is cached by DSH's menu just like a successful group. Retry
+      // the constrained discovery, then publish its recovery without requiring a chat turn.
+      this.lastError = 'ACP 模型目录探测失败；请检查 agy 登录状态和只读探测环境。'
+      this.emitStatus()
+      const delay = [5_000, 30_000, 60_000][this.catalogRetryCount]
+      if (delay !== undefined && !this.catalogRetry) {
+        this.catalogRetryCount++
+        this.catalogRetry = setTimeout(() => {
+          this.catalogRetry = undefined
+          this.catalogExpiresAt = 0
+          void this.refreshModels(cwd).catch(() => {})
+        }, delay)
+        this.catalogRetry.unref?.()
+      }
+      // Keep the last successful list during a transient outage. Avoid one failed
+      // re-probe per resolveModelInfo when the host expands the returned group.
+      if (this.cachedModels.length) {
+        this.catalogExpiresAt = Date.now() + (delay ?? 30_000)
+        return this.cachedModels
+      }
+      throw err
+    }).finally(() => { this.catalogProbe = undefined })
     return this.catalogProbe
   }
 
@@ -458,7 +484,10 @@ export class AcpSessionPool extends EventEmitter {
       this.lifetime.signal.throwIfAborted()
       const stop = () => client?.dispose()
       this.lifetime.signal.addEventListener('abort', stop, { once: true })
-      try { this.captureCatalogFromSession(await client.sessionNew({ cwd: root, mcpServers: [] })) }
+      try {
+        const catalog = this.captureCatalogFromSession(await client.sessionNew({ cwd: root, mcpServers: [] }))
+        if (!catalog.models.length) throw new Error('agy returned an empty ACP model catalog')
+      }
       finally { this.lifetime.signal.removeEventListener('abort', stop) }
       return this.cachedModels
     } finally { client?.dispose(); lease.release() }
@@ -502,6 +531,7 @@ export class AcpSessionPool extends EventEmitter {
       this.sweepTimer = null
     }
     this.disposed = true
+    clearTimeout(this.catalogRetry)
     this.lifetime.abort()
     void this.resetAllSessions()
     this.accountProvider.dispose?.()
@@ -511,10 +541,19 @@ export class AcpSessionPool extends EventEmitter {
   private captureCatalogFromSession(res: SessionNewResult) {
     const tier = res._meta?.antigravity?.tier?.name
     if (tier) this.cachedTier = tier
-    const { models, routes } = modelCatalog(res)
-    this.cachedModels = models
+    const catalog = modelCatalog(res)
+    if (!catalog.models.length || this.disposed) return catalog
+    const signature = JSON.stringify(catalog.models.filter(m => !m.variantOf))
+    const changed = signature !== this.catalogSignature || this.lastError !== null
+    this.catalogSignature = signature
+    this.cachedModels = catalog.models
     this.catalogExpiresAt = Date.now() + 5 * 60_000
-    return routes
+    this.lastError = null
+    clearTimeout(this.catalogRetry)
+    this.catalogRetry = undefined
+    this.catalogRetryCount = 0
+    if (changed) this.emit('models-updated')
+    return catalog
   }
 
   private emitStatus(): void {
