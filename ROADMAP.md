@@ -33,9 +33,9 @@
 - [ ] 在本地 DSH 实例中实际加载 `dsh-agy-acp` 并完成端到端联调。
 
 ### Phase 2 — 工具生态 + 交互式权限 + 前端控制台
-- [ ] **会话级反向 MCP 桥接**（`src/mcp/`）：复用本地回环 HTTP + Bearer Token + 零依赖 stdio `bridge.mjs`，但通过 `session/new` 的 `mcpServers` 参数动态注入（**不污染全局 `~/.gemini/config/mcp_config.json`**），并屏蔽 `run_code` / `agy_acp_tool` 防递归。
-- [ ] **ACP 原生交互式权限审批**：将 `session/request_permission` 回调通过 SSE 推到前端控制台（或对接 DSH 原生审批机制），支持用户在界面上实时点击 Allow / Deny / Always Allow。
-- [ ] **前端管理控制台**（`src/client/`）：基于 SSE 扩展设置页与插件详情页（支持切换权限模式、查看活跃 ACP 会话、一键重置会话、实时查看上下文占用与 Token 用量）。
+- [x] **会话级反向 MCP 桥接**（`src/mcp/`）：复用本地回环 HTTP + Bearer Token + 零依赖 stdio `bridge.mjs`，通过 `session/new` 的 `mcpServers` 参数动态注入（**不污染全局 `~/.gemini/config/mcp_config.json`**），并屏蔽 `run_code` / `agy_acp_tool` 防递归。
+- [x] **ACP 原生交互式权限审批**：将 `session/request_permission` 回调通过 SSE 推到前端控制台，支持用户在界面上实时点击 Allow / Deny / Always Allow（含会话级记忆与超时兜底）。
+- [x] **前端管理控制台**（`src/client/`）：基于 SSE 扩展顶栏交互控制面板（支持切换权限模式、查看活跃 ACP 会话、一键重置会话、实时查看上下文占用与 Token 用量、实时审批权限）。
 
 ### Phase 3 — 多账号池化与高可用（基于 `AccountProvider` 扩展点）
 - [ ] 实现多账号池（独立 `HOME` / Keychain 沙箱、单账号独立代理注入）。

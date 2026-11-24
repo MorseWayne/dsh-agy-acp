@@ -3,6 +3,7 @@ import { AcpClient, type PermissionHandler } from '../acp/client.ts'
 import type {
   AcpConfigOption,
   AcpMcpServerSpec,
+  AcpUsage,
   InitializeResult,
   SessionNewResult,
 } from '../acp/protocol.ts'
@@ -11,8 +12,12 @@ import {
   type AccountLease,
   type AccountProvider,
   type AcpModelOption,
+  type PendingPermission,
+  type PermissionMode,
   type PluginConfig,
+  type SessionSummary,
   type StatusSnapshot,
+  type UsageTotals,
 } from '../common/types.ts'
 
 export interface ManagedAcpSession {
@@ -23,10 +28,12 @@ export interface ManagedAcpSession {
   currentEffort: string
   currentMode: string
   configOptions: AcpConfigOption[]
+  contextUsed: number
+  contextSize: number
   lastActiveAt: number
 }
 
-/** Phase 1 default: single local account authenticated via `agy`. */
+/** Phase 1/2 default: single local account authenticated via `agy`. */
 export class SingleAccountProvider implements AccountProvider {
   async acquire(): Promise<AccountLease> {
     return { accountId: 'default', release: () => {} }
@@ -37,6 +44,10 @@ export interface SessionPoolDeps {
   getConfig: () => PluginConfig
   resolveBin: () => string | null
   onPermission?: PermissionHandler
+  getPendingPermissions?: () => PendingPermission[]
+  isMcpBridgeActive?: () => boolean
+  onPermissionModeChange?: (mode: PermissionMode) => void
+  onSessionClosed?: (acpSessionId: string) => void
   accountProvider?: AccountProvider
   getMcpServers?: (sessionKey: string) => AcpMcpServerSpec[]
   log?: (msg: string) => void
@@ -55,6 +66,12 @@ export class AcpSessionPool extends EventEmitter {
   private cachedTier: string | null = null
   private lastError: string | null = null
   private sweepTimer: ReturnType<typeof setInterval> | null = null
+  private usageTotals: UsageTotals = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedReadTokens: 0,
+    reasoningTokens: 0,
+  }
 
   constructor(private readonly deps: SessionPoolDeps) {
     super()
@@ -68,8 +85,55 @@ export class AcpSessionPool extends EventEmitter {
     return this.client
   }
 
+  notifyStatusChange(): void {
+    this.emitStatus()
+  }
+
+  recordContextUsage(dshSessionKey: string, used: number, size: number): void {
+    const sess = this.sessions.get(dshSessionKey)
+    if (!sess) return
+    sess.contextUsed = used
+    if (size > 0) sess.contextSize = size
+    sess.lastActiveAt = Date.now()
+    this.emitStatus()
+  }
+
+  recordTurnUsage(usage: AcpUsage | undefined): void {
+    if (!usage) return
+    const cached = usage.cachedReadTokens ?? 0
+    const input = Math.max(0, (usage.inputTokens ?? 0) - cached)
+    this.usageTotals = {
+      inputTokens: this.usageTotals.inputTokens + input,
+      outputTokens: this.usageTotals.outputTokens + (usage.outputTokens ?? 0),
+      cachedReadTokens: this.usageTotals.cachedReadTokens + cached,
+      reasoningTokens: this.usageTotals.reasoningTokens + (usage.thoughtTokens ?? 0),
+    }
+    this.emitStatus()
+  }
+
+  async setPermissionMode(mode: PermissionMode): Promise<void> {
+    this.deps.onPermissionModeChange?.(mode)
+    if (this.client?.isRunning && mode !== 'skip') {
+      for (const sess of this.sessions.values()) {
+        await this.syncSessionOptions(this.client, sess, { mode }).catch(() => undefined)
+      }
+    }
+    this.emitStatus()
+  }
+
   getStatus(): StatusSnapshot {
     const cfg = this.deps.getConfig()
+    const sessions: SessionSummary[] = Array.from(this.sessions.values(), (s) => ({
+      dshSessionKey: s.dshSessionKey,
+      acpSessionId: s.acpSessionId,
+      cwd: s.cwd,
+      currentModel: s.currentModel,
+      currentEffort: s.currentEffort,
+      currentMode: s.currentMode,
+      contextUsed: s.contextUsed,
+      contextSize: s.contextSize,
+      lastActiveAt: s.lastActiveAt,
+    }))
     return {
       providerId: PROVIDER_ID,
       enabled: cfg.enabled,
@@ -77,7 +141,11 @@ export class AcpSessionPool extends EventEmitter {
       agentName: this.initResult?.agentInfo?.name ?? null,
       agentVersion: this.initResult?.agentInfo?.version ?? null,
       tierName: this.cachedTier,
-      activeSessions: this.sessions.size,
+      activeSessions: sessions.length,
+      sessions,
+      pendingPermissions: this.deps.getPendingPermissions?.() ?? [],
+      mcpBridgeActive: this.deps.isMcpBridgeActive?.() ?? false,
+      usageTotals: { ...this.usageTotals },
       models: this.cachedModels,
       permissionMode: cfg.permissionMode,
       lastError: this.lastError,
@@ -160,6 +228,8 @@ export class AcpSessionPool extends EventEmitter {
       currentEffort: findCurrentOption(configOptions, 'thought_level') ?? '',
       currentMode: findCurrentOption(configOptions, 'mode') ?? res.modes?.currentModeId ?? 'default',
       configOptions,
+      contextUsed: 0,
+      contextSize: 0,
       lastActiveAt: Date.now(),
     }
     this.sessions.set(dshSessionKey, session)
@@ -234,10 +304,19 @@ export class AcpSessionPool extends EventEmitter {
     const sess = this.sessions.get(dshSessionKey)
     if (!sess) return
     this.sessions.delete(dshSessionKey)
+    this.deps.onSessionClosed?.(sess.acpSessionId)
     if (this.client?.isRunning) {
       await this.client.sessionClose(sess.acpSessionId).catch(() => undefined)
     }
     this.emitStatus()
+  }
+
+  async resetAllSessions(): Promise<number> {
+    const keys = Array.from(this.sessions.keys())
+    for (const key of keys) {
+      await this.closeSession(key)
+    }
+    return keys.length
   }
 
   async sweepIdleSessions(): Promise<void> {

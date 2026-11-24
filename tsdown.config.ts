@@ -12,7 +12,8 @@ export default defineConfig([
     dts: true,
     clean: true,
     fixedExtension: false,
-    external: hostExternals,
+    deps: { neverBundle: hostExternals },
+    copy: [{ from: 'src/mcp/bridge.mjs', to: 'dist' }],
   },
   {
     entry: { client: 'src/client/index.ts' },
@@ -23,7 +24,7 @@ export default defineConfig([
     dts: false,
     clean: false,
     fixedExtension: false,
-    external: [/^@deepseek-ai\//, 'react', 'react-dom', 'react/jsx-runtime'],
+    deps: { neverBundle: [/^@deepseek-ai\//, 'react', 'react-dom', 'react/jsx-runtime'] },
     outputOptions: {
       entryFileNames: 'client.js',
       banner: `window.__ModuleLoader__.load({ id: "dsh-agy-acp", factory: (require) => {`,

@@ -13,7 +13,7 @@ export interface PluginConfig {
   defaultEffort: string
   sessionIdleTtlMs: number
   requestTimeoutMs: number
-  /** Experimental: attach session-scoped MCP servers via ACP session/new. */
+  /** Attach session-scoped reverse MCP bridge via ACP session/new. */
   mcpBridge: boolean
 }
 
@@ -21,6 +21,43 @@ export interface AcpModelOption {
   value: string
   name: string
   efforts: string[]
+}
+
+export interface SessionSummary {
+  dshSessionKey: string
+  acpSessionId: string
+  cwd: string
+  currentModel: string
+  currentEffort: string
+  currentMode: string
+  contextUsed: number
+  contextSize: number
+  lastActiveAt: number
+}
+
+export interface PendingPermissionOption {
+  optionId: string
+  name: string
+  kind: string
+}
+
+export interface PendingPermission {
+  requestId: string
+  sessionId: string
+  toolCallId: string
+  toolName: string
+  title?: string
+  kind?: string
+  rawInput?: unknown
+  options: PendingPermissionOption[]
+  createdAt: number
+}
+
+export interface UsageTotals {
+  inputTokens: number
+  outputTokens: number
+  cachedReadTokens: number
+  reasoningTokens: number
 }
 
 export interface StatusSnapshot {
@@ -31,6 +68,10 @@ export interface StatusSnapshot {
   agentVersion: string | null
   tierName: string | null
   activeSessions: number
+  sessions: SessionSummary[]
+  pendingPermissions: PendingPermission[]
+  mcpBridgeActive: boolean
+  usageTotals: UsageTotals
   models: AcpModelOption[]
   permissionMode: PermissionMode
   lastError: string | null
@@ -39,7 +80,7 @@ export interface StatusSnapshot {
 
 /**
  * Extension seam for Phase 3 multi-account pooling.
- * Phase 1 uses DefaultSingleAccountProvider (current machine login).
+ * Phase 1/2 uses SingleAccountProvider (current machine login).
  */
 export interface AccountLease {
   accountId: string

@@ -155,6 +155,9 @@ export class AcpAdapter extends LlmAdapter {
 
     const unsubscribe = client.onSessionUpdate(session.acpSessionId, (update) => {
       rec.pushUpdate(update)
+      if (update.sessionUpdate === 'usage_update' && typeof update.used === 'number') {
+        this.deps.pool.recordContextUsage(sessionKey, update.used, typeof update.size === 'number' ? update.size : 0)
+      }
     })
 
     const onAbort = (): void => {
@@ -166,6 +169,7 @@ export class AcpAdapter extends LlmAdapter {
     void client
       .sessionPrompt({ sessionId: session.acpSessionId, prompt: promptBlocks }, cfg.requestTimeoutMs)
       .then((res) => {
+        this.deps.pool.recordTurnUsage(res.usage)
         rec.finish(res.stopReason, res.usage)
       })
       .catch((err: unknown) => {
