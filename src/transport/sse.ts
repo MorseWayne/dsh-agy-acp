@@ -141,6 +141,25 @@ export function registerAcpRoutes(
     })
   })
 
+  addRoute('POST', '/plugins/agy-acp/config', async (req, res) => {
+    try {
+      const body = await readJsonBody(req)
+      const patch: Record<string, unknown> = {}
+      if (typeof body.permissionMode === 'string' && VALID_MODES.has(body.permissionMode as PermissionMode)) {
+        patch.permissionMode = body.permissionMode
+      }
+      if (typeof body.mcpBridge === 'boolean') patch.mcpBridge = body.mcpBridge
+      if (typeof body.agyBin === 'string') patch.agyBin = body.agyBin.trim()
+      if (typeof body.workspaceRoot === 'string') patch.workspaceRoot = body.workspaceRoot.trim()
+      if (typeof body.defaultModel === 'string') patch.defaultModel = body.defaultModel.trim()
+      if (typeof body.defaultEffort === 'string') patch.defaultEffort = body.defaultEffort.trim()
+      await pool.updateConfig(patch)
+      sendJson(res, 200, { ok: true, status: pool.getStatus() })
+    } catch (err) {
+      sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) })
+    }
+  })
+
   addRoute('POST', '/plugins/agy-acp/mode', async (req, res) => {
     try {
       const body = await readJsonBody(req)

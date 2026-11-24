@@ -49,6 +49,7 @@ export interface SessionPoolDeps {
   getPendingPermissions?: () => PendingPermission[]
   isMcpBridgeActive?: () => boolean
   onPermissionModeChange?: (mode: PermissionMode) => void
+  onConfigPatch?: (patch: Partial<PluginConfig>) => void | Promise<void>
   onSessionClosed?: (acpSessionId: string) => void
   accountProvider?: AccountProvider
   getMcpServers?: (sessionKey: string) => AcpMcpServerSpec[]
@@ -148,6 +149,19 @@ export class AcpSessionPool extends EventEmitter {
     this.emitStatus()
   }
 
+  async updateConfig(patch: Partial<PluginConfig>): Promise<void> {
+    await this.deps.onConfigPatch?.(patch)
+    if (patch.permissionMode && patch.permissionMode !== 'skip') {
+      for (const sess of this.sessions.values()) {
+        const client = this.clients.get(sess.accountId)
+        if (client?.isRunning) {
+          await this.syncSessionOptions(client, sess, { mode: patch.permissionMode }).catch(() => undefined)
+        }
+      }
+    }
+    this.emitStatus()
+  }
+
   getStatus(): StatusSnapshot {
     const cfg = this.deps.getConfig()
     const sessions: SessionSummary[] = Array.from(this.sessions.values(), (s) => ({
@@ -177,6 +191,15 @@ export class AcpSessionPool extends EventEmitter {
       accounts: this.getAccountHealthSnapshots(),
       models: this.cachedModels,
       permissionMode: cfg.permissionMode,
+      config: {
+        agyBin: cfg.agyBin,
+        workspaceRoot: cfg.workspaceRoot,
+        defaultModel: cfg.defaultModel,
+        defaultEffort: cfg.defaultEffort,
+        mcpBridge: cfg.mcpBridge,
+        sessionIdleTtlMs: cfg.sessionIdleTtlMs,
+        requestTimeoutMs: cfg.requestTimeoutMs,
+      },
       lastError: this.lastError,
       updatedAt: Date.now(),
     }

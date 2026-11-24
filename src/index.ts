@@ -37,6 +37,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   }
 
   let mcpBridge: ReverseMcpBridge | null = null
+  let syncMcpBridge: (() => Promise<void>) | null = null
 
   const permissions = new PermissionManager({
     getMode: () => cfg.permissionMode,
@@ -65,6 +66,10 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     isMcpBridgeActive: () => Boolean(mcpBridge?.isRunning),
     onPermissionModeChange: (mode: PermissionMode) => {
       cfg = { ...cfg, permissionMode: mode }
+    },
+    onConfigPatch: async (patch) => {
+      cfg = { ...cfg, ...patch }
+      await syncMcpBridge?.()
     },
     onSessionClosed: (acpSessionId) => {
       permissions.clearSessionRules(acpSessionId)
@@ -112,45 +117,63 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     )
 
     let localBridge: ReverseMcpBridge | null = null
-    if (cfg.enabled && cfg.mcpBridge && typeof tools.schemas === 'function' && typeof tools.execute === 'function') {
-      const toolsSvc = tools
-      localBridge = new ReverseMcpBridge({
-        listTools: (): BridgeToolSchema[] =>
-          (toolsSvc.schemas?.() ?? []).map((t) => ({
-            name: t.name,
-            description: t.description,
-            inputSchema: t.parameters,
-          })),
-        callTool: async (toolName, args, signal) => {
-          const result = await toolsSvc.execute!({
-            callId: `mcp:${randomUUID().slice(0, 12)}` as ToolCallId,
-            name: toolName,
-            arguments: args,
-            signal,
-          })
-          const textParts = result.content
-            .map((b) => (b.type === 'text' ? b.text : JSON.stringify(b)))
-            .filter((t) => t.length > 0)
-          return {
-            content: [{ type: 'text', text: textParts.join('\n') || '(no output)' }],
-            isError: result.isError,
-          }
-        },
-        log,
-      })
-      mcpBridge = localBridge
-      void localBridge
-        .start()
-        .then(() => pool.notifyStatusChange())
-        .catch((err) => log(`reverse MCP bridge failed to start: ${err instanceof Error ? err.message : String(err)}`))
+    const ensureBridgeState = async (): Promise<void> => {
+      const want = cfg.enabled && cfg.mcpBridge && typeof tools.schemas === 'function' && typeof tools.execute === 'function'
+      if (want && !localBridge) {
+        const toolsSvc = tools
+        const b = new ReverseMcpBridge({
+          listTools: (): BridgeToolSchema[] =>
+            (toolsSvc.schemas?.() ?? []).map((t) => ({
+              name: t.name,
+              description: t.description,
+              inputSchema: t.parameters,
+            })),
+          callTool: async (toolName, args, signal) => {
+            const result = await toolsSvc.execute!({
+              callId: `mcp:${randomUUID().slice(0, 12)}` as ToolCallId,
+              name: toolName,
+              arguments: args,
+              signal,
+            })
+            const textParts = result.content
+              .map((b) => (b.type === 'text' ? b.text : JSON.stringify(b)))
+              .filter((t) => t.length > 0)
+            return {
+              content: [{ type: 'text', text: textParts.join('\n') || '(no output)' }],
+              isError: result.isError,
+            }
+          },
+          log,
+        })
+        localBridge = b
+        mcpBridge = b
+        try {
+          await b.start()
+        } catch (err) {
+          log(`reverse MCP bridge failed to start: ${err instanceof Error ? err.message : String(err)}`)
+        }
+        pool.notifyStatusChange()
+      } else if (!want && localBridge) {
+        const closing = localBridge
+        localBridge = null
+        if (mcpBridge === closing) mcpBridge = null
+        await closing.dispose()
+        pool.notifyStatusChange()
+      }
     }
 
+    syncMcpBridge = ensureBridgeState
+    void ensureBridgeState()
+
     return () => {
+      if (syncMcpBridge === ensureBridgeState) syncMcpBridge = null
       if (typeof unlisten === 'function') unlisten()
       if (typeof disposeTool === 'function') disposeTool()
       if (localBridge) {
-        if (mcpBridge === localBridge) mcpBridge = null
-        void localBridge.dispose().finally(() => pool.notifyStatusChange())
+        const closing = localBridge
+        localBridge = null
+        if (mcpBridge === closing) mcpBridge = null
+        void closing.dispose().finally(() => pool.notifyStatusChange())
       }
     }
   })

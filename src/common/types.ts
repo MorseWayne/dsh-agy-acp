@@ -119,6 +119,15 @@ export interface StatusSnapshot {
   accounts: AccountHealthSnapshot[]
   models: AcpModelOption[]
   permissionMode: PermissionMode
+  config: {
+    agyBin: string
+    workspaceRoot: string
+    defaultModel: string
+    defaultEffort: string
+    mcpBridge: boolean
+    sessionIdleTtlMs: number
+    requestTimeoutMs: number
+  }
   lastError: string | null
   updatedAt: number
 }
