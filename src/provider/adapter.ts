@@ -252,6 +252,8 @@ export class AcpAdapter extends LlmAdapter {
       if (session.currentMode !== targetMode) throw new Error(`Antigravity did not accept permission mode ${targetMode}`)
       const turn = this.deps.pool.beginPrompt(session, options.signal)
       const rec = this.deps.runs.create(sessionKey)
+      // agy emits usage_update at the end of a prompt, so seed with the last known occupancy for mirror boundaries.
+      if (typeof session.contextUsed === 'number') rec.contextUsed = session.contextUsed
       rec.setCancelHandler(() => {
         turn.cancel()
         client.sessionCancel(session.acpSessionId)
