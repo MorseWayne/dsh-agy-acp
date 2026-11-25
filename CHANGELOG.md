@@ -2,6 +2,24 @@
 
 All notable changes to `@morsewayne/dsh-agy-acp` are documented in this file.
 
+## [0.4.2] - 2026-11-25
+
+### Added
+- **Workspace-Write Smart Auto-Allow with Risk Guardrails**: Automatically allows safe sandboxed commands and validated local workspace file operations under `workspace-write`, while continuing to escalate high-risk commands, out-of-bounds targets, and ambiguous inputs to DSH approval.
+- **Per-Turn `stderr` Slicing**: `AcpClient` now tracks monotonic stderr offsets (`stderrOffset()` / `readStderrSince()`) so timeout and process-exit diagnostics include only output emitted during the failing request instead of stale warnings from earlier turns.
+- **TOS Violation Quarantine Without Failover**: Recognizes `TOS_VIOLATION` / account-suspension errors with strict priority over quota/geo rules, immediately quarantines the affected account across all model families, halts automatic failover to prevent cascading bans, and surfaces quarantine alerts with manual recovery in Console UI and `/agy-acp status`.
+
+### Fixed
+- **Wrong cache-hit rate in DSH (0% instead of ~85%)**: Tool-mirror steps reported the whole context as uncached input, and the final step dropped the cache buckets when clamping the run-cumulative ACP usage. Each DSH step now reports the exact usage of the agy model calls behind it, tailed from agy's own per-call `transcript.jsonl` (`PLANNER_RESPONSE` records, under the account's HOME / `ANTIGRAVITY_APP_DATA_DIR`). Several calls in one step keep the latest prompt side (true context occupancy) and sum generation; a step without a new call reports nothing instead of re-billing.
+- **Cache double subtraction**: agy's ACP `inputTokens` already excludes cached tokens, so `mapUsage` no longer subtracts the cache buckets from it (which zeroed uncached input and overstated hits in the console totals). Totals are derived when the reported one would make DSH reject the turn.
+- **Fallback without a transcript** keeps the previous occupancy-based reporting, but the clamped final sample now scales cache buckets proportionally instead of dropping them.
+- **Plugin reload disconnect attribution**: Reports plugin reload/unload explicitly when pool disposal terminates in-flight ACP turns.
+- **Loopback reverse MCP immunity & `NO_PROXY` hardening**: Switched `bridge.mjs` to direct `node:http`/`node:https` requests (immune to `HTTP_PROXY`/`ALL_PROXY`/`NODE_USE_ENV_PROXY=1`), and automatically merges `127.0.0.1,localhost,::1` into `NO_PROXY`/`no_proxy` when proxy env vars are passed through account `env`.
+- **Non-blocking credential slot release**: Replaced the up-to-2s synchronous busy-wait loop in `CredentialSlotLeaseManager` with an uncontended fast path + async contended retry and lazy non-spinning exit cleanup.
+
+### Changed
+- **Removed per-account `proxyUrl` / `hasProxy` config layer**: Simplified account configuration to rely on ambient host proxy/TUN or explicit `accounts[].env`, removing the unused `proxyUrl` field and UI badge.
+
 ## [0.4.1] - 2026-11-25
 
 ### Fixed

@@ -268,7 +268,7 @@ export class ReverseMcpBridge {
       return {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: this.serverName, version: '0.4.1' },
+        serverInfo: { name: this.serverName, version: '0.4.2' },
       }
     }
 
