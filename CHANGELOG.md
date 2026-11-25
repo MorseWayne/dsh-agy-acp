@@ -2,6 +2,12 @@
 
 All notable changes to `@morsewayne/dsh-agy-acp` are documented in this file.
 
+## [0.4.1] - 2026-11-25
+
+### Fixed
+- **Context occupancy never shown in DSH**: The adapter only emitted a `usage` chunk when a whole ACP prompt finished, so tool-mirror steps carried no usage and DSH's token meter had no `pressureTokens`. Tool boundaries now report the live context occupancy, seeded from the session's last known `usage_update.used` since agy emits it only at prompt end.
+- **Inflated context pressure**: ACP `session/prompt` usage is cumulative across every internal model call, so its cache-read bucket could exceed the context window. The final usage sample is now clamped to the live context occupancy when it would exceed it.
+
 ## [0.4.0] - 2026-11-25
 
 ### Added

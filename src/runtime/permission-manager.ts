@@ -44,6 +44,20 @@ const SINGLE_PATH_KEYS = new Set([
   'path',
   'File',
   'file',
+  'SourcePath',
+  'DestinationPath',
+  'sourcePath',
+  'destinationPath',
+  'source',
+  'destination',
+  'from',
+  'to',
+  'oldPath',
+  'newPath',
+  'old_path',
+  'new_path',
+  'src',
+  'dest',
 ])
 
 const MULTI_PATH_KEYS = new Set([
