@@ -132,10 +132,17 @@ export class AcpRunRecording {
     return this.toolCalls.get(key)
   }
 
+  /** Latest `usage_update.used` seen during this run: the real live context occupancy. */
+  contextUsed: number | undefined
+
   pushUpdate(update: SessionUpdatePayload): number {
     if (this.settled) return this.items.length - 1
     const idx = this.items.length
     this.items.push({ kind: 'update', update })
+    if (update.sessionUpdate === 'usage_update') {
+      const used = (update as { used?: unknown }).used
+      if (typeof used === 'number' && Number.isSafeInteger(used) && used >= 0) this.contextUsed = used
+    }
 
     if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
       const tc = update as AcpToolCallUpdate

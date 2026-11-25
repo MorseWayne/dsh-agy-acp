@@ -14,3 +14,21 @@ export function mapUsage(raw: AcpUsage): TokenUsage {
     ...(raw.totalTokens !== undefined ? { totalTokens: raw.totalTokens } : {}),
   }
 }
+
+/**
+ * DSH derives context occupancy from prompt-side tokens of the latest usage sample, but the ACP
+ * `session/prompt` usage is cumulative over every internal model call of the run, so its cache-read
+ * bucket can exceed the context window. Prefer the live `usage_update.used` figure as the pressure.
+ */
+export function mapContextUsage(raw: AcpUsage | undefined, contextUsed: number | undefined): TokenUsage | undefined {
+  const mapped = raw ? mapUsage(raw) : undefined
+  if (contextUsed === undefined) return mapped
+  if (!mapped) return { inputTokens: contextUsed, outputTokens: 0 }
+  const pressure = mapped.inputTokens + (mapped.cacheReadTokens ?? 0) + (mapped.cacheWriteTokens ?? 0)
+  if (pressure <= contextUsed) return mapped
+  return {
+    inputTokens: contextUsed,
+    outputTokens: mapped.outputTokens,
+    ...(mapped.reasoningTokens !== undefined ? { reasoningTokens: mapped.reasoningTokens } : {}),
+  }
+}

@@ -10,7 +10,7 @@ import {
 import { ReasoningEffortId, type ToolCallId } from '@deepseek-ai/dsh-llm/brand'
 import { AcpProcessExitError, AcpRpcError, AcpTimeoutError } from '../acp/client.ts'
 import type { AcpToolCallUpdate } from '../acp/protocol.ts'
-import { mapUsage } from '../acp/usage.ts'
+import { mapContextUsage } from '../acp/usage.ts'
 import { defaultEffort, effortLabel } from '../common/effort.ts'
 import { isGeoUnsupportedError } from '../common/geo.ts'
 import {
@@ -536,9 +536,8 @@ export class AcpAdapter extends LlmAdapter {
       if (item.kind === 'done') {
         const closed = closeOpenBlock()
         if (closed) yield closed
-        if (item.usage) {
-          yield { type: 'usage', usage: mapUsage(item.usage) }
-        }
+        const usage = mapContextUsage(item.usage, rec.contextUsed)
+        if (usage) yield { type: 'usage', usage }
         yield { type: 'finish', reason: { kind: 'stop' } }
         return
       }
@@ -607,7 +606,9 @@ export class AcpAdapter extends LlmAdapter {
               }
             }
 
-            // A mirror boundary is not another ACP request. Only the final response carries usage.
+            // A mirror boundary has no ACP response usage; report live context occupancy so DSH can show it.
+            const boundaryUsage = mapContextUsage(undefined, rec.contextUsed)
+            if (boundaryUsage) yield { type: 'usage', usage: boundaryUsage }
             yield { type: 'finish', reason: { kind: 'tool-calls' } }
             return
           }

@@ -122,7 +122,10 @@ async function assertMirrorContinuation(format: 'legacy' | 'tool role' | 'runtim
     )
 
     assert.deepEqual(permissionLog, ['run_command'])
-    assert.equal(span1.some(c => c.type === 'usage'), false)
+    // Mirror boundaries report live context occupancy (usage_update.used) so DSH can render context pressure.
+    const boundaryUsage = span1.find((c) => c.type === 'usage')
+    assert.ok(boundaryUsage && boundaryUsage.type === 'usage')
+    assert.equal(boundaryUsage.usage.inputTokens, 320)
     const observed = pool.getStatus().sessions[0]!
     assert.equal(observed.contextUsed, 320)
     assert.equal(observed.contextSize, 65536)
@@ -204,12 +207,12 @@ async function assertMirrorContinuation(format: 'legacy' | 'tool role' | 'runtim
 
     const usage2 = span2.find((c) => c.type === 'usage')
     assert.ok(usage2 && usage2.type === 'usage')
-    assert.equal(usage2.usage.inputTokens, 500) // 1000 - 400 read - 100 write
-    assert.equal(usage2.usage.cacheWriteTokens, 100)
-    assert.equal(pool.getStatus().usageTotals.inputTokens, 500)
-    assert.equal(pool.getStatus().usageTotals.cachedWriteTokens, 100)
-    assert.equal(usage2.usage.cacheReadTokens, 400)
+    // ACP prompt usage is cumulative (1000 > live context 320), so pressure is clamped to usage_update.used.
+    assert.equal(usage2.usage.inputTokens, 320)
+    assert.equal(usage2.usage.cacheReadTokens, undefined)
     assert.equal(usage2.usage.reasoningTokens, 120)
+    assert.equal(pool.getStatus().usageTotals.inputTokens, 500) // pool totals keep raw ACP buckets
+    assert.equal(pool.getStatus().usageTotals.cachedWriteTokens, 100)
 
     const followUp = await collectChunks(adapter.stream({ provider: PROVIDER_ID, model: 'claude-sonnet-5-5', sessionId: 'dsh-tool-conv',
       messages: [...history, { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'switch model' }] }],
