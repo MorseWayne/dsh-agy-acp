@@ -316,6 +316,295 @@ function extractEditBody(input: Record<string, unknown> | null): { text: string;
   return null
 }
 
+export interface HighRiskCommandMatch {
+  readonly category: string
+  readonly reason: string
+}
+
+export interface ExtractedExecuteCommand {
+  readonly fullCmd: string
+  readonly displayCmd: string
+  readonly cwd?: string
+  readonly bytes: number
+  readonly hasDangerousEnv: boolean
+}
+
+const DANGEROUS_ENV_KEYS = new Set([
+  'LD_PRELOAD',
+  'LD_LIBRARY_PATH',
+  'DYLD_INSERT_LIBRARIES',
+  'DYLD_LIBRARY_PATH',
+  'NODE_OPTIONS',
+  'BASH_ENV',
+  'ENV',
+  'PROMPT_COMMAND',
+])
+
+function hasDangerousEnvOverride(obj: Record<string, unknown> | null): boolean {
+  if (!obj) return false
+  for (const key of ['env', 'Env', 'environment', 'Environment']) {
+    const rec = asRecord(obj[key])
+    if (!rec) continue
+    for (const envKey of Object.keys(rec)) {
+      if (DANGEROUS_ENV_KEYS.has(envKey.toUpperCase())) return true
+    }
+  }
+  return false
+}
+
+function extractCommandFromObject(obj: Record<string, unknown>): ExtractedExecuteCommand | null {
+  const cmd = firstString(obj, ['CommandLine', 'command', 'cmd', 'script'])
+  if (!cmd || !cmd.trim()) return null
+
+  const rawArgs = obj.args ?? obj.argv ?? obj.Args
+  let argsDisplay: string | undefined
+  let argsRiskText: string | undefined
+
+  if (rawArgs !== undefined) {
+    if (Array.isArray(rawArgs)) {
+      const stringArgs: string[] = []
+      for (const item of rawArgs) {
+        if (typeof item !== 'string') return null
+        stringArgs.push(item)
+      }
+      if (stringArgs.length > 0) {
+        argsDisplay = JSON.stringify(stringArgs)
+        argsRiskText = stringArgs.join(' ')
+      }
+    } else if (typeof rawArgs === 'string') {
+      if (rawArgs.length > 0) {
+        argsDisplay = rawArgs
+        argsRiskText = rawArgs
+      }
+    } else {
+      return null
+    }
+  }
+
+  const displayCmd = argsDisplay ? `${cmd} ${argsDisplay}` : cmd
+  const fullCmd = argsRiskText ? `${cmd} ${argsRiskText}` : cmd
+  const cwd = firstString(obj, ['Cwd', 'cwd', 'workdir', 'workingDirectory'])
+  return {
+    fullCmd,
+    displayCmd,
+    ...(cwd ? { cwd } : {}),
+    bytes: Buffer.byteLength(displayCmd, 'utf8'),
+    hasDangerousEnv: hasDangerousEnvOverride(obj),
+  }
+}
+
+/** Fail-closed extraction of command metadata across `rawInput` and `args`. */
+export function extractExecuteCommand(req: RequestPermissionParams): ExtractedExecuteCommand | null {
+  const tc = req.toolCall
+  const sources: Record<string, unknown>[] = []
+  for (const src of [tc.rawInput, tc.args]) {
+    if (src === undefined) continue
+    const rec = asRecord(src)
+    if (!rec) return null
+    sources.push(rec)
+  }
+  if (sources.length === 0) return null
+
+  const extracted = sources.map(extractCommandFromObject).filter((v): v is ExtractedExecuteCommand => v !== null)
+  if (extracted.length === 0) return null
+  if (extracted.length > 1) {
+    const [first, second] = extracted
+    if (first!.fullCmd !== second!.fullCmd || first!.cwd !== second!.cwd) return null
+  }
+  return extracted[0]!
+}
+
+const LOOPBACK_URL_RE = /^https?:\/\/(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\])(?::\d+)?(?:\/|\?|#|$)/i
+const URL_TOKEN_RE = /https?:\/\/[^\s'"`<>|;&)]+/gi
+
+function hasDangerousRmSegment(command: string): boolean {
+  const rmMatches = command.matchAll(/(?:^|[;&|(\n`'"])\s*(?:(?:env\s+[\w.+-]+=\S+\s+)*)?rm\s+([^\n;&|)`'"]+)/g)
+  for (const match of rmMatches) {
+    const argStr = match[1] ?? ''
+    const tokens = argStr.trim().split(/\s+/).filter(Boolean)
+    let hasRecursive = false
+    let hasForce = false
+    const targets: string[] = []
+    let afterDoubleDash = false
+    for (const raw of tokens) {
+      const token = raw.replace(/^['"]|['"]$/g, '')
+      if (!afterDoubleDash && token === '--') {
+        afterDoubleDash = true
+        continue
+      }
+      if (!afterDoubleDash && token.startsWith('-')) {
+        if (/^--recursive$/i.test(token) || /^-[a-zA-Z]*[rR]/.test(token)) hasRecursive = true
+        if (/^--force$/i.test(token) || /^-[a-zA-Z]*f/.test(token)) hasForce = true
+        continue
+      }
+      targets.push(token)
+    }
+    if (!hasRecursive && !hasForce) continue
+    for (const t of targets) {
+      if (
+        t === '/' ||
+        t === '/*' ||
+        t === '*' ||
+        t === '.' ||
+        t === './' ||
+        t === './*' ||
+        t === '..' ||
+        t.startsWith('../') ||
+        /(?:^|\/)\.\.(?:\/|$)/.test(t) ||
+        t === '~' ||
+        t.startsWith('~/') ||
+        t === '$HOME' ||
+        t.startsWith('$HOME/') ||
+        t === '${HOME}' ||
+        t.startsWith('${HOME}/') ||
+        t === '.git' ||
+        t.startsWith('.git/') ||
+        t.endsWith('/.git') ||
+        (t.startsWith('/') && !t.startsWith('/tmp/') && !t.startsWith('/var/tmp/'))
+      ) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+function hasExternalCurlWrite(command: string): boolean {
+  const curlMatches = command.matchAll(/(?:^|[;&|(\n`'"])\s*curl\b([^\n;&|)`'"]*)/g)
+  for (const match of curlMatches) {
+    const args = match[1] ?? ''
+    const isWrite =
+      /(?:^|\s)(?:-d|--data(?:-(?:raw|binary|urlencode|ascii))?|-F|--form|-T|--upload-file|--json)(?=\s|=|$)/.test(args) ||
+      /(?:^|\s)(?:-X|--request)\s*['"]?(?:POST|PUT|PATCH|DELETE)['"]?(?=\s|$)/i.test(args)
+    if (!isWrite) continue
+    const urls = args.match(URL_TOKEN_RE) ?? []
+    // Fail-closed: if a write curl has no clear loopback-only URLs (e.g. variable URL or external host), ask user.
+    if (urls.length === 0 || urls.some((u) => !LOOPBACK_URL_RE.test(u))) {
+      return true
+    }
+  }
+  return false
+}
+
+const HIGH_RISK_COMMAND_RULES: ReadonlyArray<{
+  readonly category: string
+  readonly reason: string
+  readonly pattern: RegExp
+}> = [
+  {
+    category: 'privilege',
+    reason: '涉及提权操作（sudo / su / doas / pkexec）',
+    pattern: /(?:^|[;&|(\n`'"])\s*(?:sudo|doas|pkexec|su(?:\s+-\s*|\s+[-\w]+))(?=\s|$)/,
+  },
+  {
+    category: 'system',
+    reason: '涉及系统级磁盘、分区或开关机操作',
+    pattern: /(?:^|[;&|(\n`'"])\s*(?:mkfs(?:\.\w+)?|fdisk|parted|wipefs|shred|shutdown|reboot|poweroff|halt|telinit)\b/,
+  },
+  {
+    category: 'system',
+    reason: '涉及直接写入块设备（dd of=/dev/...）',
+    pattern: /(?:^|[;&|(\n`'"])\s*dd\b[^\n;&|]*\bof=\/dev\//,
+  },
+  {
+    category: 'system',
+    reason: '涉及停止或修改系统服务（systemctl）',
+    pattern: /(?:^|[;&|(\n`'"])\s*systemctl\s+(?:stop|disable|mask|reboot|poweroff|halt|daemon-reexec)\b/,
+  },
+  {
+    category: 'system',
+    reason: '涉及修改系统目录权限或递归 777 授权',
+    pattern: /(?:^|[;&|(\n`'"])\s*(?:chmod|chown)\b[^\n;&|]*(?:\s-[a-zA-Z]*R[a-zA-Z]*\s+777\b|\s(?:\/etc|\/usr|\/var|\/bin|\/sbin|\/root|~\/|\$HOME)(?:\/|\s|$))/,
+  },
+  {
+    category: 'delete',
+    reason: '涉及 find 批量删除文件',
+    pattern: /(?:^|[;&|(\n`'"])\s*find\b[^\n;&|]*(?:\s-delete\b|\s-exec(?:dir)?\s+rm\b)/,
+  },
+  {
+    category: 'git',
+    reason: '涉及 Git 推送到远端仓库（git push）',
+    pattern: /(?:^|[;&|(\n`'"])\s*git\b(?:\s+(?:-[Cc]\s+\S+|--git-dir(?:=\S+|\s+\S+)|--work-tree(?:=\S+|\s+\S+)))*\s+push\b/,
+  },
+  {
+    category: 'git',
+    reason: '涉及 Git 硬重置（git reset --hard）',
+    pattern: /(?:^|[;&|(\n`'"])\s*git\b[^\n;&|]*\breset\s+(?:[^\n;&|]*\s)?--hard\b/,
+  },
+  {
+    category: 'git',
+    reason: '涉及 Git 强制清理未跟踪文件（git clean -f）',
+    pattern: /(?:^|[;&|(\n`'"])\s*git\b[^\n;&|]*\bclean\s+(?:[^\n;&|]*-[a-zA-Z]*f|--force)/,
+  },
+  {
+    category: 'git',
+    reason: '涉及 Git 重写仓库历史（filter-branch / filter-repo）',
+    pattern: /(?:^|[;&|(\n`'"])\s*git\b[^\n;&|]*\b(?:filter-branch|filter-repo)\b/,
+  },
+  {
+    category: 'git',
+    reason: '涉及批量丢弃工作区改动（git checkout -- . / git restore .）',
+    pattern: /(?:^|[;&|(\n`'"])\s*git\b[^\n;&|]*(?:\bcheckout\s+--\s+\.(?:\s|$)|\brestore\s+(?:--worktree\s+|--staged\s+)*\.(?:\s|$))/,
+  },
+  {
+    category: 'git',
+    reason: '涉及强制删除 Git 分支（git branch -D）',
+    pattern: /(?:^|[;&|(\n`'"])\s*git\b[^\n;&|]*\bbranch\s+(?:[^\n;&|]*\s)?-D\b/,
+  },
+  {
+    category: 'rce',
+    reason: '涉及下载远端脚本并直接执行（curl/wget 管道或进程替换）',
+    pattern: /\b(?:curl|wget)\b[^\n]*\|\s*(?:env\s+)?(?:(?:ba|z|da|k|c)?sh|python3?|node|perl|ruby)\b|\b(?:ba|z|da)?sh\s+<\(\s*(?:curl|wget)\b/,
+  },
+  {
+    category: 'network',
+    reason: '涉及反弹 Shell 或可疑网络连接执行',
+    pattern: /\/dev\/(?:tcp|udp)\/|\b(?:nc|ncat|netcat)\b[^\n;&|]*\s-[a-zA-Z]*e\b|\bsocat\b[^\n;&|]*\bexec:/i,
+  },
+  {
+    category: 'network',
+    reason: '涉及连接远端主机或跨主机传输文件（ssh / scp / sftp / rsync）',
+    pattern: /(?:^|[;&|(\n`'"])\s*(?:(?:ssh|scp|sftp)\b|rsync\b[^\n;&|]*\s(?:[\w.-]+@)?[\w.-]+:)/,
+  },
+  {
+    category: 'secrets',
+    reason: '涉及读取敏感凭据或密钥目录（~/.ssh、~/.aws、~/.gnupg、~/.kube 等）',
+    pattern: /(?:~|\$HOME|\$\{HOME\}|\/root|\/home\/[^/\s]+)\/\.(?:ssh|aws|gnupg|kube|npmrc|netrc|docker\/config\.json|config\/gh)\b|\/etc\/shadow\b/,
+  },
+  {
+    category: 'publish',
+    reason: '涉及对外发布软件包或推送镜像（publish / docker push / twine upload）',
+    pattern: /(?:^|[;&|(\n`'"])\s*(?:(?:npm|pnpm|yarn|bun|cargo)\s+publish\b|docker\s+push\b|twine\s+upload\b)/,
+  },
+  {
+    category: 'deploy',
+    reason: '涉及高危外部平台或基础设施变更（gh / kubectl / terraform / helm）',
+    pattern: /(?:^|[;&|(\n`'"])\s*(?:gh\s+(?:pr\s+merge|release\s+(?:create|delete)|repo\s+delete)\b|kubectl\s+(?:apply|delete|patch|replace|rollout)\b|terraform\s+(?:apply|destroy)\b|helm\s+(?:install|upgrade|uninstall)\b)/,
+  },
+]
+
+/** Assess whether a shell command hits any high-risk guard requiring human confirmation. */
+export function assessCommandRisk(command: string): HighRiskCommandMatch | null {
+  if (hasDangerousRmSegment(command)) {
+    return {
+      category: 'delete',
+      reason: '涉及高危强制/递归删除（根路径、家目录、工作区外或 .git 目录）',
+    }
+  }
+  if (hasExternalCurlWrite(command)) {
+    return {
+      category: 'network',
+      reason: '涉及向非本机地址发送 HTTP 写/上传请求（curl）',
+    }
+  }
+  for (const rule of HIGH_RISK_COMMAND_RULES) {
+    if (rule.pattern.test(command)) {
+      return { category: rule.category, reason: rule.reason }
+    }
+  }
+  return null
+}
+
 /** Human-readable approval reason with explicit truncation warnings and zero silent size denials. */
 export function formatApprovalReason(req: RequestPermissionParams): string {
   const tc = req.toolCall
@@ -328,20 +617,20 @@ export function formatApprovalReason(req: RequestPermissionParams): string {
   if (kind === 'execute') {
     lines.push(`Antigravity 请求执行命令 (${kind}): ${toolName}`)
     if (tc.title) lines.push(`说明: ${tc.title}`)
-    const cwd = firstString(inputObj, ['Cwd', 'cwd', 'workdir', 'workingDirectory'])
+    const extracted = extractExecuteCommand(req)
+    const cwd = extracted?.cwd ?? firstString(inputObj, ['Cwd', 'cwd', 'workdir', 'workingDirectory'])
     if (cwd) lines.push(`目录: ${cwd}`)
-    const cmd = firstString(inputObj, ['CommandLine', 'command', 'cmd', 'script'])
-    const rawArgs = inputObj?.args ?? inputObj?.argv ?? inputObj?.Args
-    const argsText =
-      Array.isArray(rawArgs) && rawArgs.length > 0
-        ? JSON.stringify(rawArgs)
-        : typeof rawArgs === 'string' && rawArgs.length > 0
-          ? rawArgs
-          : undefined
-    const fullCmd = cmd ? (argsText ? `${cmd} ${argsText}` : cmd) : undefined
 
+    const risk = extracted ? assessCommandRisk(extracted.fullCmd) : null
+    if (risk) {
+      lines.push(`⚠️ 高危命令拦截: ${risk.reason}`)
+    } else if (extracted?.hasDangerousEnv) {
+      lines.push('⚠️ 高危环境拦截: 命令携带受限环境变量注入（如 LD_PRELOAD / NODE_OPTIONS）')
+    }
+
+    const fullCmd = extracted?.displayCmd
     if (fullCmd) {
-      const bytes = Buffer.byteLength(fullCmd, 'utf8')
+      const bytes = extracted.bytes
       if (bytes <= MAX_COMMAND_FULL_BYTES) {
         lines.push(`命令:\n${fullCmd}`)
       } else {
@@ -396,10 +685,24 @@ function disposition(p: SessionPolicy, req: RequestPermissionParams): 'allow' | 
   if (kind === 'read' || kind === 'search') return 'allow'
   if (p.mode === 'read-only') return 'deny'
   if (p.mode === 'danger-full-access' && p.preset === 'danger-full-access' && p.approval === 'never') return 'allow'
-  if (p.mode === 'workspace-write' && p.preset === 'workspace-write' && kind === 'edit') {
-    const targets = extractEditTargets(req)
-    if (targets && isWithinRoots(targets, p.workspaceRoot, p.additionalWritableRoots)) {
-      return 'allow' // the process sandbox, not this classification, enforces actual writes
+  if (p.mode === 'workspace-write' && p.preset === 'workspace-write') {
+    if (kind === 'edit' || kind === 'delete' || kind === 'move') {
+      const targets = extractEditTargets(req)
+      if (targets && isWithinRoots(targets, p.workspaceRoot, p.additionalWritableRoots)) {
+        return 'allow' // the process sandbox, not this classification, enforces actual writes
+      }
+    }
+    if (kind === 'execute') {
+      const extracted = extractExecuteCommand(req)
+      if (
+        extracted &&
+        extracted.bytes <= MAX_COMMAND_FULL_BYTES &&
+        !extracted.hasDangerousEnv &&
+        (!extracted.cwd || isWithinRoots([extracted.cwd], p.workspaceRoot, p.additionalWritableRoots)) &&
+        !assessCommandRisk(extracted.fullCmd)
+      ) {
+        return 'allow' // confined by host full process sandbox; only high-risk commands escalate to human approval
+      }
     }
   }
   return 'ask'
