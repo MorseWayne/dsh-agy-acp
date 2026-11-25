@@ -78,4 +78,11 @@ jobs:
       - name: Publish verified tarball with npm trusted publishing
         env:
           DIST_TAG: ${{ needs.pack.outputs.dist_tag }}
-        run: npm publish release/*.tgz --ignore-scripts --access public --registry=https://registry.npmjs.org --tag "$DIST_TAG"
+        run: |
+          shopt -s nullglob
+          tarballs=(./release/*.tgz)
+          if (( ${#tarballs[@]} != 1 )); then
+            echo "::error::Expected exactly one tarball in ./release, found ${#tarballs[@]}"
+            exit 1
+          fi
+          npm publish "${tarballs[0]}" --ignore-scripts --access public --registry=https://registry.npmjs.org --tag "$DIST_TAG"
