@@ -16,7 +16,7 @@
 | **阶段三** | ✅ 已完成（`0189a5c`） | [阶段三设计规格](./specs/2026-11-25-phase3-config-persistence-and-console-ui-design.md) | 配置白名单原子持久化与重置、模型目录代次隔离与强制刷新、前端单例 SSE 状态中心、DSH 官方主题适配与控制台升级 | `v0.2.0` |
 | **阶段四** | ✅ 已完成（`7f488b6`） | [阶段四设计规格](./specs/2026-11-25-phase4-egress-guard-design.md) | 网络出口合规探测与防风控本地硬熔断（Egress Probe & GeoFence Guard）、全四条出站链路守门、多账号避障与控制台可视化自检 | `v0.3.0` |
 | **阶段五** | ✅ 已完成（`b237d35`） | [阶段五设计规格](./specs/2026-11-25-phase5-protocol-continuity-and-mcp-hardening-design.md) | ACP 协议能力深化（`session/load` 原生会话恢复、`config_option_update` / `session_info_update` 实时同步）与反向 MCP 桥接健壮化 | `v0.4.0` |
-| **阶段六** | 📋 路线规划（下一优先） | 待起草独立规格 | 多账号配额感知调度闭环、`/agy-acp` 结构化诊断工具箱、文档与发布基线收口 | `v0.4.0` |
+| **阶段六** | 🔄 进行中 | [阶段六设计规格](./specs/2026-11-25-phase6-quota-scheduling-doctor-and-release-design.md) | 多账号配额感知调度闭环、`/agy-acp` 结构化诊断工具箱、文档与发布基线收口 | `v0.4.0` |
 
 ```mermaid
 flowchart LR
