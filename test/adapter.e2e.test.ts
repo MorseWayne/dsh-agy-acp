@@ -1200,3 +1200,35 @@ test('session/load restores native ACP context across idle sweep & restart witho
     pool2.dispose()
   }
 })
+
+test('pool.dispose() during an in-flight turn reports a plugin reload reason instead of a bare "AcpClient disposed"', async () => {
+  const logs: string[] = []
+  const cfg = resolveConfig({ enabled: true, requestTimeoutMs: 10_000 })
+  const runs = new AcpRunStore()
+  const pool = new AcpSessionPool({ ...fakeHost, getConfig: () => cfg, resolveBin: () => FAKE_AGY_BIN, log: m => logs.push(m) })
+  const adapter = new AcpAdapter({ getConfig: () => cfg, pool, runs })
+  const chunks: StreamChunk[] = []
+  let thrown: unknown
+  try {
+    for await (const c of adapter.stream({
+      provider: PROVIDER_ID,
+      model: 'gemini-4-neon',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'SLOW_CANCEL please' }] } as Message],
+      sessionId: 'dsh-reload-1',
+    } as GenerateOptions)) {
+      chunks.push(c)
+      if (c.type === 'text-delta' && chunks.filter(x => x.type === 'text-delta').length === 1) pool.dispose()
+    }
+  } catch (err) {
+    thrown = err
+  } finally {
+    pool.dispose()
+  }
+  const finish = chunks.find(c => c.type === 'finish')
+  const message = thrown instanceof Error
+    ? thrown.message
+    : finish && finish.type === 'finish' ? JSON.stringify(finish.reason) : ''
+  assert.match(message, /插件已重载或卸载/)
+  assert.doesNotMatch(message, /AcpClient disposed/)
+  assert.ok(logs.some(l => /terminating 1 ACP session\(s\) \(1 with an in-flight turn\)/.test(l)), logs.join('\n'))
+})

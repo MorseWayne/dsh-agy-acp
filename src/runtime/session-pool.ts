@@ -1313,7 +1313,12 @@ export class AcpSessionPool extends EventEmitter {
     this.lifetime.abort()
     this.egressGuard.dispose()
     const keys = new Set([...this.sessions.keys(), ...this.opening.keys(), ...this.clients.keys()])
-    for (const key of keys) this.invalidate(key)
+    if (keys.size) {
+      const busy = [...keys].filter(key => this.active.has(key) || this.opening.has(key)).length
+      this.deps.log?.(`plugin unloading/reloading: terminating ${keys.size} ACP session(s) (${busy} with an in-flight turn)`)
+    }
+    const reason = new Error('dsh-agy-acp 插件已重载或卸载（例如 dist/ 被重新构建），当前 ACP 会话被终止，请重新发起请求。')
+    for (const key of keys) this.invalidate(key, reason)
     this.accountProvider.dispose?.()
     this.removeAllListeners()
   }
