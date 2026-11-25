@@ -1,4 +1,7 @@
-import { cancelled, policyKey, type SessionPolicy, type FilePolicy } from './permission-manager.ts'
+import { cancelled, canFinishConfinedTurn, policyKey, SessionPolicyChangedError, type SessionPolicy, type FilePolicy } from './permission-manager.ts'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { AcpClient, AcpProcessExitError, AcpTimeoutError } from '../acp/client.ts'
 import { isGeoUnsupportedError } from '../common/geo.ts'
@@ -51,6 +54,7 @@ export interface ManagedAcpSession {
   currentEffort: string
   currentMode: string
   configOptions: AcpConfigOption[]
+  hasMcpServers?: boolean
   supportsSystemPromptAppend?: boolean
   appliedSystemHash?: string | null
   contextUsed: number | null
@@ -104,12 +108,19 @@ export class SingleAccountProvider implements AccountProvider {
   }
 }
 
+interface TurnPermissions {
+  requests: number
+  pending: Set<string>
+  granted: Set<string>
+  interruptedBeforeGrant?: string
+}
+
 export interface SessionPoolDeps {
   getConfig: () => PluginConfig
   resolveBin: () => string | null
   readPolicy: (key: string) => SessionPolicy
   prepareArgv: (argv: string[], policy: FilePolicy, signal?: AbortSignal) => Promise<string[]>
-  onPermission?: (req: RequestPermissionParams, key: string, signal: AbortSignal) => Promise<RequestPermissionResult>
+  onPermission?: (req: RequestPermissionParams, key: string, signal: AbortSignal, launchPolicy: SessionPolicy) => Promise<RequestPermissionResult>
   isMcpBridgeActive?: () => boolean
   onConfigPatch?: (patch: Partial<PluginConfig>) => void | Promise<void>
   onConfigReset?: () => void | Promise<void>
@@ -130,9 +141,10 @@ export class AcpSessionPool extends EventEmitter {
   private readonly clients = new Map<string, AcpClient>()
   private readonly policies = new Map<string, string>()
   private readonly opening = new Map<string, AbortController>()
-  private readonly active = new Map<string, { controller: AbortController; done: Promise<void>; settle(): void }>()
+  private readonly active = new Map<string, { controller: AbortController; launchPolicy: SessionPolicy; retire: boolean; permissions: TurnPermissions; done: Promise<void>; settle(): void }>()
   private readonly lifetime = new AbortController()
   private disposed = false
+  private traceSession = process.env.DSH_AGY_ACP_TRACE_SESSION
   private readonly quotaSamples = new Map<string, AccountQuotaSample>()
   private readonly quotaReads = new Map<string, Promise<void>>()
   private configQueue: Promise<void> = Promise.resolve()
@@ -476,15 +488,31 @@ export class AcpSessionPool extends EventEmitter {
     return this.sessions.get(session.dshSessionKey) === session
   }
 
+  policyChanged(key: string): void {
+    const turn = this.active.get(key)
+    if (turn) {
+      try {
+        const current = this.policy(key)
+        if (this.policies.get(key) === policyKey(current)) return
+        if (!this.sessions.get(key)?.hasMcpServers && canFinishConfinedTurn(turn.launchPolicy, current)) {
+          turn.retire = true
+          return
+        }
+      } catch { /* Unknown authority requires closing the existing sandbox. */ }
+    }
+    this.invalidate(key, new SessionPolicyChangedError())
+  }
+
   activeSignal(key: string): AbortSignal | undefined {
     const signal = this.active.get(key)?.controller.signal
     if (!signal || signal.aborted || this.policies.get(key) !== policyKey(this.policy(key))) return undefined
     return signal
   }
 
-  beginPrompt(session: ManagedAcpSession, signal?: AbortSignal): { cancel(): void; finish(): void } {
+  beginPrompt(session: ManagedAcpSession, signal?: AbortSignal) {
     const key = session.dshSessionKey
-    if (this.sessions.get(key) !== session || this.active.has(key) || this.policies.get(key) !== policyKey(this.policy(key))) {
+    const launchPolicy = this.policy(key)
+    if (this.sessions.get(key) !== session || this.active.has(key) || this.policies.get(key) !== policyKey(launchPolicy)) {
       throw new Error('ACP session policy changed or session is busy; retry the turn')
     }
     signal?.throwIfAborted()
@@ -492,12 +520,17 @@ export class AcpSessionPool extends EventEmitter {
     const cancel = () => ac.abort()
     signal?.addEventListener('abort', cancel, { once: true })
     const { promise: done, resolve: settle } = Promise.withResolvers<void>()
-    this.active.set(key, { controller: ac, done, settle })
-    return { cancel, finish: () => {
+    const permissions: TurnPermissions = { requests: 0, pending: new Set(), granted: new Set() }
+    const turn = { controller: ac, launchPolicy, retire: false, permissions, done, settle }
+    this.active.set(key, turn)
+    return { cancel, permissions, finish: () => {
       signal?.removeEventListener('abort', cancel)
       cancel()
       settle()
-      if (this.active.get(key)?.controller === ac) this.active.delete(key)
+      if (this.active.get(key) === turn) {
+        this.active.delete(key)
+        if (turn.retire) this.invalidate(key)
+      }
     } }
   }
 
@@ -510,15 +543,26 @@ export class AcpSessionPool extends EventEmitter {
   ): Promise<{ client: AcpClient; initResult: InitializeResult }> {
     const bin = this.deps.resolveBin()
     if (!bin) throw new Error('agy binary not found — install Antigravity CLI first')
-    const [exe, ...args] = await this.deps.prepareArgv([bin, 'acp'], policy, signal)
+    const argv = await this.deps.prepareArgv([bin, 'acp'], policy, signal)
     signal.throwIfAborted()
-    if (!exe || this.disposed) throw new Error('ACP launch unavailable')
+    if (!argv[0] || this.disposed) throw new Error('ACP launch unavailable')
+    let [exe, ...args] = argv
+    if (process.platform === 'linux' && this.traceSession === policy.sessionId) {
+      this.traceSession = undefined
+      const trace = join(mkdtempSync(join(tmpdir(), 'dsh-acp-signal-')), 'signals.log')
+      // Keep the sandbox runner as the direct child. Trace one launch, including its descendants.
+      args = ['-DDD', '-f', '-qq', '-tt', '-Y', '--seccomp-bpf', '-e', 'trace=kill,pidfd_send_signal',
+        '-e', 'signal=SIGTERM', '-o', trace, '--', ...argv]
+      exe = '/usr/bin/strace'
+      this.deps.log?.(`ACP signal trace for "${policy.sessionId}": ${trace}`)
+    }
     const client = new AcpClient({ bin: exe, args, env, cwd: policy.workspaceRoot,
       defaultTimeoutMs: this.deps.getConfig().requestTimeoutMs, onPermission, onExit, onLog: this.deps.log })
-    const stop = () => client.dispose()
+    const stop = () => client.dispose(signal.reason)
     signal.addEventListener('abort', stop, { once: true })
     try {
       client.start()
+      this.deps.log?.(`ACP started for "${policy.sessionId}" (pid=${client.pid}, executable=${argv[0]})`)
       const initResult = await client.initialize()
       this.initResult = initResult
       return { client, initResult }
@@ -551,7 +595,7 @@ export class AcpSessionPool extends EventEmitter {
     if (existing || current) this.invalidate(key)
     const opening = new AbortController()
     this.opening.set(key, opening)
-    const stopOpening = () => client?.dispose()
+    const stopOpening = () => client?.dispose(opening.signal.reason)
     opening.signal.addEventListener('abort', stopOpening, { once: true })
     let lease: AccountLease | undefined
     let client: AcpClient | undefined
@@ -565,18 +609,42 @@ export class AcpSessionPool extends EventEmitter {
         lease.env,
         opening.signal,
         async req => {
-          const signal = this.activeSignal(key)
-          if (!signal || this.clients.get(key) !== client || req.sessionId !== this.sessions.get(key)?.acpSessionId) return cancelled()
-          return await this.deps.onPermission?.(req, key, signal) ?? cancelled()
+          const turn = this.active.get(key)
+          if (!turn || this.clients.get(key) !== client || req.sessionId !== this.sessions.get(key)?.acpSessionId) return cancelled()
+          const { signal } = turn.controller
+          const live = this.policy(key)
+          if (signal.aborted || (fingerprint !== policyKey(live) && !(turn.retire && canFinishConfinedTurn(policy, live)))) return cancelled()
+          const permissions = turn.permissions
+          const id = req.toolCall.toolCallId
+          permissions.requests++
+          permissions.pending.add(id)
+          try {
+            const result = await this.deps.onPermission?.(req, key, signal, policy) ?? cancelled()
+            if (signal.aborted) return cancelled()
+            const { outcome } = result
+            if (outcome.outcome === 'selected' && req.options.some(o =>
+              o.optionId === outcome.optionId && (o.kind === 'allow_once' || o.kind === 'allow_always'))) {
+              permissions.granted.add(id)
+            }
+            return result
+          } finally {
+            permissions.pending.delete(id)
+          }
         },
         (code, signal, exitedClient) => {
           if (this.clients.get(key) !== exitedClient) return
-          this.deps.log?.(`agy acp session "${key}" exited unexpectedly (code=${String(code)}, signal=${String(signal)})`)
+          const activeTurn = this.active.get(key)
+          const permissions = activeTurn?.permissions
+          const phase = permissions?.pending.size ? 'permission-pending' : permissions?.granted.size ? 'after-grant' : activeTurn ? 'prompt' : 'idle'
+          this.deps.log?.(`agy acp session "${key}" exited unexpectedly (pid=${exitedClient.pid}, phase=${phase}, code=${code}, signal=${signal})`)
+          // Snapshot before aborting the approval. Its promise may resolve during cleanup.
+          if (activeTurn && !activeTurn.controller.signal.aborted && permissions?.requests === 1 && !permissions.granted.size) {
+            permissions.interruptedBeforeGrant = permissions.pending.values().next().value
+          }
           this.clients.delete(key)
           this.sessions.delete(key)
           this.sessionEnvs.delete(key)
           this.policies.delete(key)
-          const activeTurn = this.active.get(key)
           if (activeTurn) {
             activeTurn.controller.abort()
             activeTurn.settle()
@@ -610,6 +678,7 @@ export class AcpSessionPool extends EventEmitter {
         currentEffort: findCurrentOption(configOptions, 'thought_level') ?? '',
         currentMode: findCurrentOption(configOptions, 'mode') ?? res.modes?.currentModeId ?? '',
         configOptions,
+        hasMcpServers: mcpServers.length > 0,
         supportsSystemPromptAppend,
         appliedSystemHash: supportsSystemPromptAppend && systemPrompt ? systemPrompt.hash : null,
         contextUsed: null, contextSize: 0, lastActiveAt: Date.now(),
@@ -973,9 +1042,9 @@ export class AcpSessionPool extends EventEmitter {
     return this.cachedModels
   }
 
-  invalidate(key: string): void {
+  invalidate(key: string, reason?: Error): void {
     if (!this.opening.has(key) && !this.sessions.has(key) && !this.clients.has(key)) return
-    this.opening.get(key)?.abort()
+    this.opening.get(key)?.abort(reason)
     this.active.get(key)?.controller.abort()
     this.active.get(key)?.settle()
     this.active.delete(key)
@@ -984,7 +1053,7 @@ export class AcpSessionPool extends EventEmitter {
     this.policies.delete(key)
     const client = this.clients.get(key)
     this.clients.delete(key)
-    client?.dispose()
+    client?.dispose(reason)
     this.deps.onSessionClosed?.(key)
     this.emitStatus()
   }

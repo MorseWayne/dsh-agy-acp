@@ -80,6 +80,8 @@ export class AcpRunRecording {
   private readonly stepToToolCallId = new Map<number, string>()
   private readonly emittedToolCallIds = new Set<string>()
   private waiters: Array<() => void> = []
+  private recovery?: { toolId: string; policy: string }
+  private cancelled = false
   private settled = false
   private runError?: string
   private cancelHandler: (() => void) | null = null
@@ -97,7 +99,21 @@ export class AcpRunRecording {
   }
 
   requestCancel(): void {
+    this.cancelled = true
     this.cancelHandler?.()
+  }
+
+  allowApprovalRecovery(toolId: string, policy: string): void {
+    const tool = this.toolCalls.get(toolId)
+    if (tool && !tool.settled && this.toolCalls.size === 1) this.recovery = { toolId, policy }
+  }
+
+  claimApprovalRecovery(step: number): string | undefined {
+    const recovery = this.recovery
+    if (!recovery || this.cancelled ||
+        this.getToolCall(step)?.toolCallId !== recovery.toolId || !this.isToolEmitted(recovery.toolId)) return undefined
+    this.recovery = undefined
+    return recovery.policy
   }
 
   isToolEmitted(toolCallId: string): boolean {
@@ -265,6 +281,10 @@ export class AcpRunStore {
 
   get(runId: string): AcpRunRecording | undefined {
     return this.runs.get(runId)
+  }
+
+  isLatestForOwner(run: AcpRunRecording): boolean {
+    return Array.from(this.runs.values()).findLast(candidate => candidate.owner === run.owner) === run
   }
 
   forget(runId: string): void {

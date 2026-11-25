@@ -108,6 +108,9 @@ const EXIT_CLOSE_FALLBACK_MS = 250
 export class AcpClient {
   private child: ChildProcessWithoutNullStreams | null = null
   private rl: ReadlineInterface | null = null
+  private spawnedPid?: number
+  get pid(): number | undefined { return this.spawnedPid }
+
   private nextId = 1
   private readonly pending = new Map<JsonRpcId, PendingCall>()
   private readonly sessionListeners = new Map<string, Set<UpdateListener>>()
@@ -147,6 +150,7 @@ export class AcpClient {
       // Own the local process group so a sandbox wrapper is not the only process stopped.
       detached: process.platform !== 'win32',
     })
+    this.spawnedPid = child.pid
     this.child = child
 
     // Prevent unhandled EPIPE crashes if the child exits while writing notifications/responses.
@@ -319,7 +323,7 @@ export class AcpClient {
     return this.request<Record<string, never>>('session/close', { sessionId }, 10_000)
   }
 
-  dispose(): void {
+  dispose(reason = new Error('AcpClient disposed')): void {
     this.disposedByCaller = true
     this.closed = true
     this.exitSettled = true
@@ -327,7 +331,7 @@ export class AcpClient {
       clearTimeout(this.exitFallbackTimer)
       this.exitFallbackTimer = null
     }
-    this.failAllPending(new Error('AcpClient disposed'))
+    this.failAllPending(reason)
     this.rl?.close()
     this.rl = null
     if (this.child) {

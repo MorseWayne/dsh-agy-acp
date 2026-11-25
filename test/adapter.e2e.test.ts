@@ -1,6 +1,6 @@
 import { fakeHost } from './fixtures/session-policy.ts'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, rmSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -950,5 +950,111 @@ test('EgressGuard blocks HK main chat & auxiliary calls with zero subprocess lau
     assert.equal(poolMulti.getStatus().accounts.find(a => a.id === 'acct-us')?.egress?.status, 'supported')
   } finally {
     poolMulti.dispose()
+  }
+})
+
+for (const scenario of ['before grant', 'after grant', 'repeat exit', 'caller cancelled', 'policy changed'] as const) {
+  test(`SIGTERM during a mirror tool call: ${scenario}`, { timeout: 10_000 }, async t => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), 'dsh-approval-exit-'))
+    const sessionId = 'approval-test'
+    const cfg = resolveConfig({})
+    const runs = new AcpRunStore()
+    const logs: string[] = []
+    const caller = new AbortController()
+    let approvals = 0
+    let oldApprovalClosed = false
+    let approvalPolicy: 'ask' | 'never' = 'ask'
+    const pool = new AcpSessionPool({
+      ...fakeHost, resolveBin: () => FAKE_AGY_BIN, getConfig: () => cfg,
+      readPolicy: () => ({ sessionId, workspaceRoot: cwd, mode: 'workspace-write', preset: 'workspace-write', approval: approvalPolicy }),
+      log: message => logs.push(message),
+      async onPermission(_req, _key, signal) {
+        approvals++
+        if (scenario !== 'after grant' && (approvals === 1 || scenario === 'repeat exit')) {
+          const launch = logs.findLast(line => line.startsWith('ACP started'))
+          const pid = Number(launch?.match(/pid=(\d+)/)?.[1])
+          assert.ok(pid > 0)
+          process.kill(pid, 'SIGTERM')
+          await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
+          oldApprovalClosed = true
+        }
+        return { outcome: { outcome: 'selected', optionId: 'allow' } }
+      },
+    })
+    t.after(() => { pool.dispose(); rmSync(cwd, { recursive: true, force: true }) })
+    const adapter = new AcpAdapter({ pool, runs, getConfig: () => cfg })
+    const mirror = defineAgyAcpMirrorTool(runs)
+    const history: Message[] = [
+      { role: 'user', content: [{ type: 'text', text: 'earlier context' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'ack' }] },
+      { role: 'user', content: [{ type: 'text', text: 'APPROVAL_EXIT' + (scenario === 'after grant' ? ' AFTER_GRANT' : '') }] },
+    ] as Message[]
+    const stream = () => collectChunks(adapter.stream({ provider: PROVIDER_ID, model: 'gemini-4-neon', sessionId, messages: history, signal: caller.signal,
+      tools: [{ name: MIRROR_TOOL_NAME, description: '', parameters: { type: 'object', properties: {} } }] } as unknown as GenerateOptions))
+    async function mirrorResult(chunks: StreamChunk[]) {
+      const end = chunks.find(c => c.type === 'block-end' && c.block.type === 'tool-call')
+      assert.ok(end?.type === 'block-end' && end.block.type === 'tool-call')
+      const args = JSON.parse(end.block.arguments)
+      const result = await mirror.execute(args, { agent: { session: { id: sessionId } } } as ToolRunContext)
+      const content = mirror.output.render(args, result as never)
+      history.push({ role: 'assistant', content: [end.block] } as Message,
+        { role: 'tool', toolCallId: end.block.id, content } as unknown as Message)
+      return result as { output: string; isError: boolean }
+    }
+
+    const first = await mirrorResult(await stream())
+    assert.equal(first.isError, true)
+    if (scenario === 'after grant') {
+      assert.match(first.output, /已获准执行/)
+    } else {
+      assert.equal(oldApprovalClosed, true)
+      assert.match(first.output, /尚未获准执行/)
+      assert.equal(existsSync(path.join(cwd, 'executions')), false)
+    }
+    if (scenario === 'caller cancelled') caller.abort()
+    if (scenario === 'policy changed') approvalPolicy = 'never'
+    let next = await stream()
+    if (scenario === 'before grant' || scenario === 'repeat exit') {
+      await mirrorResult(next)
+      next = await stream()
+      assert.equal(approvals, 2)
+    } else {
+      assert.equal(approvals, 1)
+    }
+    assert.ok(logs.some(line => line.includes(`phase=${scenario === 'after grant' ? 'after-grant' : 'permission-pending'}`)))
+    const finish = next.find(c => c.type === 'finish')
+    assert.equal(finish?.reason.kind, scenario === 'before grant' ? 'stop' : scenario === 'caller cancelled' ? 'aborted' : 'error')
+    if (scenario === 'before grant') {
+      assert.match(next.filter(c => c.type === 'text-delta').map(c => c.text).join(''), /earlier context/)
+    }
+    if (scenario === 'after grant' || scenario === 'before grant') {
+      assert.equal(readFileSync(path.join(cwd, 'executions'), 'utf8'), 'executed\n')
+    } else {
+      assert.equal(existsSync(path.join(cwd, 'executions')), false)
+    }
+  })
+}
+
+test('SIGTERM after reasoning recovers once with distinct block indices, while partial answers are preserved', async t => {
+  const { adapter, pool } = createHarness()
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-reasoning-exit-'))
+  t.after(() => { pool.dispose(); rmSync(dir, { recursive: true, force: true }) })
+  const previous = process.env.FAKE_CRASH_COUNTER_FILE
+  t.after(() => {
+    if (previous === undefined) delete process.env.FAKE_CRASH_COUNTER_FILE
+    else process.env.FAKE_CRASH_COUNTER_FILE = previous
+  })
+  for (const partial of [false, true]) {
+    const counter = path.join(dir, String(partial))
+    process.env.FAKE_CRASH_COUNTER_FILE = counter
+    const chunks = await collectChunks(adapter.stream({
+      provider: PROVIDER_ID, model: 'gemini-4-neon', sessionId: `reasoning-${partial}`,
+      messages: [{ role: 'user', content: [{ type: 'text',
+        text: 'CRASH_BEFORE_OUTPUT DURING_REASONING' + (partial ? ' ANSWER_STARTED' : '') }] }],
+    } as unknown as GenerateOptions))
+    assert.equal(readFileSync(counter, 'utf8'), partial ? '1' : '2')
+    assert.deepEqual(chunks.filter(c => c.type === 'block-start').map(c => c.index), [0, 1])
+    assert.deepEqual(chunks.filter(c => c.type === 'block-end').map(c => c.index), [0, 1])
+    assert.deepEqual(chunks.filter(c => c.type === 'finish').map(c => c.reason.kind), [partial ? 'error' : 'stop'])
   }
 })

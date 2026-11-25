@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 
 // Minimal ACP JSON-RPC 2.0 server over stdio for end-to-end integration tests.
@@ -195,6 +195,24 @@ async function handleRequest(id, method, params) {
       .filter((b) => b.type === 'text')
       .map((b) => b.text)
       .join('\n')
+
+    if (promptText.includes('APPROVAL_EXIT')) {
+      const toolCall = { sessionUpdate: 'tool_call', toolCallId: 'approval-tool', kind: 'execute',
+        name: 'run_command', status: 'pending', rawInput: { CommandLine: 'test command' } }
+      sendUpdate(sessionId, toolCall)
+      const decision = await requestClient('session/request_permission', {
+        sessionId, toolCall,
+        options: [{ kind: 'allow_once', optionId: 'allow', name: 'Allow once' }],
+      })
+      if (decision.outcome.optionId === 'allow') {
+        appendFileSync('executions', 'executed\n')
+        if (promptText.includes('AFTER_GRANT')) process.kill(process.pid, 'SIGTERM')
+      }
+      sendUpdate(sessionId, { ...toolCall, sessionUpdate: 'tool_call_update', status: 'completed' })
+      sendUpdate(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: promptText } })
+      send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } })
+      return
+    }
 
     if (promptText.includes('SLOW_CANCEL')) {
       sendUpdate(sessionId, {
@@ -499,6 +517,16 @@ async function handleRequest(id, method, params) {
         if (n >= 1 && process.env.FAKE_CRASH_ALWAYS !== '1') shouldCrash = false
       }
       if (shouldCrash) {
+        if (promptText.includes('DURING_REASONING')) {
+          sendUpdate(sessionId, { sessionUpdate: 'usage_update', used: 50, size: 1000 })
+          sendUpdate(sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Thinking' } })
+          if (promptText.includes('ANSWER_STARTED')) {
+            sendUpdate(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Partial answer' } })
+          }
+          await new Promise(resolve => setTimeout(resolve, 10))
+          process.kill(process.pid, 'SIGTERM')
+          return
+        }
         process.stderr.write('GOOGLE_API_KEY=AIzaSySecretKey1234567890123456789\nfatal peer crash\n')
         process.exit(1)
       }

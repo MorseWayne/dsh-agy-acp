@@ -20,6 +20,7 @@ import {
   type PluginConfig,
 } from '../common/types.ts'
 import { isQuotaOrRateLimitError } from '../runtime/account-pool.ts'
+import { policyKey, SessionPolicyChangedError } from '../runtime/permission-manager.ts'
 import { EgressBlockedError } from '../runtime/egress-guard.ts'
 import type { AcpSessionPool, ManagedAcpSession } from '../runtime/session-pool.ts'
 import { compactDisplayInput } from './mirror-tool.ts'
@@ -122,19 +123,31 @@ export class AcpAdapter extends LlmAdapter {
 
     // 1. Continuation span: DSH just executed `agy_acp_tool` and is resuming the same ACP turn.
     const continuation = detectContinuation(options.messages as readonly ContinuationMessage[])
+    let messages = options.messages as readonly PromptMessage[]
+    let recoveryPolicy: string | undefined
     if (continuation) {
       const rec = this.deps.runs.get(continuation.runId)
       if (rec && rec.owner === sessionKey) {
-        const onContAbort = (): void => {
-          rec.requestCancel()
+        const callId = encodeMirrorCallId(rec.id, continuation.itemIndex)
+        const callIndex = options.messages.findLastIndex(m => m.role === 'assistant' &&
+          m.content.some(b => b.type === 'tool-call' && b.id === callId))
+        if (callIndex >= 0 && !options.signal?.aborted && !cfg.mcpBridge && this.deps.runs.isLatestForOwner(rec)) {
+          recoveryPolicy = rec.claimApprovalRecovery(continuation.itemIndex)
         }
-        options.signal?.addEventListener('abort', onContAbort, { once: true })
-        try {
-          yield* this.driveRecording(rec, continuation.itemIndex + 1, cutOnTool, isCodeMode, options.signal)
-        } finally {
-          options.signal?.removeEventListener('abort', onContAbort)
+        if (recoveryPolicy && policyKey(this.deps.pool.policy(sessionKey)) === recoveryPolicy) {
+          // Keep the original user input (including images). The interrupted tool never produced a result.
+          messages = messages.slice(0, callIndex)
+          this.deps.log?.(`recreating ACP session "${sessionKey}" after interrupted approval (retry 1/1)`)
+        } else {
+          const onContAbort = () => rec.requestCancel()
+          options.signal?.addEventListener('abort', onContAbort, { once: true })
+          try {
+            yield* this.driveRecording(rec, continuation.itemIndex + 1, cutOnTool, isCodeMode, options.signal)
+          } finally {
+            options.signal?.removeEventListener('abort', onContAbort)
+          }
+          return
         }
-        return
       }
     }
 
@@ -143,12 +156,14 @@ export class AcpAdapter extends LlmAdapter {
     const requestedModel = options.model || cfg.defaultModel || ''
     const preparedSystem = prepareSystemPrompt(options.system)
     const triedAccounts = new Set<string>()
-    let crashRetried = false
+    let crashRetried = recoveryPolicy !== undefined
+    let nextBlockIndex = 0
     let lastEgressBlockedError: EgressBlockedError | null = null
     const maxAccounts = Math.max(1, cfg.accounts.filter((a) => a.enabled !== false).length || 1)
     const maxIterations = maxAccounts + 2
 
     for (let iter = 0; iter < maxIterations; iter++) {
+      options.signal?.throwIfAborted()
       let client: Awaited<ReturnType<AcpSessionPool['getOrCreateSession']>>['client']
       let session: ManagedAcpSession
       let created: boolean
@@ -194,6 +209,9 @@ export class AcpAdapter extends LlmAdapter {
 
       const targetModel = requestedModel || session.currentModel
       const policy = this.deps.pool.policy(sessionKey)
+      if (recoveryPolicy && (!created || session.hasMcpServers || recoveryPolicy !== policyKey(policy))) {
+        throw new Error('恢复时会话或权限已变更，请重新发起请求。')
+      }
       const nativeAuto = session.configOptions.find(o => o.id === 'mode')?.options?.some(o => 'value' in o ? o.value === 'auto' : o.options.some(v => v.value === 'auto'))
       const targetMode = policy.preset === 'auto' && policy.mode === 'danger-full-access' && nativeAuto ? 'auto' : 'default'
 
@@ -217,7 +235,7 @@ export class AcpAdapter extends LlmAdapter {
       }
 
       this.deps.pool.notifyStatusChange()
-      const baseBlocks = buildPromptBlocks(options.messages as readonly PromptMessage[], created)
+      const baseBlocks = buildPromptBlocks(messages, created)
       let pendingSystemHash: string | null = null
       let promptBlocks = baseBlocks
       if (preparedSystem) {
@@ -272,9 +290,25 @@ export class AcpAdapter extends LlmAdapter {
           rec.finish(res.stopReason, res.usage)
         })
         .catch((err: unknown) => {
+          if (err instanceof SessionPolicyChangedError) {
+            cleanupTurn()
+            rec.fail(err)
+            return
+          }
           const isCleanRpcError = err instanceof AcpRpcError
           let error = err instanceof Error ? err : new Error(String(err))
-          if (isGeoUnsupportedError(error)) {
+          if (err instanceof AcpProcessExitError) {
+            const { interruptedBeforeGrant, granted } = turn.permissions
+            if (interruptedBeforeGrant) {
+              if (cutOnTool && !crashRetried && !session.hasMcpServers && !cfg.mcpBridge && targetMode !== 'auto' && policy.approval === 'ask') {
+                rec.allowApprovalRecovery(interruptedBeforeGrant, policyKey(policy))
+              }
+              error = new Error(`工具审批因 ACP 退出而中断，该请求尚未获准执行。 ${err.message}`, { cause: err })
+            } else if ([...granted].some(id => !rec.getToolCall(id)?.settled)) {
+              error = new Error(`工具已获准执行，但未收到执行结果。请先核对执行状态，再决定是否重试。 ${err.message}`, { cause: err })
+            }
+          }
+          if (!(err instanceof AcpProcessExitError) && isGeoUnsupportedError(error)) {
             const snap = this.deps.pool.recordGeoRejection(session.accountId)
             this.deps.pool.reportAccountFailure(session.accountId, targetModel, error)
             const regionHint = snap.country ? `（当前检测地区：${snap.country}）` : ''
@@ -301,7 +335,7 @@ export class AcpAdapter extends LlmAdapter {
 
       // Peek first item before yielding so quota/429/geo failover and pre-output crash recovery stay seamless.
       const firstItem = await rec.waitFor(0, options.signal)
-      if (firstItem?.kind === 'error' && !options.signal?.aborted) {
+      if (firstItem?.kind === 'error' && !(firstItem.error instanceof AcpProcessExitError) && !turn.permissions.requests && !options.signal?.aborted) {
         const isGeoErr =
           isGeoUnsupportedError(firstItem.error) ||
           (firstItem.error instanceof LlmError && firstItem.error.code === 'ACP_GEO_UNSUPPORTED')
@@ -314,17 +348,22 @@ export class AcpAdapter extends LlmAdapter {
             await this.deps.pool.closeSession(sessionKey)
             continue
           }
-        } else if (firstItem.error instanceof AcpProcessExitError && !crashRetried) {
-          crashRetried = true
-          this.deps.log?.(
-            `agy acp process exited before output on "${sessionKey}", recreating session and retrying once: ${firstItem.error.message}`,
-          )
-          await this.deps.pool.closeSession(sessionKey)
-          continue
         }
       }
 
-      yield* this.driveRecording(rec, 0, cutOnTool, isCodeMode, options.signal)
+      const resumeAt = yield* this.driveRecording(rec, 0, cutOnTool, isCodeMode, options.signal, nextBlockIndex, () =>
+        !crashRetried && !options.signal?.aborted && !turn.permissions.requests &&
+        !session.hasMcpServers && targetMode !== 'auto' && this.deps.runs.isLatestForOwner(rec) &&
+        rec.items.every(item => item.kind === 'error' || (item.kind === 'update' &&
+          ['agent_thought_chunk', 'usage_update', 'session_info_update', 'available_commands_update',
+            'config_option_update'].includes(item.update.sessionUpdate))))
+      if (resumeAt !== undefined && !options.signal?.aborted) {
+        crashRetried = true
+        recoveryPolicy = policyKey(policy)
+        nextBlockIndex = resumeAt
+        this.deps.log?.(`ACP exited before an answer or tool call for "${sessionKey}"; recreating session (retry 1/1)`)
+        continue
+      }
       return
     }
   }
@@ -386,9 +425,11 @@ export class AcpAdapter extends LlmAdapter {
     cutOnTool: boolean,
     isCodeMode: boolean,
     signal?: AbortSignal,
-  ): AsyncIterable<StreamChunk> {
+    blockStart = 0,
+    canRetryExit?: () => boolean,
+  ): AsyncGenerator<StreamChunk, number | void> {
     let idx = startIndex
-    let blockIdx = 0
+    let blockIdx = blockStart
     let openType: 'text' | 'reasoning' | null = null
     let openAcc = ''
 
@@ -476,6 +517,11 @@ export class AcpAdapter extends LlmAdapter {
       if (item.kind === 'error') {
         const closed = closeOpenBlock()
         if (closed) yield closed
+        if (item.error instanceof SessionPolicyChangedError) {
+          yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: item.error.message } } }
+          return
+        }
+        if (item.error instanceof AcpProcessExitError && canRetryExit?.()) return blockIdx
         yield {
           type: 'finish',
           reason: {
