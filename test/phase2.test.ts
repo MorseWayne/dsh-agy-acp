@@ -136,3 +136,128 @@ test('HTTP configuration cannot override a DSH session permission or approve ACP
     pool.dispose()
   }
 })
+
+test('HTTP config save/reset and models/refresh validate input, isolate disk failures, and protect against CSRF', async () => {
+  const baseCfg = resolveConfig({ defaultModel: 'base-model', sessionIdleTtlMs: 1_800_000 })
+  let cfg = { ...baseCfg }
+  let persisted = false
+  let failSave = false
+  let failProbe = false
+
+  const pool = new AcpSessionPool({
+    ...fakeHost,
+    getConfig: () => cfg,
+    resolveBin: () => process.execPath,
+    prepareArgv: async () => {
+      if (failProbe) throw new Error('probe down')
+      return [process.execPath, new URL('./fixtures/fake-agy.mjs', import.meta.url).pathname]
+    },
+    hasPersistedConfig: () => persisted,
+    onConfigPatch: (patch) => {
+      if (failSave) throw new Error('EACCES /secret/path/config.json')
+      cfg = { ...cfg, ...patch }
+      persisted = true
+    },
+    onConfigReset: () => {
+      cfg = { ...baseCfg }
+      persisted = false
+    },
+  })
+
+  const routes = new Map<string, (req: IncomingMessage, res: ServerResponse) => void | Promise<void>>()
+  const webServer: WebServerLike = {
+    route(method, routePath, handler) {
+      routes.set(`${method} ${routePath}`, handler)
+      return () => routes.delete(`${method} ${routePath}`)
+    },
+  }
+  const disposeRoutes = registerAcpRoutes(webServer, pool)
+  const server = createServer((req, res) => {
+    const handler = routes.get(`${req.method ?? 'GET'} ${req.url ?? '/'}`)
+    if (!handler) {
+      res.writeHead(404)
+      res.end('Not found')
+      return
+    }
+    void handler(req, res)
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+  const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+
+  try {
+    // Rejects array body, host-only keys, unknown keys, and out-of-range timeouts with 400
+    for (const rawBody of ['[]', '{"accounts":[]}', '{"unknown":1}', '{"requestTimeoutMs":500}', '{}']) {
+      const r = await fetch(`${baseUrl}/plugins/agy-acp/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: rawBody,
+      })
+      assert.equal(r.status, 400, rawBody)
+    }
+
+    // Disk failure returns 500 without leaking path and does NOT poison subsequent saves
+    failSave = true
+    const errRes = await fetch(`${baseUrl}/plugins/agy-acp/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mcpBridge: true }),
+    })
+    assert.equal(errRes.status, 500)
+    const errJson = await errRes.json() as { error: string }
+    assert.equal(errJson.error.includes('/secret/path'), false)
+    assert.equal(cfg.mcpBridge, false)
+
+    failSave = false
+    const okRes = await fetch(`${baseUrl}/plugins/agy-acp/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mcpBridge: true, defaultModel: 'gemini-4-neon', sessionIdleTtlMs: 300_000 }),
+    })
+    assert.equal(okRes.status, 200)
+    const okJson = await okRes.json() as { persisted: boolean; status: { hasPersistedConfig: boolean; config: { defaultModel: string } } }
+    assert.equal(okJson.persisted, true)
+    assert.equal(okJson.status.hasPersistedConfig, true)
+    assert.equal(okJson.status.config.defaultModel, 'gemini-4-neon')
+
+    // CSRF protection: reset & models/refresh require application/json
+    assert.equal((await fetch(`${baseUrl}/plugins/agy-acp/config/reset`, { method: 'POST', body: '{}' })).status, 415)
+    assert.equal((await fetch(`${baseUrl}/plugins/agy-acp/models/refresh`, { method: 'POST', body: '{}' })).status, 415)
+
+    // Config reset restores baseCfg
+    const resetCfgRes = await fetch(`${baseUrl}/plugins/agy-acp/config/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+    assert.equal(resetCfgRes.status, 200)
+    const resetCfgJson = await resetCfgRes.json() as { status: { hasPersistedConfig: boolean; config: { defaultModel: string } } }
+    assert.equal(resetCfgJson.status.hasPersistedConfig, false)
+    assert.equal(resetCfgJson.status.config.defaultModel, 'base-model')
+
+    // models/refresh succeeds with 200, then returns 502 on failure while keeping cached models
+    const refreshOk = await fetch(`${baseUrl}/plugins/agy-acp/models/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+    assert.equal(refreshOk.status, 200)
+    const refreshOkJson = await refreshOk.json() as { status: { models: unknown[] } }
+    assert.ok(refreshOkJson.status.models.length > 0)
+
+    failProbe = true
+    const refreshFail = await fetch(`${baseUrl}/plugins/agy-acp/models/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+    assert.equal(refreshFail.status, 502)
+    const refreshFailJson = await refreshFail.json() as { error: string; status: { models: unknown[]; lastError: string | null } }
+    assert.match(refreshFailJson.error, /probe down/)
+    assert.ok(refreshFailJson.status.models.length > 0)
+    assert.ok(refreshFailJson.status.lastError)
+  } finally {
+    disposeRoutes()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    pool.dispose()
+  }
+})

@@ -58,3 +58,38 @@ test('formatCatalogProbeError classifies failure causes clearly without leaking 
   assert.equal(generic.includes('AIzaSySecretKey'), false)
   assert.match(generic, /\[REDACTED\]/)
 })
+
+test('forceRefreshModels emits SSE status on recovery and rejects on failure while preserving cache for refreshModels', async (t) => {
+  let unavailable = false
+  const statusEvents: Array<{ lastError: string | null; modelsCount: number }> = []
+  const pool = new AcpSessionPool({
+    ...fakeHost,
+    getConfig: () => resolveConfig(),
+    resolveBin: () => process.execPath,
+    async prepareArgv() {
+      if (unavailable) throw new Error('forced outage')
+      return [process.execPath, fileURLToPath(new URL('./fixtures/fake-agy.mjs', import.meta.url))]
+    },
+  })
+  t.after(() => pool.dispose())
+  pool.on('status', (s: { lastError: string | null; models: unknown[] }) => {
+    statusEvents.push({ lastError: s.lastError, modelsCount: s.models.length })
+  })
+
+  const initial = await pool.forceRefreshModels()
+  assert.ok(initial.length > 0)
+  assert.ok(statusEvents.some(e => e.lastError === null && e.modelsCount > 0))
+
+  unavailable = true
+  await assert.rejects(pool.forceRefreshModels(), /forced outage/)
+  assert.match(pool.getStatus().lastError ?? '', /forced outage/)
+  // Passive refreshModels still returns preserved cache during outage
+  const cached = await pool.refreshModels()
+  assert.deepEqual(cached, initial)
+
+  // Recovery clears lastError and emits status event
+  unavailable = false
+  await pool.forceRefreshModels()
+  assert.equal(pool.getStatus().lastError, null)
+  assert.equal(statusEvents[statusEvents.length - 1]?.lastError, null)
+})

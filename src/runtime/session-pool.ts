@@ -99,6 +99,8 @@ export interface SessionPoolDeps {
   onPermission?: (req: RequestPermissionParams, key: string, signal: AbortSignal) => Promise<RequestPermissionResult>
   isMcpBridgeActive?: () => boolean
   onConfigPatch?: (patch: Partial<PluginConfig>) => void | Promise<void>
+  onConfigReset?: () => void | Promise<void>
+  hasPersistedConfig?: () => boolean
   onSessionClosed?: (key: string) => void
   accountProvider?: AccountProvider
   getMcpServers?: (sessionKey: string) => Promise<AcpMcpServerSpec[]>
@@ -119,6 +121,8 @@ export class AcpSessionPool extends EventEmitter {
   private disposed = false
   private readonly quotaSamples = new Map<string, AccountQuotaSample>()
   private readonly quotaReads = new Map<string, Promise<void>>()
+  private configQueue: Promise<void> = Promise.resolve()
+  private catalogGeneration = 0
   private catalogProbe?: Promise<AcpModelOption[]>
   private catalogRetry?: ReturnType<typeof setTimeout>
   private catalogRetryCount = 0
@@ -240,9 +244,27 @@ export class AcpSessionPool extends EventEmitter {
     this.emitStatus()
   }
 
+  private runConfigOp<T>(op: () => Promise<T>): Promise<T> {
+    const next = this.configQueue.catch(() => {}).then(async () => {
+      if (this.disposed) throw new Error('ACP session pool disposed')
+      return await op()
+    })
+    this.configQueue = next.then(() => {}, () => {})
+    return next
+  }
+
   async updateConfig(patch: Partial<PluginConfig>): Promise<void> {
-    await this.deps.onConfigPatch?.(patch)
-    this.emitStatus()
+    await this.runConfigOp(async () => {
+      await this.deps.onConfigPatch?.(patch)
+      this.emitStatus()
+    })
+  }
+
+  async resetConfig(): Promise<void> {
+    await this.runConfigOp(async () => {
+      await this.deps.onConfigReset?.()
+      this.emitStatus()
+    })
   }
 
   getStatus(): StatusSnapshot {
@@ -282,6 +304,7 @@ export class AcpSessionPool extends EventEmitter {
         sessionIdleTtlMs: cfg.sessionIdleTtlMs,
         requestTimeoutMs: cfg.requestTimeoutMs,
       },
+      hasPersistedConfig: this.deps.hasPersistedConfig?.() ?? false,
       lastError: this.lastError,
       updatedAt: Date.now(),
     }
@@ -647,36 +670,67 @@ export class AcpSessionPool extends EventEmitter {
     }
   }
 
-  async refreshModels(cwd?: string): Promise<AcpModelOption[]> {
-    if (this.cachedModels.length > 0 && Date.now() < this.catalogExpiresAt) return this.cachedModels
-    if (!this.catalogProbe) this.catalogProbe = this.probeCatalog(cwd).catch(err => {
-      if (this.disposed) throw err
-      // A failed group is cached by DSH's menu just like a successful group. Retry
-      // the constrained discovery, then publish its recovery without requiring a chat turn.
-      this.lastError = formatCatalogProbeError(err)
-      this.emitStatus()
-      const delay = [5_000, 30_000, 60_000][this.catalogRetryCount]
-      if (delay !== undefined && !this.catalogRetry) {
-        this.catalogRetryCount++
-        this.catalogRetry = setTimeout(() => {
-          this.catalogRetry = undefined
-          this.catalogExpiresAt = 0
-          void this.refreshModels(cwd).catch(() => {})
-        }, delay)
-        this.catalogRetry.unref?.()
-      }
-      // Keep the last successful list during a transient outage. Avoid one failed
-      // re-probe per resolveModelInfo when the host expands the returned group.
-      if (this.cachedModels.length) {
-        this.catalogExpiresAt = Date.now() + (delay ?? 30_000)
-        return this.cachedModels
-      }
-      throw err
-    }).finally(() => { this.catalogProbe = undefined })
+  invalidateCatalog(): void {
+    this.catalogGeneration++
+    this.catalogExpiresAt = 0
+    clearTimeout(this.catalogRetry)
+    this.catalogRetry = undefined
+    this.catalogRetryCount = 0
+    this.catalogProbe = undefined
+  }
+
+  private runCatalogProbe(cwd?: string): Promise<AcpModelOption[]> {
+    if (!this.catalogProbe) {
+      const gen = this.catalogGeneration
+      const probe = this.probeCatalog(cwd, gen).catch(err => {
+        if (this.disposed || gen !== this.catalogGeneration) throw err
+        // A failed group is cached by DSH's menu just like a successful group. Retry
+        // the constrained discovery, then publish its recovery without requiring a chat turn.
+        this.lastError = formatCatalogProbeError(err)
+        const delay = [5_000, 30_000, 60_000][this.catalogRetryCount]
+        if (delay !== undefined && !this.catalogRetry) {
+          this.catalogRetryCount++
+          this.catalogRetry = setTimeout(() => {
+            this.catalogRetry = undefined
+            this.catalogExpiresAt = 0
+            void this.refreshModels(cwd).catch(() => {})
+          }, delay)
+          this.catalogRetry.unref?.()
+        }
+        // Keep the last successful list during a transient outage. Avoid one failed
+        // re-probe per resolveModelInfo when the host expands the returned group.
+        if (this.cachedModels.length) {
+          this.catalogExpiresAt = Date.now() + (delay ?? 30_000)
+        }
+        this.emitStatus()
+        throw err
+      }).finally(() => {
+        if (this.catalogProbe === probe) this.catalogProbe = undefined
+      })
+      this.catalogProbe = probe
+    }
     return this.catalogProbe
   }
 
-  private async probeCatalog(cwd?: string): Promise<AcpModelOption[]> {
+  async refreshModels(cwd?: string): Promise<AcpModelOption[]> {
+    if (this.cachedModels.length > 0 && Date.now() < this.catalogExpiresAt) return this.cachedModels
+    try {
+      return await this.runCatalogProbe(cwd)
+    } catch (err) {
+      if (!this.disposed && this.cachedModels.length > 0) {
+        return this.cachedModels
+      }
+      throw err
+    }
+  }
+
+  async forceRefreshModels(cwd?: string): Promise<AcpModelOption[]> {
+    if (this.disposed) throw new Error('ACP session pool disposed')
+    this.invalidateCatalog()
+    return await this.runCatalogProbe(cwd)
+  }
+
+  private async probeCatalog(cwd?: string, expectedGen?: number): Promise<AcpModelOption[]> {
     const lease = await this.accountProvider.acquire('__catalog__', '')
     let client: AcpClient | undefined
     try {
@@ -687,7 +741,11 @@ export class AcpSessionPool extends EventEmitter {
       const stop = () => client?.dispose()
       this.lifetime.signal.addEventListener('abort', stop, { once: true })
       try {
-        const catalog = this.captureCatalogFromSession(await client.sessionNew({ cwd: root, mcpServers: [] }))
+        const res = await client.sessionNew({ cwd: root, mcpServers: [] })
+        if (expectedGen !== undefined && expectedGen !== this.catalogGeneration) {
+          return this.cachedModels
+        }
+        const catalog = this.captureCatalogFromSession(res)
         if (!catalog.models.length) throw new Error('agy returned an empty ACP model catalog')
       }
       finally { this.lifetime.signal.removeEventListener('abort', stop) }
@@ -755,7 +813,10 @@ export class AcpSessionPool extends EventEmitter {
     clearTimeout(this.catalogRetry)
     this.catalogRetry = undefined
     this.catalogRetryCount = 0
-    if (changed) this.emit('models-updated')
+    if (changed) {
+      this.emitStatus()
+      this.emit('models-updated')
+    }
     return catalog
   }
 

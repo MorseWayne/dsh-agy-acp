@@ -10,6 +10,7 @@ import { defineAgyAcpMirrorTool } from './provider/mirror-tool.ts'
 import { AcpRunStore } from './provider/run-store.ts'
 import { resolveAgyBin } from './runtime/bin.ts'
 import { MultiAccountPool } from './runtime/account-pool.ts'
+import { ConfigStore } from './runtime/config-store.ts'
 import { CredentialSlotLeaseManager } from './runtime/credential-lease.ts'
 import { hostPermissions, type SessionAgent } from './runtime/host-permissions.ts'
 import { AcpSessionPool } from './runtime/session-pool.ts'
@@ -28,11 +29,14 @@ interface DshToolsServiceLike {
 }
 
 export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): void {
-  let cfg = resolveConfig(entryConfig)
+  const baseCfg = resolveConfig(entryConfig)
   const log = (msg: string): void => {
     // eslint-disable-next-line no-console
     console.log(`[dsh-agy-acp] ${msg}`)
   }
+  const configStore = new ConfigStore({ log })
+  const loaded = configStore.load()
+  let cfg = { ...baseCfg, ...loaded.patch }
 
   const permissions = hostPermissions(ctx as unknown as Parameters<typeof hostPermissions>[0])
   let bridgeTools: DshToolsServiceLike | undefined
@@ -62,9 +66,28 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     accountProvider: multiAccountPool,
     ...permissions,
     isMcpBridgeActive: () => bridges.size > 0,
+    hasPersistedConfig: () => configStore.hasPersistedOverrides,
     onConfigPatch: patch => {
+      configStore.savePatch(patch)
+      const prevBin = cfg.agyBin
+      const prevRoot = cfg.workspaceRoot
       cfg = { ...cfg, ...patch }
       if (!cfg.mcpBridge) for (const key of bridges.keys()) releaseBridge(key)
+      if (cfg.agyBin !== prevBin || cfg.workspaceRoot !== prevRoot) {
+        pool.invalidateCatalog()
+        void pool.refreshModels().catch(() => {})
+      }
+    },
+    onConfigReset: () => {
+      configStore.reset()
+      const prevBin = cfg.agyBin
+      const prevRoot = cfg.workspaceRoot
+      cfg = { ...baseCfg }
+      if (!cfg.mcpBridge) for (const key of bridges.keys()) releaseBridge(key)
+      if (cfg.agyBin !== prevBin || cfg.workspaceRoot !== prevRoot) {
+        pool.invalidateCatalog()
+        void pool.refreshModels().catch(() => {})
+      }
     },
     onSessionClosed: releaseBridge,
     async getMcpServers(key) {

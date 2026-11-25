@@ -2,12 +2,13 @@
 import React from 'react'
 import type { AccountHealthSnapshot, QuotaBucketState, StatusSnapshot } from '../common/types.ts'
 import { activeCooldowns, bucketDisplay, nextAccountExpiry, requestAccountAction } from './account-display.ts'
+import { styles, theme } from './theme.ts'
 
 const h = React.createElement
 const row = { display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', flexWrap: 'wrap', gap: '4px 12px' }
-const secondary = { fontSize: '12px', opacity: 0.8 }
-const border = '1px solid var(--dsw-alias-border-primary, currentColor)'
-const button = { padding: '4px 9px', borderRadius: '5px', border, background: 'transparent', color: 'inherit', font: 'inherit' }
+const secondary = styles.secondaryText
+const border = theme.borderPrimary
+const button = styles.ghostButton
 
 function localTime(ms: number): string {
   return new Date(ms).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })

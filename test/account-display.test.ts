@@ -8,6 +8,8 @@ import type { AccountHealthSnapshot, StatusSnapshot } from '../src/common/types.
 import { initialSnapshot, reduceSnapshot, snapshotNotice } from '../src/client/snapshot-state.ts'
 import { AccountCard } from '../src/client/account-card.ts'
 import { activeCooldowns, bucketDisplay, nextAccountExpiry, requestAccountAction, sessionAccountLabel } from '../src/client/account-display.ts'
+import { SettingsView } from '../src/client/index.ts'
+import { createStatusStore, type EventSourceLike } from '../src/client/status-store.ts'
 
 const account: AccountHealthSnapshot = {
   id: 'default', label: '本机默认账号', enabled: true, hasProxy: false, hasSandboxHome: false,
@@ -122,4 +124,180 @@ test('errors, non-JSON replies and network failures never leak raw data or produ
     async () => new Response('secret-marked-html'),
     async () => { throw new Error('secret-marked-network-error') },
   ]) await assert.rejects(requestAccountAction('refresh', 'default', request), { message: '配额刷新失败，请稍后重试。' })
+})
+
+test('createStatusStore shares one EventSource across subscribers, avoids fake-online after grace close, and is SSR-safe', async () => {
+  const fullSnap = (updatedAt: number): StatusSnapshot => ({
+    providerId: 'antigravity-acp',
+    enabled: true,
+    connected: true,
+    agentName: 'agy',
+    agentVersion: '1.5.16',
+    tierName: 'Pro',
+    activeSessions: 0,
+    sessions: [],
+    mcpBridgeActive: false,
+    usageTotals: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0, reasoningTokens: 0 },
+    accounts: [account],
+    models: [],
+    config: { agyBin: '', workspaceRoot: '', defaultModel: '', defaultEffort: '', mcpBridge: false, sessionIdleTtlMs: 1_800_000, requestTimeoutMs: 600_000 },
+    hasPersistedConfig: false,
+    lastError: null,
+    updatedAt,
+  })
+
+  let createdEs = 0
+  let closedEs = 0
+  let fetchCalls = 0
+  const hooks: {
+    status: ((ev: MessageEvent<string>) => void) | null
+    error: (() => void) | null
+    timer: (() => void) | null
+  } = { status: null, error: null, timer: null }
+
+  const store = createStatusStore({
+    closeGraceMs: 100,
+    fetchStatus: async () => {
+      fetchCalls++
+      return fullSnap(100)
+    },
+    createEventSource: () => {
+      createdEs++
+      const mock: EventSourceLike = {
+        addEventListener(type, listener) {
+          if (type === 'status') hooks.status = listener
+          if (type === 'error') hooks.error = listener as () => void
+        },
+        removeEventListener(type) {
+          if (type === 'status') hooks.status = null
+          if (type === 'error') hooks.error = null
+        },
+        close() {
+          closedEs++
+        },
+      }
+      return mock
+    },
+    setTimeoutFn: (fn) => {
+      hooks.timer = fn
+      return 1 as unknown as ReturnType<typeof setTimeout>
+    },
+    clearTimeoutFn: () => {
+      hooks.timer = null
+    },
+  })
+
+  let n1 = 0
+  let n2 = 0
+  const unsub1 = store.subscribe(() => { n1++ })
+  const unsub2 = store.subscribe(() => { n2++ })
+  assert.equal(createdEs, 1)
+  assert.equal(fetchCalls, 1)
+
+  // Live SSE event updates both subscribers
+  hooks.status?.({ data: JSON.stringify(fullSnap(200)) } as MessageEvent<string>)
+  assert.equal(store.getSnapshot().stream, 'live')
+  const stableRef = store.getSnapshot()
+  // Duplicate disconnect/error must keep referential stability if nothing changed
+  hooks.error?.()
+  const afterDisconnect = store.getSnapshot()
+  assert.notEqual(afterDisconnect, stableRef)
+  const notificationsBeforeDup = n1
+  hooks.error?.()
+  assert.equal(store.getSnapshot(), afterDisconnect)
+  assert.equal(n1, notificationsBeforeDup)
+
+  // Back to live, then unsubscribe all -> within grace period resubscribe reuses connection
+  hooks.status?.({ data: JSON.stringify(fullSnap(250)) } as MessageEvent<string>)
+  assert.equal(store.getSnapshot().stream, 'live')
+  unsub1()
+  unsub2()
+  assert.ok(hooks.timer)
+  const unsub3 = store.subscribe(() => {})
+  assert.equal(hooks.timer, null)
+  assert.equal(createdEs, 1)
+  assert.equal(closedEs, 0)
+
+  // Unsubscribe all and let grace timer expire -> closes ES and resets stream from 'live' to 'connecting'
+  unsub3()
+  const fireTimer = hooks.timer as (() => void) | null
+  assert.ok(fireTimer)
+  fireTimer()
+  assert.equal(closedEs, 1)
+  assert.equal(store.getSnapshot().stream, 'connecting')
+
+  // Resubscribing creates fresh EventSource and stays 'connecting' until new SSE frame arrives
+  const unsub4 = store.subscribe(() => {})
+  assert.equal(createdEs, 2)
+  assert.equal(store.getSnapshot().stream, 'connecting')
+  store.applyStatus(fullSnap(300))
+  assert.equal(store.getSnapshot().status?.updatedAt, 300)
+  unsub4()
+  store.dispose()
+
+  // SSR environment without EventSource does not throw
+  const ssrStore = createStatusStore({ fetchStatus: async () => null, createEventSource: () => null })
+  const unsubSsr = ssrStore.subscribe(() => {})
+  unsubSsr()
+  ssrStore.dispose()
+})
+
+test('SettingsView renders model select, lastError banner, timeout inputs, context progressbar, and uses DSH theme tokens', () => {
+  const snap: StatusSnapshot = {
+    providerId: 'antigravity-acp',
+    enabled: true,
+    connected: true,
+    agentName: 'Antigravity ACP Server',
+    agentVersion: '1.5.16',
+    tierName: 'Pro',
+    activeSessions: 1,
+    sessions: [
+      {
+        dshSessionKey: 'conv-1',
+        acpSessionId: 'acp-1',
+        accountId: 'default',
+        cwd: '/work',
+        currentModel: 'gemini-4-neon',
+        currentEffort: 'high',
+        currentMode: 'default',
+        contextUsed: 160_000,
+        contextSize: 200_000,
+        lastActiveAt: now,
+      },
+    ],
+    mcpBridgeActive: false,
+    usageTotals: { inputTokens: 1200, outputTokens: 300, cachedReadTokens: 400, cachedWriteTokens: 50, reasoningTokens: 80 },
+    accounts: [account],
+    models: [
+      { value: 'gemini-4-neon', name: 'Gemini 4 Neon', efforts: ['low', 'medium', 'high'] },
+      { value: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', efforts: ['medium', 'high'] },
+    ],
+    config: {
+      agyBin: '',
+      workspaceRoot: '',
+      defaultModel: 'legacy-custom-model',
+      defaultEffort: '',
+      mcpBridge: true,
+      sessionIdleTtlMs: 900_000,
+      requestTimeoutMs: 120_000,
+    },
+    hasPersistedConfig: true,
+    lastError: 'ACP 模型目录探测超时，请检查 agy CLI 登录状态',
+    updatedAt: now,
+  }
+
+  const html = renderToStaticMarkup(
+    React.createElement(SettingsView, { status: snap, stream: 'live', failed: false, applyStatus: () => {} }),
+  )
+  assert.match(html, /<select/)
+  assert.match(html, /Gemini 4 Neon \(gemini-4-neon\)/)
+  assert.match(html, /legacy-custom-model（当前已存，不在目录中）/)
+  assert.match(html, /目录\/连接诊断/)
+  assert.match(html, /重新探测目录/)
+  assert.match(html, /空闲会话回收/)
+  assert.match(html, /单次请求超时/)
+  assert.match(html, /恢复默认/)
+  assert.match(html, /role="progressbar"/)
+  assert.match(html, /--dsw-alias-/)
+  assert.doesNotMatch(html, /#18181b/)
 })

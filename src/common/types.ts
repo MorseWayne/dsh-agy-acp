@@ -56,6 +56,16 @@ export interface AccountHealthSnapshot {
   lastUsedAt: number | null
 }
 
+export interface PersistedConfigPatch {
+  mcpBridge?: boolean
+  defaultModel?: string
+  defaultEffort?: string
+  agyBin?: string
+  workspaceRoot?: string
+  sessionIdleTtlMs?: number
+  requestTimeoutMs?: number
+}
+
 export interface PluginConfig {
   enabled: boolean
   agyBin: string
@@ -124,6 +134,7 @@ export interface StatusSnapshot {
     sessionIdleTtlMs: number
     requestTimeoutMs: number
   }
+  hasPersistedConfig?: boolean
   lastError: string | null
   updatedAt: number
 }
