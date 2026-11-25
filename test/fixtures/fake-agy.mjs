@@ -14,6 +14,28 @@ const sessions = new Map()
 const pendingServerCalls = new Map()
 const activeTurns = new Map()
 
+function loadDiskSessions() {
+  const file = process.env.FAKE_SESSION_STORE_FILE
+  if (!file || !existsSync(file)) return {}
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'))
+  } catch {
+    return {}
+  }
+}
+
+function saveDiskSession(sessionId, sess) {
+  const file = process.env.FAKE_SESSION_STORE_FILE
+  if (!file) return
+  const all = loadDiskSessions()
+  all[sessionId] = {
+    turns: sess.turns,
+    configOptions: sess.configOptions,
+    systemAppend: sess.systemAppend,
+  }
+  writeFileSync(file, JSON.stringify(all), 'utf8')
+}
+
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n')
 }
@@ -76,13 +98,15 @@ rl.on('line', (line) => {
 async function handleRequest(id, method, params) {
   if (method === 'initialize') {
     const supportsAppend = process.env.FAKE_NO_SYSTEM_APPEND !== '1'
+    const supportsLoad = process.env.FAKE_DISABLE_LOAD_SESSION !== '1'
     send({
       jsonrpc: '2.0',
       id,
       result: {
         protocolVersion: 1,
-        agentInfo: { name: 'fake-agy-acp', version: '1.5.16-test' },
+        agentInfo: { name: 'fake-agy-acp', version: '1.5.17-test' },
         agentCapabilities: {
+          ...(supportsLoad ? { loadSession: true, sessionCapabilities: { load: {} } } : {}),
           promptCapabilities: { image: true, embeddedContext: true },
           ...(supportsAppend ? { _meta: { antigravity: { tier: true, systemPrompt: { append: true } } } } : {}),
         },
@@ -129,12 +153,68 @@ async function handleRequest(id, method, params) {
       },
     ]
     sessions.set(sessionId, { turns: 0, configOptions, systemAppend })
+    saveDiskSession(sessionId, { turns: 0, configOptions, systemAppend })
     send({
       jsonrpc: '2.0',
       id,
       result: {
         sessionId,
         configOptions,
+        models: {
+          currentModelId: 'gemini-4-neon-medium',
+          availableModels: [
+            { modelId: 'gemini-4-neon-low', name: 'Gemini 4 Neon Low' },
+            { modelId: 'gemini-4-neon-medium', name: 'Gemini 4 Neon Medium' },
+            { modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon High' },
+          ],
+        },
+        _meta: { antigravity: { tier: { name: 'Test Tier', id: 'test' } } },
+      },
+    })
+    return
+  }
+
+  if (method === 'session/load') {
+    if (process.env.FAKE_CRASH_ON_LOAD === '1') {
+      process.stderr.write('load fatal crash\n')
+      process.exit(1)
+    }
+    const sessionId = params?.sessionId
+    const disk = loadDiskSessions()[sessionId]
+    if (process.env.FAKE_FAIL_SESSION_LOAD === '1' || !disk) {
+      send({
+        jsonrpc: '2.0',
+        id,
+        error: { code: -32002, message: `Session not found: ${sessionId}` },
+      })
+      return
+    }
+    const restored = {
+      turns: disk.turns ?? 0,
+      configOptions: disk.configOptions,
+      systemAppend: params?._meta?.antigravity?.systemPrompt?.append ?? disk.systemAppend ?? null,
+    }
+    sessions.set(sessionId, restored)
+    const numMatch = /^sess_(\d+)$/.exec(sessionId)
+    if (numMatch && Number(numMatch[1]) >= nextSessionSeq) {
+      nextSessionSeq = Number(numMatch[1]) + 1
+    }
+    // Replay historical message chunk + usage_update before resolving session/load
+    sendUpdate(sessionId, {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'STALE_REPLAY_TEXT_MUST_NOT_LEAK' },
+    })
+    sendUpdate(sessionId, {
+      sessionUpdate: 'usage_update',
+      used: 1234,
+      size: 65536,
+    })
+    send({
+      jsonrpc: '2.0',
+      id,
+      result: {
+        sessionId,
+        configOptions: restored.configOptions,
         models: {
           currentModelId: 'gemini-4-neon-medium',
           availableModels: [
@@ -191,10 +271,33 @@ async function handleRequest(id, method, params) {
       return
     }
     sess.turns += 1
+    saveDiskSession(sessionId, sess)
     const promptText = (params?.prompt ?? [])
       .filter((b) => b.type === 'text')
       .map((b) => b.text)
       .join('\n')
+
+    if (promptText.includes('EMIT_DYNAMIC_UPDATES')) {
+      for (const opt of sess.configOptions) {
+        if (opt.id === 'model') opt.currentValue = 'claude-sonnet-5-5'
+        if (opt.id === 'thought_level') opt.currentValue = 'high'
+      }
+      saveDiskSession(sessionId, sess)
+      sendUpdate(sessionId, {
+        sessionUpdate: 'session_info_update',
+        title: '\u001b[32m重构登录模块\u001b[0m',
+      })
+      sendUpdate(sessionId, {
+        sessionUpdate: 'config_option_update',
+        configOptions: sess.configOptions,
+      })
+      sendUpdate(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Dynamic updates pushed.' },
+      })
+      send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } })
+      return
+    }
 
     if (promptText.includes('APPROVAL_EXIT')) {
       const toolCall = { sessionUpdate: 'tool_call', toolCallId: 'approval-tool', kind: 'execute',

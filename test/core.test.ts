@@ -330,6 +330,11 @@ test('detectContinuation takes max itemIndex across out-of-order concurrent tool
     { role: 'user', source: { kind: 'runtime-context' }, content: [{ type: 'text', text: 'ctx' }] },
   ])
   assert.deepEqual(cont, { runId: 'runA', itemIndex: 5 })
+  assert.equal(detectContinuation([
+    { role: 'tool', toolCallId: id2, content: [] },
+    { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'continue' }] },
+    { role: 'user', source: { kind: 'time-context' }, content: [{ type: 'text', text: 'step time' }] },
+  ]), null)
 })
 
 test('sanitizeDiagnosticText redacts credentials case-insensitively before tail truncation', () => {

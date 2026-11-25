@@ -6,16 +6,19 @@ import { EventEmitter } from 'node:events'
 import { AcpClient, AcpProcessExitError, AcpTimeoutError } from '../acp/client.ts'
 import { isGeoUnsupportedError } from '../common/geo.ts'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
-import type {
-  AcpConfigOption,
-  AcpMcpServerSpec,
-  AcpUsage,
-  InitializeResult,
-  PromptContentBlock,
-  SessionNewResult,
-  SessionPromptResult,
-  SessionUpdatePayload,
-  RequestPermissionParams, RequestPermissionResult,
+import {
+  supportsSessionLoad,
+  type AcpConfigOption,
+  type AcpMcpServerSpec,
+  type AcpUsage,
+  type InitializeResult,
+  type PromptContentBlock,
+  type SessionLoadResult,
+  type SessionNewResult,
+  type SessionPromptResult,
+  type SessionUpdatePayload,
+  type RequestPermissionParams,
+  type RequestPermissionResult,
 } from '../acp/protocol.ts'
 import {
   PROVIDER_ID,
@@ -25,6 +28,7 @@ import {
   type AccountProvider,
   type AccountQuotaSample,
   type AcpModelOption,
+  type McpBridgeSnapshot,
   type PluginConfig,
   type SessionSummary,
   type StatusSnapshot,
@@ -33,6 +37,7 @@ import {
 
 import { AccountQuotaError, readAccountQuota, requireFileCredentialMode } from './account-quota.ts'
 import { EgressBlockedError, EgressGuard } from './egress-guard.ts'
+import type { SessionIndex } from './session-index.ts'
 import { defaultEffort, sortedEfforts } from '../common/effort.ts'
 import { mapUsage } from '../acp/usage.ts'
 import { modelCatalog, selectOption, values } from './model-catalog.ts'
@@ -53,6 +58,8 @@ export interface ManagedAcpSession {
   currentModel: string
   currentEffort: string
   currentMode: string
+  title?: string
+  resumed?: boolean
   configOptions: AcpConfigOption[]
   hasMcpServers?: boolean
   supportsSystemPromptAppend?: boolean
@@ -122,12 +129,14 @@ export interface SessionPoolDeps {
   prepareArgv: (argv: string[], policy: FilePolicy, signal?: AbortSignal) => Promise<string[]>
   onPermission?: (req: RequestPermissionParams, key: string, signal: AbortSignal, launchPolicy: SessionPolicy) => Promise<RequestPermissionResult>
   isMcpBridgeActive?: () => boolean
+  getMcpBridgeSnapshot?: () => McpBridgeSnapshot
   onConfigPatch?: (patch: Partial<PluginConfig>) => void | Promise<void>
   onConfigReset?: () => void | Promise<void>
   hasPersistedConfig?: () => boolean
   onSessionClosed?: (key: string) => void
   accountProvider?: AccountProvider
   egressGuard?: EgressGuard
+  sessionIndex?: SessionIndex
   getMcpServers?: (sessionKey: string) => Promise<AcpMcpServerSpec[]>
   log?: (msg: string) => void
 }
@@ -156,6 +165,7 @@ export class AcpSessionPool extends EventEmitter {
   private initResult: InitializeResult | null = null
   private readonly sessions = new Map<string, ManagedAcpSession>()
   private readonly sessionEnvs = new Map<string, NodeJS.ProcessEnv | undefined>()
+  private readonly sessionUnsubs = new Map<string, () => void>()
   private readonly accountProvider: AccountProvider
   private readonly egressGuard: EgressGuard
   private cachedModels: AcpModelOption[] = []
@@ -444,11 +454,14 @@ export class AcpSessionPool extends EventEmitter {
       currentModel: s.currentModel,
       currentEffort: s.currentEffort,
       currentMode: s.currentMode,
+      ...(s.title ? { title: s.title } : {}),
+      ...(s.resumed ? { resumed: true } : {}),
       contextUsed: s.contextUsed,
       contextSize: s.contextSize,
       lastActiveAt: s.lastActiveAt,
     }))
     const connected = Array.from(this.clients.values()).some((c) => c.isRunning)
+    const mcpBridge = this.deps.getMcpBridgeSnapshot?.()
     return {
       providerId: PROVIDER_ID,
       enabled: cfg.enabled,
@@ -457,8 +470,10 @@ export class AcpSessionPool extends EventEmitter {
       agentVersion: this.initResult?.agentInfo?.version ?? null,
       tierName: this.cachedTier,
       activeSessions: sessions.length,
+      ...(this.deps.sessionIndex ? { persistedSessions: this.deps.sessionIndex.size } : {}),
       sessions,
       mcpBridgeActive: this.deps.isMcpBridgeActive?.() ?? false,
+      ...(mcpBridge ? { mcpBridge } : {}),
       usageTotals: { ...this.usageTotals },
       accounts: this.getAccountHealthSnapshots(),
       models: this.cachedModels.filter(m => !m.variantOf),
@@ -489,6 +504,7 @@ export class AcpSessionPool extends EventEmitter {
   }
 
   policyChanged(key: string): void {
+    this.deps.sessionIndex?.delete(key)
     const turn = this.active.get(key)
     if (turn) {
       try {
@@ -501,6 +517,77 @@ export class AcpSessionPool extends EventEmitter {
       } catch { /* Unknown authority requires closing the existing sandbox. */ }
     }
     this.invalidate(key, new SessionPolicyChangedError())
+  }
+
+  recordAppliedSystemHash(session: ManagedAcpSession, hash: string): void {
+    if (!this.owns(session)) return
+    session.appliedSystemHash = hash
+    this.deps.sessionIndex?.updateMeta(session.dshSessionKey, { appliedSystemHash: hash })
+  }
+
+  private applySessionMetadataUpdate(key: string, session: ManagedAcpSession, update: SessionUpdatePayload): boolean {
+    if (update.sessionUpdate === 'config_option_update' && Array.isArray(update.configOptions)) {
+      session.configOptions = update.configOptions
+      const nextModel = findCurrentOption(update.configOptions, 'model')
+      if (nextModel && nextModel !== session.currentModel) {
+        session.currentModel = nextModel
+        session.contextUsed = null
+        session.contextSize = 0
+      }
+      const nextEffort = findCurrentOption(update.configOptions, 'thought_level')
+      if (nextEffort !== undefined) {
+        session.currentEffort = nextEffort
+      }
+      const nextMode = findCurrentOption(update.configOptions, 'mode')
+      if (nextMode) {
+        session.currentMode = nextMode
+      }
+      const nextCatalog = modelCatalog({ configOptions: update.configOptions })
+      if (nextCatalog.models.length > 0) {
+        session.models = nextCatalog.models
+        session.modelRoutes = nextCatalog.routes
+        this.captureCatalogFromSession({ sessionId: session.acpSessionId, configOptions: update.configOptions })
+      }
+      session.lastActiveAt = Date.now()
+      return true
+    }
+
+    if (update.sessionUpdate === 'session_info_update' && typeof update.title === 'string') {
+      const cleanTitle = sanitizeDiagnosticText(update.title, 120)
+      const nextTitle = cleanTitle || undefined
+      if (nextTitle !== session.title) {
+        session.title = nextTitle
+        this.deps.sessionIndex?.updateMeta(key, { title: nextTitle ?? '', touch: false })
+        return true
+      }
+      return false
+    }
+
+    if (update.sessionUpdate === 'usage_update' && typeof update.used === 'number' && Number.isSafeInteger(update.used) && update.used >= 0) {
+      session.contextUsed = update.used
+      const size = typeof update.size === 'number' && Number.isSafeInteger(update.size) && update.size > 0 ? update.size : 0
+      if (size > 0) {
+        session.contextSize = size
+        if (session.currentModel) this.observedWindows.set(session.currentModel, size)
+      }
+      session.lastActiveAt = Date.now()
+      return true
+    }
+
+    return false
+  }
+
+  private bindPersistentSessionUpdates(key: string, client: AcpClient, session: ManagedAcpSession): void {
+    this.sessionUnsubs.get(key)?.()
+    const unsub = client.onSessionUpdate(session.acpSessionId, (update) => {
+      if (this.sessions.get(key) !== session) return
+      // During an active prompt, usage_update is already handled via recordContextUsage with targetModel.
+      if (update.sessionUpdate === 'usage_update' && this.active.has(key)) return
+      if (this.applySessionMetadataUpdate(key, session, update)) {
+        this.emitStatus()
+      }
+    })
+    this.sessionUnsubs.set(key, unsub)
   }
 
   activeSignal(key: string): AbortSignal | undefined {
@@ -576,6 +663,7 @@ export class AcpSessionPool extends EventEmitter {
     model = '',
     exclude?: ReadonlySet<string>,
     systemPrompt?: { append: string; hash: string },
+    options?: { forceNew?: boolean },
   ): Promise<{ client: AcpClient; session: ManagedAcpSession; created: boolean }> {
     if (this.disposed || this.opening.has(key)) throw new Error('ACP session unavailable or opening')
     const previous = this.active.get(key)
@@ -584,12 +672,22 @@ export class AcpSessionPool extends EventEmitter {
     const policy = this.policy(key)
     if (cwd !== policy.workspaceRoot) throw new Error('DSH workspace changed during startup')
     const fingerprint = policyKey(policy)
+    if (options?.forceNew) {
+      this.deps.sessionIndex?.delete(key)
+    }
     const existing = this.sessions.get(key)
     const current = this.clients.get(key)
-    if (existing && current?.isRunning && !exclude?.has(existing.accountId) && this.policies.get(key) === fingerprint) {
+    if (
+      !options?.forceNew &&
+      existing &&
+      current?.isRunning &&
+      !exclude?.has(existing.accountId) &&
+      this.policies.get(key) === fingerprint
+    ) {
       const existingEnv = this.sessionEnvs.get(key) ?? this.accountProvider.getAccountEnv?.(existing.accountId)
       await this.assertEgressAllowed(existing.accountId, existingEnv, this.lifetime.signal)
       existing.lastActiveAt = Date.now()
+      this.deps.sessionIndex?.updateMeta(key, { touch: true })
       return { client: current, session: existing, created: false }
     }
     if (existing || current) this.invalidate(key)
@@ -604,91 +702,177 @@ export class AcpSessionPool extends EventEmitter {
       opening.signal.throwIfAborted()
       await this.assertEgressAllowed(lease.accountId, lease.env, opening.signal)
       opening.signal.throwIfAborted()
-      const launched = await this.newClient(
-        policy,
-        lease.env,
-        opening.signal,
-        async req => {
-          const turn = this.active.get(key)
-          if (!turn || this.clients.get(key) !== client || req.sessionId !== this.sessions.get(key)?.acpSessionId) return cancelled()
-          const { signal } = turn.controller
-          const live = this.policy(key)
-          if (signal.aborted || (fingerprint !== policyKey(live) && !(turn.retire && canFinishConfinedTurn(policy, live)))) return cancelled()
-          const permissions = turn.permissions
-          const id = req.toolCall.toolCallId
-          permissions.requests++
-          permissions.pending.add(id)
-          try {
-            const result = await this.deps.onPermission?.(req, key, signal, policy) ?? cancelled()
-            if (signal.aborted) return cancelled()
-            const { outcome } = result
-            if (outcome.outcome === 'selected' && req.options.some(o =>
-              o.optionId === outcome.optionId && (o.kind === 'allow_once' || o.kind === 'allow_always'))) {
-              permissions.granted.add(id)
-            }
-            return result
-          } finally {
-            permissions.pending.delete(id)
+
+      const makePermissionBridge = () => async (req: RequestPermissionParams): Promise<RequestPermissionResult> => {
+        const turn = this.active.get(key)
+        if (!turn || this.clients.get(key) !== client || req.sessionId !== this.sessions.get(key)?.acpSessionId) return cancelled()
+        const { signal } = turn.controller
+        const live = this.policy(key)
+        if (signal.aborted || (fingerprint !== policyKey(live) && !(turn.retire && canFinishConfinedTurn(policy, live)))) return cancelled()
+        const permissions = turn.permissions
+        const id = req.toolCall.toolCallId
+        permissions.requests++
+        permissions.pending.add(id)
+        try {
+          const result = await this.deps.onPermission?.(req, key, signal, policy) ?? cancelled()
+          if (signal.aborted) return cancelled()
+          const { outcome } = result
+          if (outcome.outcome === 'selected' && req.options.some(o =>
+            o.optionId === outcome.optionId && (o.kind === 'allow_once' || o.kind === 'allow_always'))) {
+            permissions.granted.add(id)
           }
-        },
-        (code, signal, exitedClient) => {
-          if (this.clients.get(key) !== exitedClient) return
-          const activeTurn = this.active.get(key)
-          const permissions = activeTurn?.permissions
-          const phase = permissions?.pending.size ? 'permission-pending' : permissions?.granted.size ? 'after-grant' : activeTurn ? 'prompt' : 'idle'
-          this.deps.log?.(`agy acp session "${key}" exited unexpectedly (pid=${exitedClient.pid}, phase=${phase}, code=${code}, signal=${signal})`)
-          // Snapshot before aborting the approval. Its promise may resolve during cleanup.
-          if (activeTurn && !activeTurn.controller.signal.aborted && permissions?.requests === 1 && !permissions.granted.size) {
-            permissions.interruptedBeforeGrant = permissions.pending.values().next().value
-          }
-          this.clients.delete(key)
-          this.sessions.delete(key)
-          this.sessionEnvs.delete(key)
-          this.policies.delete(key)
-          if (activeTurn) {
-            activeTurn.controller.abort()
-            activeTurn.settle()
-            this.active.delete(key)
-          }
-          this.deps.onSessionClosed?.(key)
-          this.emitStatus()
-        },
-      )
+          return result
+        } finally {
+          permissions.pending.delete(id)
+        }
+      }
+
+      const makeExitHandler = () => (code: number | null, signal: NodeJS.Signals | null, exitedClient: AcpClient): void => {
+        if (this.clients.get(key) !== exitedClient) return
+        const activeTurn = this.active.get(key)
+        const permissions = activeTurn?.permissions
+        const phase = permissions?.pending.size ? 'permission-pending' : permissions?.granted.size ? 'after-grant' : activeTurn ? 'prompt' : 'idle'
+        this.deps.log?.(`agy acp session "${key}" exited unexpectedly (pid=${exitedClient.pid}, phase=${phase}, code=${code}, signal=${signal})`)
+        if (phase !== 'idle') {
+          this.deps.sessionIndex?.delete(key)
+        }
+        // Snapshot before aborting the approval. Its promise may resolve during cleanup.
+        if (activeTurn && !activeTurn.controller.signal.aborted && permissions?.requests === 1 && !permissions.granted.size) {
+          permissions.interruptedBeforeGrant = permissions.pending.values().next().value
+        }
+        this.sessionUnsubs.get(key)?.()
+        this.sessionUnsubs.delete(key)
+        this.clients.delete(key)
+        this.sessions.delete(key)
+        this.sessionEnvs.delete(key)
+        this.policies.delete(key)
+        if (activeTurn) {
+          activeTurn.controller.abort()
+          activeTurn.settle()
+          this.active.delete(key)
+        }
+        this.deps.onSessionClosed?.(key)
+        this.emitStatus()
+      }
+
+      let launched = await this.newClient(policy, lease.env, opening.signal, makePermissionBridge(), makeExitHandler())
       client = launched.client
-      const supportsSystemPromptAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
+      let supportsSystemPromptAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
       opening.signal.throwIfAborted()
-      const mcpServers = await this.deps.getMcpServers?.(key) ?? []
+      let mcpServers = await this.deps.getMcpServers?.(key) ?? []
       opening.signal.throwIfAborted()
-      const res = await client.sessionNew({
-        cwd,
-        mcpServers,
-        ...(supportsSystemPromptAppend && systemPrompt?.append
-          ? { _meta: { antigravity: { systemPrompt: { append: systemPrompt.append } } } }
-          : {}),
-      })
+
+      const persisted = !options?.forceNew ? this.deps.sessionIndex?.get(key) : undefined
+      const canAttemptLoad = Boolean(
+        persisted &&
+        persisted.accountId === lease.accountId &&
+        persisted.cwd === cwd &&
+        persisted.policyFingerprint === fingerprint &&
+        supportsSessionLoad(launched.initResult),
+      )
+
+      let sessionResult: SessionNewResult | undefined
+      let resumedFromDisk = false
+      const bufferedLoadUpdates: SessionUpdatePayload[] = []
+
+      if (canAttemptLoad && persisted) {
+        const unsubReplay = client.onSessionUpdate(persisted.acpSessionId, (u) => {
+          bufferedLoadUpdates.push(u)
+        })
+        try {
+          const loadRes: SessionLoadResult = await client.sessionLoad({
+            sessionId: persisted.acpSessionId,
+            cwd,
+            mcpServers,
+            ...(supportsSystemPromptAppend && systemPrompt?.append
+              ? { _meta: { antigravity: { systemPrompt: { append: systemPrompt.append } } } }
+              : {}),
+          })
+          resumedFromDisk = true
+          sessionResult = {
+            ...loadRes,
+            sessionId: loadRes.sessionId || persisted.acpSessionId,
+          }
+        } catch (loadErr) {
+          this.deps.sessionIndex?.delete(key)
+          bufferedLoadUpdates.length = 0
+          this.deps.log?.(
+            `ACP session/load failed for "${key}" (${sanitizeDiagnosticText(String(loadErr), 140)}); falling back to session/new`,
+          )
+          if (!client.isRunning) {
+            client.dispose()
+            this.deps.onSessionClosed?.(key)
+            opening.signal.throwIfAborted()
+            launched = await this.newClient(policy, lease.env, opening.signal, makePermissionBridge(), makeExitHandler())
+            client = launched.client
+            supportsSystemPromptAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
+            mcpServers = await this.deps.getMcpServers?.(key) ?? []
+            opening.signal.throwIfAborted()
+          }
+        } finally {
+          unsubReplay()
+        }
+      }
+
+      if (!sessionResult) {
+        sessionResult = await client.sessionNew({
+          cwd,
+          mcpServers,
+          ...(supportsSystemPromptAppend && systemPrompt?.append
+            ? { _meta: { antigravity: { systemPrompt: { append: systemPrompt.append } } } }
+            : {}),
+        })
+      }
+
       opening.signal.throwIfAborted()
       if (policyKey(this.policy(key)) !== fingerprint) throw new Error('DSH session policy changed during startup')
-      const { routes: modelRoutes, models } = this.captureCatalogFromSession(res)
-      const configOptions = res.configOptions ?? []
+      const { routes: modelRoutes, models } = this.captureCatalogFromSession(sessionResult)
+      const configOptions = sessionResult.configOptions ?? []
+      const appliedSystemHash =
+        supportsSystemPromptAppend && systemPrompt
+          ? systemPrompt.hash
+          : resumedFromDisk
+            ? (persisted?.appliedSystemHash ?? null)
+            : null
       const session: ManagedAcpSession = {
         models,
         modelRoutes,
-        dshSessionKey: key, acpSessionId: res.sessionId, accountId: lease.accountId, cwd,
-        currentModel: findCurrentOption(configOptions, 'model') ?? res.models?.currentModelId ?? '',
+        dshSessionKey: key,
+        acpSessionId: sessionResult.sessionId,
+        accountId: lease.accountId,
+        cwd,
+        currentModel: findCurrentOption(configOptions, 'model') ?? sessionResult.models?.currentModelId ?? '',
         currentEffort: findCurrentOption(configOptions, 'thought_level') ?? '',
-        currentMode: findCurrentOption(configOptions, 'mode') ?? res.modes?.currentModeId ?? '',
+        currentMode: findCurrentOption(configOptions, 'mode') ?? sessionResult.modes?.currentModeId ?? '',
+        ...(resumedFromDisk && persisted?.title ? { title: persisted.title } : {}),
+        ...(resumedFromDisk ? { resumed: true } : {}),
         configOptions,
         hasMcpServers: mcpServers.length > 0,
         supportsSystemPromptAppend,
-        appliedSystemHash: supportsSystemPromptAppend && systemPrompt ? systemPrompt.hash : null,
-        contextUsed: null, contextSize: 0, lastActiveAt: Date.now(),
+        appliedSystemHash,
+        contextUsed: null,
+        contextSize: 0,
+        lastActiveAt: Date.now(),
+      }
+      for (const replayUpdate of bufferedLoadUpdates) {
+        this.applySessionMetadataUpdate(key, session, replayUpdate)
       }
       this.clients.set(key, client)
       this.sessions.set(key, session)
       this.sessionEnvs.set(key, lease.env)
       this.policies.set(key, fingerprint)
+      this.bindPersistentSessionUpdates(key, client, session)
+      this.deps.sessionIndex?.upsert({
+        dshSessionKey: key,
+        acpSessionId: session.acpSessionId,
+        accountId: session.accountId,
+        cwd: session.cwd,
+        policyFingerprint: fingerprint,
+        appliedSystemHash: session.appliedSystemHash,
+        ...(session.title ? { title: session.title } : {}),
+      })
       this.emitStatus()
-      return { client, session, created: true }
+      return { client, session, created: !resumedFromDisk }
     } catch (err) {
       client?.dispose()
       this.deps.onSessionClosed?.(key)
@@ -1043,11 +1227,16 @@ export class AcpSessionPool extends EventEmitter {
   }
 
   invalidate(key: string, reason?: Error): void {
+    if (reason instanceof SessionPolicyChangedError) {
+      this.deps.sessionIndex?.delete(key)
+    }
     if (!this.opening.has(key) && !this.sessions.has(key) && !this.clients.has(key)) return
     this.opening.get(key)?.abort(reason)
     this.active.get(key)?.controller.abort()
     this.active.get(key)?.settle()
     this.active.delete(key)
+    this.sessionUnsubs.get(key)?.()
+    this.sessionUnsubs.delete(key)
     this.sessions.delete(key)
     this.sessionEnvs.delete(key)
     this.policies.delete(key)
@@ -1058,11 +1247,21 @@ export class AcpSessionPool extends EventEmitter {
     this.emitStatus()
   }
 
-  async closeSession(key: string): Promise<void> { this.invalidate(key) }
+  evictSession(key: string, reason?: Error): void {
+    this.deps.sessionIndex?.delete(key)
+    this.invalidate(key, reason)
+  }
+
+  async closeSession(key: string): Promise<void> {
+    this.deps.sessionIndex?.delete(key)
+    this.invalidate(key)
+  }
 
   async resetAllSessions(): Promise<number> {
+    this.deps.sessionIndex?.clear()
     const keys = new Set([...this.sessions.keys(), ...this.opening.keys(), ...this.clients.keys()])
     for (const key of keys) this.invalidate(key)
+    this.emitStatus()
     return keys.size
   }
 
@@ -1070,8 +1269,9 @@ export class AcpSessionPool extends EventEmitter {
     const ttl = this.deps.getConfig().sessionIdleTtlMs
     const now = Date.now()
     for (const [key, sess] of this.sessions) {
-      if (now - sess.lastActiveAt > ttl) {
-        await this.closeSession(key)
+      // Preserve SessionIndex entry across idle sweeps so next turn restores via `session/load`.
+      if (!this.active.has(key) && now - sess.lastActiveAt > ttl) {
+        this.invalidate(key)
       }
     }
   }
@@ -1085,7 +1285,8 @@ export class AcpSessionPool extends EventEmitter {
     clearTimeout(this.catalogRetry)
     this.lifetime.abort()
     this.egressGuard.dispose()
-    void this.resetAllSessions()
+    const keys = new Set([...this.sessions.keys(), ...this.opening.keys(), ...this.clients.keys()])
+    for (const key of keys) this.invalidate(key)
     this.accountProvider.dispose?.()
     this.removeAllListeners()
   }

@@ -455,7 +455,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
             borderRadius: '8px',
             border: theme.borderPrimary,
             backgroundColor: theme.surfaceTile,
-            marginBottom: '12px',
+            marginBottom: status.mcpBridge && (status.mcpBridge.enabled || status.mcpBridge.totalCalls > 0) ? '6px' : '12px',
             cursor: 'pointer',
           },
         },
@@ -476,6 +476,26 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
           style: { width: '16px', height: '16px', cursor: 'pointer' },
         }),
       ),
+      status.mcpBridge && (status.mcpBridge.enabled || status.mcpBridge.totalCalls > 0)
+        ? React.createElement(
+            'div',
+            { style: { ...styles.secondaryText, fontSize: '11px', padding: '0 4px', marginBottom: '12px' } },
+            [
+              `桥接运行态：挂载会话 ${status.mcpBridge.activeBridges}`,
+              `在途调用 ${status.mcpBridge.inFlightCalls}`,
+              `累计调用 ${status.mcpBridge.totalCalls}`,
+              status.mcpBridge.failedCalls > 0 && `失败/超时 ${status.mcpBridge.failedCalls}`,
+              status.mcpBridge.lastToolName && `最近工具 ${status.mcpBridge.lastToolName}`,
+            ].filter(Boolean).join(' · '),
+            status.mcpBridge.lastError
+              ? React.createElement(
+                  'div',
+                  { style: { color: theme.stateWarn, marginTop: '2px', overflowWrap: 'anywhere' } },
+                  `最近桥接告警：${status.mcpBridge.lastError}`,
+                )
+              : null,
+          )
+        : null,
 
       // Model / effort / paths / timeouts grid
       React.createElement(
@@ -659,9 +679,20 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
       { style: styles.card },
       React.createElement(
         'div',
-        { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' } },
-        React.createElement('div', { style: { fontWeight: 600 } }, `活跃 ACP 长连接会话 (${sessions.length})`),
-        sessions.length > 0
+        { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', gap: '8px', flexWrap: 'wrap' } },
+        React.createElement(
+          'div',
+          null,
+          React.createElement('div', { style: { fontWeight: 600 } }, `活跃 ACP 长连接会话 (${sessions.length})`),
+          typeof status.persistedSessions === 'number' && status.persistedSessions > 0
+            ? React.createElement(
+                'div',
+                { style: { ...styles.secondaryText, fontSize: '11px' } },
+                `已索引可恢复会话 ${status.persistedSessions} 个（空闲回收或重启后自动通过 session/load 原生恢复）`,
+              )
+            : null,
+        ),
+        (sessions.length > 0 || (status.persistedSessions ?? 0) > 0)
           ? React.createElement(
               'button',
               {
@@ -696,7 +727,30 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
               React.createElement(
                 'div',
                 { style: { flex: 1, minWidth: 0 } },
-                React.createElement('div', { style: { fontWeight: 500 } }, `${s.currentModel || 'default'} · ${s.currentMode}`),
+                React.createElement(
+                  'div',
+                  { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap', fontWeight: 500 } },
+                  `${s.currentModel || 'default'} · ${s.currentMode}`,
+                  s.resumed
+                    ? React.createElement(
+                        'span',
+                        {
+                          style: {
+                            fontSize: '11px',
+                            fontWeight: 400,
+                            padding: '0 6px',
+                            borderRadius: '999px',
+                            border: theme.borderPrimary,
+                            color: theme.stateSuccess,
+                          },
+                        },
+                        'session/load 已恢复',
+                      )
+                    : null,
+                ),
+                s.title
+                  ? React.createElement('div', { style: { fontSize: '12px', overflowWrap: 'anywhere' } }, `标题：${s.title}`)
+                  : null,
                 React.createElement('div', { style: { overflowWrap: 'anywhere', fontSize: '12px' } }, `使用账号${notice ? '（上次快照）' : ''}：${sessionAccountLabel(s.accountId, accounts)}`),
                 React.createElement(
                   'div',

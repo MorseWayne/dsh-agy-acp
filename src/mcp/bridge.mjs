@@ -8,6 +8,7 @@ import { createInterface } from 'node:readline'
 
 const BRIDGE_URL = process.env.DSH_MCP_BRIDGE_URL
 const BRIDGE_TOKEN = process.env.DSH_MCP_BRIDGE_TOKEN
+const BRIDGE_TIMEOUT_MS = Math.max(1_000, Number(process.env.DSH_MCP_BRIDGE_TIMEOUT_MS) || 125_000)
 
 if (!BRIDGE_URL || !BRIDGE_TOKEN) {
   process.stderr.write('[dsh-mcp-bridge] Missing DSH_MCP_BRIDGE_URL or DSH_MCP_BRIDGE_TOKEN\n')
@@ -28,6 +29,7 @@ async function forwardMessage(msg) {
         Authorization: `Bearer ${BRIDGE_TOKEN}`,
       },
       body: JSON.stringify(msg),
+      signal: AbortSignal.timeout(BRIDGE_TIMEOUT_MS),
     })
 
     if (!hasId) return

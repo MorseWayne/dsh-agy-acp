@@ -3,7 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
 import type { PreToolDecision, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import { resolveConfig } from './common/config.ts'
-import { MIRROR_TOOL_NAME, PROVIDER_ID } from './common/types.ts'
+import { MIRROR_TOOL_NAME, PROVIDER_ID, type McpBridgeSnapshot } from './common/types.ts'
 import { ReverseMcpBridge } from './mcp/server.ts'
 import { AcpAdapter } from './provider/adapter.ts'
 import { defineAgyAcpMirrorTool } from './provider/mirror-tool.ts'
@@ -14,6 +14,8 @@ import { ConfigStore } from './runtime/config-store.ts'
 import { CredentialSlotLeaseManager } from './runtime/credential-lease.ts'
 import { EgressGuard } from './runtime/egress-guard.ts'
 import { hostPermissions, type SessionAgent } from './runtime/host-permissions.ts'
+import { SessionPolicyChangedError } from './runtime/permission-manager.ts'
+import { SessionIndex } from './runtime/session-index.ts'
 import { AcpSessionPool } from './runtime/session-pool.ts'
 import { registerAcpRoutes, type WebServerLike } from './transport/sse.ts'
 
@@ -42,10 +44,56 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const permissions = hostPermissions(ctx as unknown as Parameters<typeof hostPermissions>[0])
   let bridgeTools: DshToolsServiceLike | undefined
   const bridges = new Map<string, ReverseMcpBridge>()
+  let archivedBridgeCalls = 0
+  let archivedBridgeFailures = 0
+  let lastBridgeToolName: string | null = null
+  let lastBridgeCallAt: number | null = null
+  let lastBridgeError: string | null = null
+
   function releaseBridge(key: string) {
     const bridge = bridges.get(key)
     bridges.delete(key)
-    if (bridge) void bridge.dispose().catch(err => log(String(err)))
+    if (bridge) {
+      const stats = bridge.getStats()
+      archivedBridgeCalls += stats.totalCalls
+      archivedBridgeFailures += stats.failedCalls
+      if (stats.lastCallAt && (!lastBridgeCallAt || stats.lastCallAt >= lastBridgeCallAt)) {
+        lastBridgeCallAt = stats.lastCallAt
+        lastBridgeToolName = stats.lastToolName
+        lastBridgeError = stats.lastError
+      }
+      void bridge.dispose().catch(err => log(String(err)))
+    }
+  }
+
+  function collectMcpBridgeSnapshot(): McpBridgeSnapshot {
+    let inFlightCalls = 0
+    let totalCalls = archivedBridgeCalls
+    let failedCalls = archivedBridgeFailures
+    let latestTool = lastBridgeToolName
+    let latestAt = lastBridgeCallAt
+    let latestErr = lastBridgeError
+    for (const b of bridges.values()) {
+      const st = b.getStats()
+      inFlightCalls += st.inFlightCalls
+      totalCalls += st.totalCalls
+      failedCalls += st.failedCalls
+      if (st.lastCallAt && (!latestAt || st.lastCallAt >= latestAt)) {
+        latestAt = st.lastCallAt
+        latestTool = st.lastToolName
+        latestErr = st.lastError
+      }
+    }
+    return {
+      enabled: cfg.mcpBridge,
+      activeBridges: bridges.size,
+      inFlightCalls,
+      totalCalls,
+      failedCalls,
+      lastToolName: latestTool,
+      lastCallAt: latestAt,
+      lastError: latestErr,
+    }
   }
 
   const slotManager = cfg.credentialSlotDir
@@ -62,13 +110,17 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
 
   const runs = new AcpRunStore()
   const egressGuard = new EgressGuard({ log })
+  const sessionIndex = new SessionIndex({ log })
+  sessionIndex.load()
   const pool: AcpSessionPool = new AcpSessionPool({
     getConfig: () => cfg,
     resolveBin: () => resolveAgyBin(cfg.agyBin),
     accountProvider: multiAccountPool,
     egressGuard,
+    sessionIndex,
     ...permissions,
     isMcpBridgeActive: () => bridges.size > 0,
+    getMcpBridgeSnapshot: collectMcpBridgeSnapshot,
     hasPersistedConfig: () => configStore.hasPersistedOverrides,
     onConfigPatch: patch => {
       configStore.savePatch(patch)
@@ -122,7 +174,10 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
           const result = batch.results[0]?.result
           if (!result) throw new Error('No DSH tool result')
           return { content: [{ type: 'text', text: result.content.map(b => b.type === 'text' ? b.text : JSON.stringify(b)).join('\n') }], isError: result.isError }
-        }, log,
+        },
+        callTimeoutMs: () => Math.min(cfg.requestTimeoutMs, 120_000),
+        onActivity: () => pool.notifyStatusChange(),
+        log,
       })
       bridges.set(key, bridge)
       await bridge.start()
@@ -133,11 +188,12 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     log,
   })
 
-  const boundaryEvents = new Set(['sandbox/mode', 'approval/policy', 'permission/preset', 'working-directory/change'])
+  const boundaryEvents = new Set(['sandbox/mode', 'approval/policy', 'permission/preset'])
   ctx.on('session/event' as never, ((session: { id: string }, event: { type: string }) => {
-    if (boundaryEvents.has(event.type)) pool.invalidate(session.id)
+    if (event.type === 'working-directory/change') pool.invalidate(session.id, new SessionPolicyChangedError())
+    else if (boundaryEvents.has(event.type)) pool.policyChanged(session.id)
   }) as never, { global: true })
-  ctx.on('session/disposed' as never, ((session: { id: string }) => pool.invalidate(session.id)) as never, { global: true })
+  ctx.on('session/disposed' as never, ((session: { id: string }) => pool.evictSession(session.id)) as never, { global: true })
   multiAccountPool?.on('change', () => {
     pool.notifyStatusChange()
   })

@@ -386,3 +386,88 @@ test('HTTP accounts/egress/check enforces JSON Content-Type, validates accountId
     pool.dispose()
   }
 })
+
+test('ReverseMcpBridge enforces per-call timeout with AbortSignal, caps concurrency, and records sanitized stats', async () => {
+  let slowAborted = false
+  let releaseHold!: () => void
+  const holdPromise = new Promise<void>((resolve) => {
+    releaseHold = resolve
+  })
+
+  const bridge = new ReverseMcpBridge({
+    callTimeoutMs: 60,
+    maxConcurrentCalls: 2,
+    listTools: () => [
+      { name: 'slow_tool' },
+      { name: 'hold_tool' },
+      { name: 'secret_err_tool' },
+    ],
+    callTool: async (name, _args, signal) => {
+      if (name === 'slow_tool') {
+        signal.addEventListener('abort', () => {
+          slowAborted = true
+        }, { once: true })
+        // Intentionally never resolve to prove Promise.race timeout frees the slot
+        return await new Promise(() => {})
+      }
+      if (name === 'hold_tool') {
+        await holdPromise
+        return { content: [{ type: 'text', text: 'held ok' }] }
+      }
+      throw new Error('upstream failed Authorization: Bearer secret_mcp_tok_999')
+    },
+  })
+
+  const url = await bridge.start()
+  const spec = bridge.getMcpServerSpec()!
+  const token = spec.env?.find((e) => e.name === 'DSH_MCP_BRIDGE_TOKEN')?.value ?? ''
+
+  const callRpc = async (id: number, name: string) => {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id,
+        method: 'tools/call',
+        params: { name, arguments: {} },
+      }),
+    })
+    return (await res.json()) as { result?: unknown; error?: { code: number; message: string } }
+  }
+
+  try {
+    // 1. Slow tool times out with code -32001, aborts signal, and releases inFlightCalls slot
+    const timedOut = await callRpc(1, 'slow_tool')
+    assert.equal(timedOut.error?.code, -32001)
+    assert.equal(slowAborted, true)
+    assert.equal(bridge.getStats().inFlightCalls, 0)
+    assert.equal(bridge.getStats().failedCalls, 1)
+    assert.match(bridge.getStats().lastError ?? '', /超时/)
+
+    // 2. Concurrency limit (maxConcurrentCalls = 2): 3rd concurrent call rejects immediately with -32005
+    const p1 = callRpc(2, 'hold_tool')
+    const p2 = callRpc(3, 'hold_tool')
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(bridge.getStats().inFlightCalls, 2)
+
+    const p3 = await callRpc(4, 'hold_tool')
+    assert.equal(p3.error?.code, -32005)
+    releaseHold()
+    const [r1, r2] = await Promise.all([p1, p2])
+    assert.ok(r1.result && r2.result)
+    assert.equal(bridge.getStats().inFlightCalls, 0)
+
+    // 3. Tool exception redacts credentials from JSON-RPC error and lastError
+    const secretErr = await callRpc(5, 'secret_err_tool')
+    assert.equal(secretErr.error?.message.includes('secret_mcp_tok_999'), false)
+    assert.equal(bridge.getStats().lastError?.includes('secret_mcp_tok_999'), false)
+    assert.equal(bridge.getStats().totalCalls, 5)
+  } finally {
+    releaseHold()
+    await bridge.dispose()
+  }
+})

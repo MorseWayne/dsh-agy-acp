@@ -5,7 +5,11 @@ import type { AddressInfo } from 'node:net'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { AcpMcpServerSpec } from '../acp/protocol.ts'
+import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import { MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME } from '../common/types.ts'
+
+export const DEFAULT_MCP_CALL_TIMEOUT_MS = 60_000
+export const DEFAULT_MCP_MAX_CONCURRENT_CALLS = 8
 
 export interface BridgeToolSchema {
   name: string
@@ -18,12 +22,27 @@ export interface BridgeToolResult {
   isError?: boolean
 }
 
+export interface McpBridgeStats {
+  inFlightCalls: number
+  totalCalls: number
+  failedCalls: number
+  lastToolName: string | null
+  lastCallAt: number | null
+  lastError: string | null
+}
+
 export interface ReverseMcpBridgeOptions {
   listTools: () => BridgeToolSchema[] | Promise<BridgeToolSchema[]>
   callTool: (name: string, args: Record<string, unknown>, signal: AbortSignal) => Promise<BridgeToolResult>
   blockedTools?: readonly string[]
   serverName?: string
   bridgeScriptPath?: string
+  /** Per-tool-call execution timeout in ms (default: 60_000). */
+  callTimeoutMs?: number | (() => number)
+  /** Maximum concurrent in-flight tool calls on this session bridge (default: 8). */
+  maxConcurrentCalls?: number
+  /** Optional callback fired when call metrics or errors change. */
+  onActivity?: () => void
   log?: (msg: string) => void
 }
 
@@ -70,7 +89,7 @@ function readJsonBody(req: IncomingMessage, maxBytes = 4 * 1024 * 1024): Promise
 
 /**
  * Localhost-only HTTP MCP JSON-RPC 2.0 server paired with a zero-dependency stdio bridge.
- * Injected per ACP session via `session/new` `mcpServers` without mutating global config.
+ * Injected per ACP session via `session/new` / `session/load` `mcpServers` without mutating global config.
  */
 export class ReverseMcpBridge {
   private server: Server | null = null
@@ -78,13 +97,22 @@ export class ReverseMcpBridge {
   private readonly blocked: Set<string>
   private readonly serverName: string
   private readonly bridgeScriptPath: string
+  private readonly maxConcurrentCalls: number
+  private readonly activeCallControllers = new Set<AbortController>()
   private url: string | null = null
+  private inFlightCalls = 0
+  private totalCalls = 0
+  private failedCalls = 0
+  private lastToolName: string | null = null
+  private lastCallAt: number | null = null
+  private lastError: string | null = null
 
   constructor(private readonly opts: ReverseMcpBridgeOptions) {
     this.token = randomBytes(32).toString('hex')
     this.blocked = new Set([...DEFAULT_BLOCKED_TOOLS, ...(opts.blockedTools ?? [])])
     this.serverName = opts.serverName ?? 'dsh-tools'
     this.bridgeScriptPath = opts.bridgeScriptPath ?? resolveDefaultBridgeScriptPath()
+    this.maxConcurrentCalls = Math.max(1, opts.maxConcurrentCalls ?? DEFAULT_MCP_MAX_CONCURRENT_CALLS)
   }
 
   get isRunning(): boolean {
@@ -93,6 +121,25 @@ export class ReverseMcpBridge {
 
   get endpointUrl(): string | null {
     return this.url
+  }
+
+  getStats(): McpBridgeStats {
+    return {
+      inFlightCalls: this.inFlightCalls,
+      totalCalls: this.totalCalls,
+      failedCalls: this.failedCalls,
+      lastToolName: this.lastToolName,
+      lastCallAt: this.lastCallAt,
+      lastError: this.lastError,
+    }
+  }
+
+  private resolveCallTimeoutMs(): number {
+    const raw = typeof this.opts.callTimeoutMs === 'function' ? this.opts.callTimeoutMs() : this.opts.callTimeoutMs
+    if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 50) {
+      return Math.round(raw)
+    }
+    return DEFAULT_MCP_CALL_TIMEOUT_MS
   }
 
   async start(): Promise<string> {
@@ -116,6 +163,7 @@ export class ReverseMcpBridge {
 
   getMcpServerSpec(): AcpMcpServerSpec | null {
     if (!this.url) return null
+    const stdioTimeoutMs = this.resolveCallTimeoutMs() + 5_000
     return {
       name: this.serverName,
       command: process.execPath,
@@ -123,15 +171,21 @@ export class ReverseMcpBridge {
       env: [
         { name: 'DSH_MCP_BRIDGE_URL', value: this.url },
         { name: 'DSH_MCP_BRIDGE_TOKEN', value: this.token },
+        { name: 'DSH_MCP_BRIDGE_TIMEOUT_MS', value: String(stdioTimeoutMs) },
       ],
     }
   }
 
   async dispose(): Promise<void> {
+    for (const ac of this.activeCallControllers) {
+      ac.abort(new Error('Reverse MCP bridge disposed'))
+    }
+    this.activeCallControllers.clear()
     const srv = this.server
     this.server = null
     this.url = null
     if (!srv) return
+    srv.closeAllConnections?.()
     await new Promise<void>((resolve) => {
       srv.close(() => resolve())
     })
@@ -189,7 +243,9 @@ export class ReverseMcpBridge {
     }
 
     const ac = new AbortController()
-    res.once('close', () => { if (!res.writableEnded) ac.abort() })
+    res.once('close', () => {
+      if (!res.writableEnded) ac.abort()
+    })
 
     try {
       const result = await this.dispatchRpc(method, params, ac.signal)
@@ -197,7 +253,7 @@ export class ReverseMcpBridge {
       res.end(JSON.stringify({ jsonrpc: '2.0', id, result }))
     } catch (err) {
       const code = (err as { code?: number }).code ?? -32603
-      const message = err instanceof Error ? err.message : String(err)
+      const message = sanitizeDiagnosticText(err instanceof Error ? err.message : String(err), 240) || 'Internal error'
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } }))
     }
@@ -243,11 +299,78 @@ export class ReverseMcpBridge {
           isError: true,
         }
       }
+      if (this.inFlightCalls >= this.maxConcurrentCalls) {
+        this.totalCalls++
+        this.failedCalls++
+        this.lastToolName = name
+        this.lastCallAt = Date.now()
+        this.lastError = sanitizeDiagnosticText(
+          `工具 "${name}" 被拒绝：反向 MCP 并发调用已达上限（${this.maxConcurrentCalls}）`,
+          160,
+        )
+        this.opts.onActivity?.()
+        throw Object.assign(
+          new Error(`Reverse MCP bridge concurrency limit (${this.maxConcurrentCalls}) exceeded`),
+          { code: -32005 },
+        )
+      }
+
       const args =
         params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments)
           ? (params.arguments as Record<string, unknown>)
           : {}
-      return await this.opts.callTool(name, args, signal)
+
+      const timeoutMs = this.resolveCallTimeoutMs()
+      const callAc = new AbortController()
+      this.activeCallControllers.add(callAc)
+      const combinedSignal = AbortSignal.any([signal, callAc.signal])
+
+      this.inFlightCalls++
+      this.totalCalls++
+      this.lastToolName = name
+      this.lastCallAt = Date.now()
+      this.opts.onActivity?.()
+
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        const result = await Promise.race([
+          this.opts.callTool(name, args, combinedSignal),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => {
+              const timeoutErr = Object.assign(
+                new Error(`Reverse MCP tool "${name}" timed out after ${timeoutMs}ms`),
+                { code: -32001 },
+              )
+              callAc.abort(timeoutErr)
+              reject(timeoutErr)
+            }, timeoutMs)
+            timer.unref?.()
+          }),
+        ])
+        if (result.isError) {
+          this.failedCalls++
+          const text = result.content.map(c => c.text).join(' ')
+          this.lastError = sanitizeDiagnosticText(`工具 "${name}" 返回错误：${text}`, 160)
+        } else {
+          this.lastError = null
+        }
+        return result
+      } catch (err) {
+        this.failedCalls++
+        const code = (err as { code?: number }).code ?? -32603
+        const rawMsg = err instanceof Error ? err.message : String(err)
+        const safeMsg = sanitizeDiagnosticText(rawMsg, 180) || '反向 MCP 工具调用失败'
+        this.lastError =
+          code === -32001
+            ? sanitizeDiagnosticText(`工具 "${name}" 调用超时（>${timeoutMs}ms）`, 160)
+            : sanitizeDiagnosticText(`工具 "${name}" 调用异常：${safeMsg}`, 160)
+        throw Object.assign(new Error(safeMsg), { code })
+      } finally {
+        if (timer) clearTimeout(timer)
+        this.activeCallControllers.delete(callAc)
+        this.inFlightCalls = Math.max(0, this.inFlightCalls - 1)
+        this.opts.onActivity?.()
+      }
     }
 
     throw Object.assign(new Error(`Method not found: ${method}`), { code: -32601 })

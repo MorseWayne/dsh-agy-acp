@@ -42,12 +42,14 @@ export interface InitializeResult {
   agentInfo?: { name: string; version: string }
   agentCapabilities?: {
     loadSession?: boolean
+    load_session?: boolean
     promptCapabilities?: {
       image?: boolean
       audio?: boolean
       embeddedContext?: boolean
     }
     sessionCapabilities?: Record<string, unknown>
+    session_capabilities?: Record<string, unknown>
     _meta?: {
       antigravity?: {
         tier?: boolean
@@ -56,6 +58,19 @@ export interface InitializeResult {
     }
   }
   authMethods?: Array<{ id: string; name: string; description?: string }>
+}
+
+export function supportsSessionLoad(init: InitializeResult | null | undefined): boolean {
+  const caps = init?.agentCapabilities
+  if (!caps) return false
+  if (caps.loadSession === true || caps.load_session === true) return true
+  if (caps.sessionCapabilities && typeof caps.sessionCapabilities === 'object' && 'load' in caps.sessionCapabilities) {
+    return true
+  }
+  if (caps.session_capabilities && typeof caps.session_capabilities === 'object' && 'load' in caps.session_capabilities) {
+    return true
+  }
+  return false
 }
 
 export interface AcpConfigOptionValue {
@@ -102,6 +117,17 @@ export interface SessionNewResult {
       tier?: { name: string; id: string; upgradeUri?: string }
     }
   }
+}
+
+export interface SessionLoadParams {
+  sessionId: string
+  cwd: string
+  mcpServers: AcpMcpServerSpec[]
+  _meta?: Record<string, unknown>
+}
+
+export interface SessionLoadResult extends Omit<SessionNewResult, 'sessionId'> {
+  sessionId?: string
 }
 
 export interface SessionSetConfigOptionParams {

@@ -9,6 +9,10 @@ import { resolveConfig } from '../src/common/config.ts'
 import { hostPermissions } from '../src/runtime/host-permissions.ts'
 import { decidePermission, extractEditTargets, formatApprovalReason, type SessionPolicy } from '../src/runtime/permission-manager.ts'
 import { AcpSessionPool } from '../src/runtime/session-pool.ts'
+import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
+import { PROVIDER_ID } from '../src/common/types.ts'
+import { AcpAdapter } from '../src/provider/adapter.ts'
+import { AcpRunStore } from '../src/provider/run-store.ts'
 import { fakeHost } from './fixtures/session-policy.ts'
 
 const ask = async () => 'allowed-once'
@@ -224,4 +228,78 @@ test('workspace-write accepts safe rawInput paths, rejects multi-key/patch/symli
   } finally {
     rmSync(tmpBase, { recursive: true, force: true })
   }
+})
+
+async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
+  const items: T[] = []
+  for await (const item of stream) items.push(item)
+  return items
+}
+
+test('switching workspace-write to auto completes the active prompt before replacing its sandbox', async t => {
+  let current = ws
+  const launches: string[] = []
+  const cfg = resolveConfig({})
+  const pool = new AcpSessionPool({
+    ...fakeHost, getConfig: () => cfg, readPolicy: () => current,
+    resolveBin: () => fileURLToPath(new URL('./fixtures/fake-agy.mjs', import.meta.url)),
+    prepareArgv: async (argv, p) => { launches.push(p.mode); return argv },
+    onPermission: async (request, _key, turnSignal, original) => {
+      assert.equal(original.mode, 'workspace-write')
+      assert.equal(current.preset, 'auto')
+      return decidePermission(request, () => current, ask, turnSignal, original)
+    },
+  })
+  t.after(() => pool.dispose())
+  const first = await pool.getOrCreateSession('s', ws.workspaceRoot)
+  let switched = false
+  first.client.onAnyUpdate(() => {
+    if (switched) return
+    switched = true
+    pool.policyChanged('s') // DSH publishes the preset and sandbox knobs separately
+    current = { ...ws, mode: 'danger-full-access', preset: 'auto' }
+    pool.policyChanged('s')
+  })
+  const adapter = new AcpAdapter({ pool, runs: new AcpRunStore(), getConfig: () => cfg })
+  const send = (text: string) => collect(adapter.stream({
+    provider: PROVIDER_ID, model: 'gemini-4-neon', sessionId: 's',
+    messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+  } as unknown as GenerateOptions))
+  const chunks = await send('USE_TOOL')
+  assert.deepEqual(chunks.filter(c => c.type === 'finish').map(c => c.reason.kind), ['stop'])
+  assert.match(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), /Command succeeded/)
+  assert.equal(first.client.isRunning, false)
+  assert.deepEqual(launches, ['workspace-write'])
+  assert.ok((await send('follow up')).some(c => c.type === 'finish' && c.reason.kind === 'stop'))
+  assert.deepEqual(launches, ['workspace-write', 'danger-full-access'])
+})
+
+test('an in-flight permission tightening is reported as an intentional stop', async t => {
+  let current = ws
+  const cfg = resolveConfig({})
+  const pool = new AcpSessionPool({ ...fakeHost, getConfig: () => cfg, readPolicy: () => current,
+    resolveBin: () => fileURLToPath(new URL('./fixtures/fake-agy.mjs', import.meta.url)) })
+  t.after(() => pool.dispose())
+  const { client } = await pool.getOrCreateSession('s', ws.workspaceRoot)
+  client.onAnyUpdate(() => { current = ro; pool.policyChanged('s') })
+  const adapter = new AcpAdapter({ pool, runs: new AcpRunStore(), getConfig: () => cfg })
+  const chunks = await collect(adapter.stream({ provider: PROVIDER_ID, model: 'gemini-4-neon', sessionId: 's',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'SLOW_CANCEL' }] }],
+  } as unknown as GenerateOptions))
+  const finish = chunks.find(c => c.type === 'finish')
+  assert.ok(finish?.reason.kind === 'aborted')
+  assert.match(finish.reason.failure?.message ?? '', /权限或工作目录已更改/)
+  assert.equal(client.isRunning, false)
+})
+
+test('an old read-only denial and a new auto approval requirement both survive a deferred switch', async () => {
+  const auto: SessionPolicy = { ...ws, mode: 'danger-full-access', preset: 'auto' }
+  const unexpected = async () => assert.fail('a read-only turn cannot acquire execute permission')
+  assert.deepEqual(await decidePermission(req('execute'), () => auto, unexpected, signal(), ro), outcome('no'))
+  let asks = 0
+  assert.deepEqual(await decidePermission(req('edit', ['src/example']), () => auto, async () => {
+    asks++
+    return 'rejected'
+  }, signal(), ws), outcome('no'))
+  assert.equal(asks, 1)
 })

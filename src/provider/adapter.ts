@@ -174,6 +174,7 @@ export class AcpAdapter extends LlmAdapter {
           requestedModel,
           triedAccounts.size > 0 ? triedAccounts : undefined,
           preparedSystem ?? undefined,
+          recoveryPolicy ? { forceNew: true } : undefined,
         ))
       } catch (err) {
         if (err instanceof EgressBlockedError && !options.signal?.aborted) {
@@ -282,7 +283,7 @@ export class AcpAdapter extends LlmAdapter {
       void client
         .sessionPrompt({ sessionId: session.acpSessionId, prompt: promptBlocks }, cfg.requestTimeoutMs)
         .then((res) => {
-          if (pendingSystemHash) session.appliedSystemHash = pendingSystemHash
+          if (pendingSystemHash) this.deps.pool.recordAppliedSystemHash(session, pendingSystemHash)
           this.deps.pool.reportAccountSuccess(session.accountId, targetModel)
           this.deps.pool.recordTurnUsage(res.usage)
           // Release active turn slot synchronously BEFORE waking consumers to prevent next-turn race.
@@ -664,8 +665,8 @@ export function detectContinuation(
 
     if (message.role !== 'user') break
 
-    // The host can append a runtime snapshot after tool results. Only skip trailing ones before results.
-    if (message.source?.kind === 'runtime-context') {
+    // DSH may append both snapshots while preparing the next step of this same turn.
+    if (message.source?.kind === 'runtime-context' || message.source?.kind === 'time-context') {
       if (targetRunId === null) continue
       break
     }

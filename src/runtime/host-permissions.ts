@@ -35,11 +35,11 @@ export function hostPermissions(host: PermissionHost) {
       if (!confined?.argv.length || confined.enforcement !== 'full') throw new Error(`Cannot enforce DSH ${file.mode} for Antigravity; refusing unconfined startup`)
       return confined.argv
     },
-    onPermission(req: RequestPermissionParams, key: string, signal: AbortSignal) {
+    onPermission(req: RequestPermissionParams, key: string, signal: AbortSignal, launchPolicy?: SessionPolicy) {
       const deadline = AbortSignal.any([signal, AbortSignal.timeout(5 * 60_000)])
       return decidePermission(req, () => readPolicy(key), reason => host.approval.request({
         agent: agent(key), toolName: `agy:${req.toolCall.name ?? req.toolCall.kind ?? 'tool'}`, reason, signal: deadline,
-      }), deadline)
+      }), deadline, launchPolicy)
     },
   }
 }

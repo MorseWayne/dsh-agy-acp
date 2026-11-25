@@ -14,6 +14,7 @@ import { defineAgyAcpMirrorTool } from '../src/provider/mirror-tool.ts'
 import { AcpRunStore } from '../src/provider/run-store.ts'
 import { MultiAccountPool } from '../src/runtime/account-pool.ts'
 import { EgressGuard } from '../src/runtime/egress-guard.ts'
+import { SessionIndex } from '../src/runtime/session-index.ts'
 import { AcpSessionPool } from '../src/runtime/session-pool.ts'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -104,7 +105,7 @@ test('AcpAdapter.stream() reuses persistent ACP session across multi-turn conver
   }
 })
 
-async function assertMirrorContinuation(format: 'legacy' | 'tool role' | 'tool role with runtime context') {
+async function assertMirrorContinuation(format: 'legacy' | 'tool role' | 'runtime-context' | 'time-context') {
   const { adapter, pool, mirrorTool, permissionLog } = createHarness()
   try {
     const mirrorSchema = { name: MIRROR_TOOL_NAME, description: '', parameters: { type: 'object', properties: {} } }
@@ -182,8 +183,8 @@ async function assertMirrorContinuation(format: 'legacy' | 'tool role' | 'tool r
         ? { role: 'user', content: [{ type: 'tool-result', ...result }] }
         : { role: 'tool', source: { kind: 'tool' }, ...result },
     ]
-    const continuationMessages = format === 'tool role with runtime context'
-      ? [...history, { role: 'user', content: [{ type: 'text', text: 'Updated runtime context' }], source: { kind: 'runtime-context' } }]
+    const continuationMessages = format === 'runtime-context' || format === 'time-context'
+      ? [...history, { role: 'user', content: [{ type: 'text', text: 'Updated host context' }], source: { kind: format } }]
       : history
     const span2 = await collectChunks(
       adapter.stream({
@@ -228,7 +229,7 @@ async function assertMirrorContinuation(format: 'legacy' | 'tool role' | 'tool r
   }
 }
 
-for (const format of ['legacy', 'tool role', 'tool role with runtime context'] as const) {
+for (const format of ['legacy', 'tool role', 'runtime-context', 'time-context'] as const) {
   test(`AcpAdapter.stream() resumes the original ACP prompt after a ${format} mirror result`, () => assertMirrorContinuation(format))
 }
 
@@ -1056,5 +1057,143 @@ test('SIGTERM after reasoning recovers once with distinct block indices, while p
     assert.deepEqual(chunks.filter(c => c.type === 'block-start').map(c => c.index), [0, 1])
     assert.deepEqual(chunks.filter(c => c.type === 'block-end').map(c => c.index), [0, 1])
     assert.deepEqual(chunks.filter(c => c.type === 'finish').map(c => c.reason.kind), [partial ? 'error' : 'stop'])
+  }
+})
+
+test('session/load restores native ACP context across idle sweep & restart without digest duplication, isolates replay chunks, and falls back smoothly to session/new', async (t) => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'dsh-agy-load-'))
+  const storeFile = path.join(tmpDir, 'fake-agy-sessions.json')
+  const indexFile = path.join(tmpDir, 'sessions.json')
+  const prevStore = process.env.FAKE_SESSION_STORE_FILE
+  const prevFail = process.env.FAKE_FAIL_SESSION_LOAD
+  process.env.FAKE_SESSION_STORE_FILE = storeFile
+  delete process.env.FAKE_FAIL_SESSION_LOAD
+
+  t.after(() => {
+    if (prevStore === undefined) delete process.env.FAKE_SESSION_STORE_FILE
+    else process.env.FAKE_SESSION_STORE_FILE = prevStore
+    if (prevFail === undefined) delete process.env.FAKE_FAIL_SESSION_LOAD
+    else process.env.FAKE_FAIL_SESSION_LOAD = prevFail
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  const cfg = resolveConfig({ enabled: true, sessionIdleTtlMs: 60_000, requestTimeoutMs: 10_000 })
+  const sessionIndex1 = new SessionIndex({ filePath: indexFile })
+  const pool1 = new AcpSessionPool({
+    ...fakeHost,
+    sessionIndex: sessionIndex1,
+    getConfig: () => cfg,
+    resolveBin: () => FAKE_AGY_BIN,
+  })
+  const adapter1 = new AcpAdapter({ getConfig: () => cfg, pool: pool1, runs: new AcpRunStore() })
+
+  try {
+    // Turn 1: creates sess_1 via session/new
+    const t1 = await collectChunks(
+      adapter1.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'first turn' }] } as Message],
+        sessionId: 'conv-load-1',
+      } as GenerateOptions),
+    )
+    assert.equal(t1.filter(c => c.type === 'text-delta').map(c => c.text).join(''), '[sess_1#1] first turn')
+    assert.equal(pool1.getStatus().persistedSessions, 1)
+
+    // Simulate idle TTL sweep -> closes child process while preserving SessionIndex
+    const liveSess = pool1.getStatus().sessions[0]!
+    assert.equal(liveSess.acpSessionId, 'sess_1')
+    ;(pool1 as unknown as { sessions: Map<string, { lastActiveAt: number }> }).sessions.get('conv-load-1')!.lastActiveAt = 1
+    await pool1.sweepIdleSessions()
+    assert.equal(pool1.getStatus().activeSessions, 0)
+    assert.equal(pool1.getStatus().persistedSessions, 1)
+
+    // Turn 2: restores sess_1 via session/load -> turn #2, NO <prior_conversation_digest>, NO leaked replay text, contextUsed=1234 restored!
+    const history2: Message[] = [
+      { role: 'user', content: [{ type: 'text', text: 'first turn' }] } as Message,
+      { role: 'assistant', content: [{ type: 'text', text: '[sess_1#1] first turn' }] } as Message,
+      { role: 'user', content: [{ type: 'text', text: 'second turn after idle' }] } as Message,
+    ]
+    const t2 = await collectChunks(
+      adapter1.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: history2,
+        sessionId: 'conv-load-1',
+      } as GenerateOptions),
+    )
+    const text2 = t2.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+    assert.equal(text2, '[sess_1#2] second turn after idle')
+    assert.equal(text2.includes('prior_conversation_digest'), false)
+    assert.equal(text2.includes('STALE_REPLAY_TEXT_MUST_NOT_LEAK'), false)
+    const snap2 = pool1.getStatus().sessions[0]!
+    assert.equal(snap2.resumed, true)
+    assert.equal(snap2.contextUsed, 1234)
+    assert.equal(snap2.contextSize, 65536)
+
+    // Dynamic notifications (`session_info_update` + `config_option_update`) sync immediately to status & SessionIndex
+    const dynTurn = await collectChunks(
+      adapter1.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [...history2, { role: 'user', content: [{ type: 'text', text: 'EMIT_DYNAMIC_UPDATES' }] } as Message],
+        sessionId: 'conv-load-1',
+      } as GenerateOptions),
+    )
+    assert.equal(dynTurn.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'Dynamic updates pushed.')
+    const afterDyn = pool1.getStatus().sessions[0]!
+    assert.equal(afterDyn.title, '重构登录模块')
+    assert.equal(afterDyn.currentModel, 'claude-sonnet-5-5')
+    assert.equal(afterDyn.currentEffort, 'high')
+  } finally {
+    pool1.dispose()
+  }
+
+  // Simulate full DSH/plugin restart: new pool + new SessionIndex reading persisted sessions.json
+  const sessionIndex2 = new SessionIndex({ filePath: indexFile })
+  sessionIndex2.load()
+  const pool2 = new AcpSessionPool({
+    ...fakeHost,
+    sessionIndex: sessionIndex2,
+    getConfig: () => cfg,
+    resolveBin: () => FAKE_AGY_BIN,
+  })
+  const adapter2 = new AcpAdapter({ getConfig: () => cfg, pool: pool2, runs: new AcpRunStore() })
+
+  try {
+    const history3: Message[] = [
+      { role: 'user', content: [{ type: 'text', text: 'first turn' }] } as Message,
+      { role: 'assistant', content: [{ type: 'text', text: 'reply 1' }] } as Message,
+      { role: 'user', content: [{ type: 'text', text: 'turn after restart' }] } as Message,
+    ]
+    const t3 = await collectChunks(
+      adapter2.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: history3,
+        sessionId: 'conv-load-1',
+      } as GenerateOptions),
+    )
+    assert.equal(t3.filter(c => c.type === 'text-delta').map(c => c.text).join(''), '[sess_1#4] turn after restart')
+    assert.equal(pool2.getStatus().sessions[0]?.title, '重构登录模块')
+
+    // Force `session/load` failure -> seamlessly falls back to `session/new` WITH 24K `<prior_conversation_digest>`
+    ;(pool2 as unknown as { sessions: Map<string, { lastActiveAt: number }> }).sessions.get('conv-load-1')!.lastActiveAt = 1
+    await pool2.sweepIdleSessions()
+    process.env.FAKE_FAIL_SESSION_LOAD = '1'
+    const t4 = await collectChunks(
+      adapter2.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: history3,
+        sessionId: 'conv-load-1',
+      } as GenerateOptions),
+    )
+    const text4 = t4.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+    assert.match(text4, /prior_conversation_digest/)
+    assert.match(text4, /turn after restart/)
+    assert.equal(pool2.getStatus().sessions[0]?.resumed, undefined)
+  } finally {
+    pool2.dispose()
   }
 })

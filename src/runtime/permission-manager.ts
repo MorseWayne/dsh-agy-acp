@@ -20,6 +20,21 @@ export function policyKey(policy: SessionPolicy): string {
   return JSON.stringify([policy.sessionId, policy.mode, policy.workspaceRoot, policy.additionalWritableRoots ?? [], policy.preset, policy.approval])
 }
 
+export class SessionPolicyChangedError extends Error {
+  constructor() {
+    super('会话权限或工作目录已更改，本轮已停止。下一条消息将使用新设置。')
+  }
+}
+
+/** A confined native turn can finish when the host widens its filesystem boundary.
+ * Native permission callbacks must still satisfy both policies. */
+export function canFinishConfinedTurn(original: SessionPolicy, current: SessionPolicy): boolean {
+  if (original.sessionId !== current.sessionId || original.workspaceRoot !== current.workspaceRoot) return false
+  if (original.mode === 'danger-full-access' || original.preset !== original.mode) return false
+  return (current.mode === 'danger-full-access' && (current.preset === 'auto' || current.preset === 'danger-full-access')) ||
+    (original.mode === 'read-only' && current.mode === 'workspace-write' && current.preset === 'workspace-write')
+}
+
 const SINGLE_PATH_KEYS = new Set([
   'Path',
   'TargetFile',
@@ -381,6 +396,7 @@ export async function decidePermission(
   readPolicy: () => SessionPolicy,
   ask: (reason: string) => Promise<string>,
   signal: AbortSignal,
+  launchPolicy?: SessionPolicy,
 ): Promise<RequestPermissionResult> {
   try {
     const p = readPolicy()
@@ -389,9 +405,10 @@ export async function decidePermission(
     const denied = (): RequestPermissionResult => reject ? { outcome: { outcome: 'selected', optionId: reject.optionId } } : cancelled()
     if (signal.aborted || !allow) return denied()
     const action = disposition(p, req)
-    if (action === 'deny') return denied()
-    if (action === 'ask') {
-      if (p.approval !== 'ask') return denied()
+    const launchAction = launchPolicy ? disposition(launchPolicy, req) : action
+    if (action === 'deny' || launchAction === 'deny') return denied()
+    if (action === 'ask' || launchAction === 'ask') {
+      if (p.approval !== 'ask' || (launchAction === 'ask' && launchPolicy?.approval === 'never')) return denied()
       const reason = formatApprovalReason(req)
       if (await ask(reason) !== 'allowed-once') return denied()
     }

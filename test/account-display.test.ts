@@ -260,12 +260,25 @@ test('SettingsView renders model select, lastError banner, timeout inputs, conte
         currentModel: 'gemini-4-neon',
         currentEffort: 'high',
         currentMode: 'default',
+        title: '修复鉴权缓存逻辑',
+        resumed: true,
         contextUsed: 160_000,
         contextSize: 200_000,
         lastActiveAt: now,
       },
     ],
-    mcpBridgeActive: false,
+    persistedSessions: 2,
+    mcpBridgeActive: true,
+    mcpBridge: {
+      enabled: true,
+      activeBridges: 1,
+      inFlightCalls: 0,
+      totalCalls: 4,
+      failedCalls: 1,
+      lastToolName: 'search_docs',
+      lastCallAt: now,
+      lastError: '工具 "search_docs" 调用超时（>60000ms）',
+    },
     usageTotals: { inputTokens: 1200, outputTokens: 300, cachedReadTokens: 400, cachedWriteTokens: 50, reasoningTokens: 80 },
     accounts: [account],
     models: [
@@ -299,6 +312,11 @@ test('SettingsView renders model select, lastError banner, timeout inputs, conte
   assert.match(html, /地域合规防护（防封号拦截）/)
   assert.match(html, /拦截受限地区（推荐，默认）/)
   assert.match(html, /严格模式（受限与未知均拦截）/)
+  assert.match(html, /桥接运行态：挂载会话 1 · 在途调用 0 · 累计调用 4 · 失败\/超时 1 · 最近工具 search_docs/)
+  assert.match(html, /最近桥接告警/)
+  assert.match(html, /已索引可恢复会话 2 个/)
+  assert.match(html, /session\/load 已恢复/)
+  assert.match(html, /标题：修复鉴权缓存逻辑/)
   assert.match(html, /恢复默认/)
   assert.match(html, /role="progressbar"/)
   assert.match(html, /--dsw-alias-/)

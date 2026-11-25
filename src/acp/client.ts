@@ -8,6 +8,8 @@ import type {
   JsonRpcResponse,
   RequestPermissionParams,
   RequestPermissionResult,
+  SessionLoadParams,
+  SessionLoadResult,
   SessionNewParams,
   SessionNewResult,
   SessionPromptParams,
@@ -305,6 +307,10 @@ export class AcpClient {
 
   sessionNew(params: SessionNewParams): Promise<SessionNewResult> {
     return this.request<SessionNewResult>('session/new', params, 30_000)
+  }
+
+  sessionLoad(params: SessionLoadParams): Promise<SessionLoadResult> {
+    return this.request<SessionLoadResult>('session/load', params, 30_000)
   }
 
   sessionSetConfigOption(params: SessionSetConfigOptionParams): Promise<SessionSetConfigOptionResult> {

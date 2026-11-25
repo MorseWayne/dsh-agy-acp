@@ -123,9 +123,22 @@ export interface SessionSummary {
   currentModel: string
   currentEffort: string
   currentMode: string
+  title?: string
+  resumed?: boolean
   contextUsed: number | null
   contextSize: number
   lastActiveAt: number
+}
+
+export interface McpBridgeSnapshot {
+  enabled: boolean
+  activeBridges: number
+  inFlightCalls: number
+  totalCalls: number
+  failedCalls: number
+  lastToolName: string | null
+  lastCallAt: number | null
+  lastError: string | null
 }
 
 export interface UsageTotals {
@@ -144,8 +157,10 @@ export interface StatusSnapshot {
   agentVersion: string | null
   tierName: string | null
   activeSessions: number
+  persistedSessions?: number
   sessions: SessionSummary[]
   mcpBridgeActive: boolean
+  mcpBridge?: McpBridgeSnapshot
   usageTotals: UsageTotals
   accounts: AccountHealthSnapshot[]
   models: AcpModelOption[]
