@@ -14,8 +14,8 @@
 | **阶段一** | ✅ 已完成（`7406eeb`） | [阶段一设计规格](./specs/2026-11-25-phase1-core-chat-and-tool-mirror-design.md) | 核心对话质量、实时工具流式镜像、五类原生卡片、`options.system` 透传、`options.purpose` 只读辅助调用、24K 上下文恢复 | `v0.2.0` |
 | **阶段二** | ✅ 已完成（`7a6d2c1`） | [阶段二设计规格](./specs/2026-11-25-phase2-permissions-and-stability-design.md) | 结构化权限审批体验、`workspace-write` 真实路径防绕过、统一凭据脱敏、类型化 ACP 错误、僵尸会话自清理、首帧前断连重试 | `v0.2.0` |
 | **阶段三** | ✅ 已完成（`0189a5c`） | [阶段三设计规格](./specs/2026-11-25-phase3-config-persistence-and-console-ui-design.md) | 配置白名单原子持久化与重置、模型目录代次隔离与强制刷新、前端单例 SSE 状态中心、DSH 官方主题适配与控制台升级 | `v0.2.0` |
-| **阶段四** | 📋 规划完成（下一优先） | [阶段四设计规格](./specs/2026-11-25-phase4-egress-guard-design.md) | 网络出口合规探测与防风控本地硬熔断（Egress Probe & GeoFence Guard）、全四条出站链路守门、多账号避障与控制台可视化自检 | `v0.3.0` |
-| **阶段五** | 📋 路线规划 | 待阶段四合入后起草 | ACP 协议能力深化（`session/load` 原生会话恢复、`config_option_update` / `session_info_update` 实时同步）与反向 MCP 桥接健壮化 | `v0.4.0` |
+| **阶段四** | ✅ 已完成（`7f488b6`） | [阶段四设计规格](./specs/2026-11-25-phase4-egress-guard-design.md) | 网络出口合规探测与防风控本地硬熔断（Egress Probe & GeoFence Guard）、全四条出站链路守门、多账号避障与控制台可视化自检 | `v0.3.0` |
+| **阶段五** | 📋 路线规划（下一优先） | 待起草独立规格 | ACP 协议能力深化（`session/load` 原生会话恢复、`config_option_update` / `session_info_update` 实时同步）与反向 MCP 桥接健壮化 | `v0.4.0` |
 | **阶段六** | 📋 路线规划 | 待阶段五合入后起草 | 多账号配额感知调度闭环、`/agy-acp` 结构化诊断工具箱、文档与发布基线收口 | `v0.4.0` |
 
 ```mermaid
@@ -23,8 +23,8 @@ flowchart LR
   P1["阶段一\n核心对话与工具镜像\n(已完成)"]
   P2["阶段二\n权限体验与连接稳定\n(已完成)"]
   P3["阶段三\n配置持久化与控制台\n(已完成)"]
-  P4["阶段四\n出口探测与防风控熔断\n(下一优先)"]
-  P5["阶段五\n协议深化与会话连续性"]
+  P4["阶段四\n出口探测与防风控熔断\n(已完成)"]
+  P5["阶段五\n协议深化与会话连续性\n(下一优先)"]
   P6["阶段六\n运维闭环与诊断发布"]
 
   P1 --> P2 --> P3 --> P4 --> P5 --> P6
