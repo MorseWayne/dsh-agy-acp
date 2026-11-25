@@ -1,4 +1,4 @@
-import type { AccountHealthSnapshot, QuotaBucketState, StatusSnapshot } from '../common/types.ts'
+import type { AccountEgressSnapshot, AccountHealthSnapshot, QuotaBucketState, StatusSnapshot } from '../common/types.ts'
 
 export function sessionAccountLabel(accountId: string, accounts: Pick<AccountHealthSnapshot, 'id' | 'label'>[]): string {
   const label = accounts.find(account => account.id === accountId)?.label
@@ -36,14 +36,65 @@ export function nextAccountExpiry(account: AccountHealthSnapshot, now: number): 
 const refreshFailureByStatus: Record<number, string> = {
   404: '账号不存在，请检查账号配置。',
   409: '该账号的查询环境不可用，请检查启用状态与凭据隔离设置。',
+  451: '当前网络出口位于受限地区，已在本地拦截配额查询以防触发风控。',
   502: 'agy CLI 未能读取配额，请检查该账号的登录状态和 CLI 版本。',
   503: '无法启动只读配额查询，请检查 agy CLI 和账号环境。',
 }
 
-export async function requestAccountAction(action: 'refresh' | 'clear', accountId: string, request = fetch): Promise<StatusSnapshot> {
-  let failure = action === 'refresh' ? '配额刷新失败，请稍后重试。' : '本地冷却未能清除，请重试。'
+const egressFailureByStatus: Record<number, string> = {
+  404: '账号不存在，请检查账号配置。',
+  409: 'ACP 插件当前未启用，无法执行出口检测。',
+}
+
+export type AccountActionKind = 'refresh' | 'clear' | 'egress'
+
+export interface EgressBadgeDisplay {
+  label: string
+  tone: 'success' | 'error' | 'warn' | 'idle'
+}
+
+export function formatEgressBadge(egress: AccountEgressSnapshot | undefined): EgressBadgeDisplay {
+  if (!egress) {
+    return { label: '出口：待检测', tone: 'idle' }
+  }
+  const modeLabel = egress.proxyMode === 'proxy' ? '代理' : '直连'
+  if (egress.status === 'supported') {
+    return {
+      label: `出口：${egress.country ?? '合规'}（${modeLabel}）· 合规`,
+      tone: 'success',
+    }
+  }
+  if (egress.status === 'unsupported') {
+    const region = egress.country ?? (egress.probeSource === 'runtime-400' ? '上游 400' : '受限区')
+    return {
+      label: `出口：${region}（${modeLabel}）· 不支持 Gemini（已拦截）`,
+      tone: 'error',
+    }
+  }
+  return {
+    label: `出口：探测异常（${modeLabel}）`,
+    tone: 'warn',
+  }
+}
+
+export async function requestAccountAction(
+  action: AccountActionKind,
+  accountId: string,
+  request = fetch,
+): Promise<StatusSnapshot> {
+  let failure =
+    action === 'refresh'
+      ? '配额刷新失败，请稍后重试。'
+      : action === 'egress'
+        ? '出口检测失败，请稍后重试。'
+        : '本地冷却未能清除，请重试。'
   try {
-    const endpoint = action === 'refresh' ? 'quota/refresh' : 'cooldown/clear'
+    const endpoint =
+      action === 'refresh'
+        ? 'quota/refresh'
+        : action === 'egress'
+          ? 'egress/check'
+          : 'cooldown/clear'
     const response = await request(`/plugins/agy-acp/accounts/${endpoint}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accountId }),
     })
@@ -53,6 +104,8 @@ export async function requestAccountAction(action: 'refresh' | 'clear', accountI
       if (status && Number.isFinite(status.updatedAt) && Array.isArray(status.accounts)) return status
     } else if (action === 'refresh') {
       failure = refreshFailureByStatus[response.status] ?? failure
+    } else if (action === 'egress') {
+      failure = egressFailureByStatus[response.status] ?? failure
     }
   } catch { /* use the same safe failure for network and malformed replies */ }
   throw new Error(failure)

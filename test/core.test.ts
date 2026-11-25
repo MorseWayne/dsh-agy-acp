@@ -3,6 +3,7 @@ import test from 'node:test'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import { validateJsonSchemaValue, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { resolveConfig } from '../src/common/config.ts'
+import { isGeoUnsupportedError, isUnsupportedGeoCountry, maskIpAddress, normalizeGeoCountryCode } from '../src/common/geo.ts'
 import { sanitizeDiagnosticText } from '../src/common/sanitize.ts'
 import { MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME } from '../src/common/types.ts'
 import { detectContinuation } from '../src/provider/adapter.ts'
@@ -369,4 +370,43 @@ test('sanitizeDiagnosticText redacts credentials case-insensitively before tail 
   const truncated = sanitizeDiagnosticText(`prefix ${boundaryToken} tail_err`, 40)
   assert.equal(truncated.includes('AAAA'), false)
   assert.match(truncated, /tail_err/)
+})
+
+test('geo rules classify restricted countries, upstream 400 errors, and mask IPv4/IPv6 addresses safely', () => {
+  for (const blocked of ['HK', 'hk', ' CN ', 'MO', 'RU', 'BY', 'IR', 'KP', 'SY', 'CU']) {
+    assert.equal(isUnsupportedGeoCountry(blocked), true, blocked)
+  }
+  for (const allowed of ['US', 'JP', 'SG', 'TW', 'DE', 'GB', 'KR', 'XX', 'T1', '', null, undefined]) {
+    assert.equal(isUnsupportedGeoCountry(allowed), false, String(allowed))
+  }
+  assert.deepEqual(normalizeGeoCountryCode('xx'), { kind: 'placeholder', raw: 'XX' })
+  assert.deepEqual(normalizeGeoCountryCode('t1'), { kind: 'placeholder', raw: 'T1' })
+  assert.deepEqual(normalizeGeoCountryCode('us'), { kind: 'valid', country: 'US' })
+  assert.deepEqual(normalizeGeoCountryCode('USA'), { kind: 'invalid' })
+
+  assert.equal(
+    isGeoUnsupportedError(new Error('FAILED_PRECONDITION (code 400): User location is not supported for the API use.')),
+    true,
+  )
+  assert.equal(
+    isGeoUnsupportedError({ code: 400, status: 'FAILED_PRECONDITION', message: 'Location is not supported' }),
+    true,
+  )
+  assert.equal(isGeoUnsupportedError(new Error('HTTP 429 RESOURCE_EXHAUSTED')), false)
+  assert.equal(isGeoUnsupportedError('Invalid argument: bad model'), false)
+
+  assert.equal(maskIpAddress('203.0.113.42'), '203.0.113.*')
+  assert.equal(maskIpAddress(' 0.0.0.0 '), '0.0.0.*')
+  assert.equal(maskIpAddress('999.1.2.3'), 'unknown')
+  assert.equal(maskIpAddress('01.2.3.4'), 'unknown')
+  assert.equal(maskIpAddress('::ffff:198.51.100.9'), '::ffff:198.51.100.*')
+  assert.equal(maskIpAddress('2001:0db8:85a3::8a2e:0370:7334'), '2001:db8::*')
+  assert.equal(maskIpAddress('[fe80::1%eth0]'), 'fe80:0::*')
+  assert.equal(maskIpAddress('2001:db8::1::2'), 'unknown')
+  assert.equal(maskIpAddress('not-an-ip'), 'unknown')
+  assert.equal(maskIpAddress(''), 'unknown')
+
+  assert.equal(resolveConfig({}).geoFenceMode, 'block')
+  assert.equal(resolveConfig({ geoFenceMode: 'strict' }).geoFenceMode, 'strict')
+  assert.equal(resolveConfig({ geoFenceMode: 'invalid' }).geoFenceMode, 'block')
 })

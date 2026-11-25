@@ -106,6 +106,7 @@ test('auxiliary prompt fails closed when read-only sandbox confinement is partia
   const perms = hostPermissions(host)
   const pool = new AcpSessionPool({
     ...perms,
+    egressGuard: fakeHost.egressGuard,
     getConfig: () => resolveConfig({}),
     resolveBin: () => fileURLToPath(new URL('./fixtures/fake-agy.mjs', import.meta.url)),
   })

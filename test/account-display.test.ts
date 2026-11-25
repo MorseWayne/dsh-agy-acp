@@ -296,8 +296,83 @@ test('SettingsView renders model select, lastError banner, timeout inputs, conte
   assert.match(html, /重新探测目录/)
   assert.match(html, /空闲会话回收/)
   assert.match(html, /单次请求超时/)
+  assert.match(html, /地域合规防护（防封号拦截）/)
+  assert.match(html, /拦截受限地区（推荐，默认）/)
+  assert.match(html, /严格模式（受限与未知均拦截）/)
   assert.match(html, /恢复默认/)
   assert.match(html, /role="progressbar"/)
   assert.match(html, /--dsw-alias-/)
   assert.doesNotMatch(html, /#18181b/)
+})
+
+test('AccountCard renders supported, unsupported, error, and unchecked egress states and posts egress/check action safely', async () => {
+  const uncheckedHtml = markup(account)
+  assert.match(uncheckedHtml, /网络出口合规/)
+  assert.match(uncheckedHtml, /出口：待检测/)
+  assert.match(uncheckedHtml, /检测出口/)
+
+  const supportedHtml = markup({
+    ...account,
+    egress: {
+      status: 'supported',
+      country: 'US',
+      ipMasked: '203.0.113.*',
+      proxyMode: 'proxy',
+      probeSource: 'cloudflare-trace',
+      checkedAt: now,
+      expiresAt: now + 300_000,
+    },
+  })
+  assert.match(supportedHtml, /出口：US（代理）· 合规/)
+  assert.match(supportedHtml, /IP 203\.0\.113\.\*/)
+
+  const unsupportedHtml = markup({
+    ...account,
+    egress: {
+      status: 'unsupported',
+      country: 'HK',
+      ipMasked: '198.51.100.*',
+      proxyMode: 'direct',
+      probeSource: 'cloudflare-trace',
+      checkedAt: now,
+      expiresAt: now + 60_000,
+      reason: '当前出口位于不受 Google 支持的地区（HK）',
+    },
+  })
+  assert.match(unsupportedHtml, /出口：HK（直连）· 不支持 Gemini（已拦截）/)
+  assert.match(unsupportedHtml, /当前出口位于不受 Google 支持的地区（HK）/)
+
+  const errorHtml = markup({
+    ...account,
+    egress: {
+      status: 'error',
+      country: null,
+      ipMasked: null,
+      proxyMode: 'proxy',
+      probeSource: null,
+      checkedAt: now,
+      expiresAt: now + 30_000,
+      reason: 'HTTP 代理认证失败（HTTP 407）',
+    },
+  })
+  assert.match(errorHtml, /出口：探测异常（代理）/)
+  assert.match(errorHtml, /HTTP 代理认证失败（HTTP 407）/)
+
+  const calls: unknown[] = []
+  const status = { accounts: [account], updatedAt: now }
+  const res = await requestAccountAction('egress', 'default', async (url, init) => {
+    calls.push([url, init?.method, JSON.parse(String(init?.body))])
+    return Response.json({ status })
+  })
+  assert.deepEqual(calls, [['/plugins/agy-acp/accounts/egress/check', 'POST', { accountId: 'default' }]])
+  assert.deepEqual(res, status)
+
+  await assert.rejects(
+    requestAccountAction('egress', 'default', async () => Response.json({ error: 'secret-proxy' }, { status: 404 })),
+    { message: '账号不存在，请检查账号配置。' },
+  )
+  await assert.rejects(
+    requestAccountAction('refresh', 'default', async () => Response.json({ error: 'blocked' }, { status: 451 })),
+    { message: '当前网络出口位于受限地区，已在本地拦截配额查询以防触发风控。' },
+  )
 })

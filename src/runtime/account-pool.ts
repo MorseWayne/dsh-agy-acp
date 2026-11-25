@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import path from 'node:path'
 import { realpathSync } from 'node:fs'
+import { isGeoUnsupportedError } from '../common/geo.ts'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import type {
   AccountHealthSnapshot,
@@ -47,6 +48,7 @@ interface InternalAccountState {
   profile: AccountProfileConfig
   activeLeases: number
   families: Map<ModelFamily, FamilyQuotaState>
+  geoBlockedUntil?: number
   lastError: string | null
   lastUsedAt: number | null
 }
@@ -170,6 +172,38 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     return { accountId, env, requiresFileCredentialMode: Boolean(acc.profile.homeDir && env?.SSH_CONNECTION?.trim()), release: () => slot?.release() }
   }
 
+  getAccountEnv(accountId: string): NodeJS.ProcessEnv | undefined {
+    const acc = this.accounts.get(accountId)
+    return acc ? buildAccountEnv(acc.profile) : undefined
+  }
+
+  markGeoBlocked(accountId: string, untilMs: number, reason?: string): void {
+    const acc = this.accounts.get(accountId)
+    if (!acc) return
+    acc.geoBlockedUntil = Math.max(acc.geoBlockedUntil ?? 0, untilMs)
+    if (reason) {
+      acc.lastError = sanitizeDiagnosticText(reason, 240) || acc.lastError
+    }
+    this.opts.log?.(
+      `account "${accountId}" entered local geo-fence cooldown (${Math.max(1, Math.ceil((untilMs - this.now()) / 1000))}s)`,
+    )
+    this.emit('change')
+  }
+
+  clearGeoBlock(accountId?: string): void {
+    let changed = false
+    for (const acc of this.accounts.values()) {
+      if (accountId && acc.profile.id !== accountId) continue
+      if (acc.geoBlockedUntil !== undefined) {
+        acc.geoBlockedUntil = undefined
+        changed = true
+      }
+    }
+    if (changed) {
+      this.emit('change')
+    }
+  }
+
   updateQuota(
     accountId: string,
     family: ModelFamily,
@@ -278,6 +312,8 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
       this.opts.log?.(
         `account "${accountId}" entered ${Math.round(backoff / 1000)}s cooldown for family "${family}": ${safeMessage}`,
       )
+    } else if (isGeoUnsupportedError(error)) {
+      acc.geoBlockedUntil = Math.max(acc.geoBlockedUntil ?? 0, this.now() + 60_000)
     }
     this.emit('change')
   }
@@ -286,6 +322,7 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     for (const acc of this.accounts.values()) {
       if (accountId && acc.profile.id !== accountId) continue
       acc.lastError = null
+      acc.geoBlockedUntil = undefined
       for (const state of acc.families.values()) {
         state.cooldownUntil = undefined
         state.consecutiveFailures = 0
@@ -337,23 +374,33 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
   }
 
   private getBlockedUntil(acc: InternalAccountState, family: ModelFamily, now: number): number | null {
-    const st = acc.families.get(family)
-    if (!st) return null
+    const blocks: number[] = []
+    if (acc.geoBlockedUntil !== undefined) {
+      if (acc.geoBlockedUntil > now) {
+        blocks.push(acc.geoBlockedUntil)
+      } else {
+        acc.geoBlockedUntil = undefined
+      }
+    }
 
-    if (st.cooldownUntil !== undefined && st.cooldownUntil > now) {
-      return st.cooldownUntil
-    }
-    if (st.fiveHour && st.fiveHour.remainingFraction <= 0) {
-      if (!st.fiveHour.resetAt || st.fiveHour.resetAt > now) {
-        return st.fiveHour.resetAt ?? now + this.baseCooldownMs
+    const st = acc.families.get(family)
+    if (st) {
+      if (st.cooldownUntil !== undefined && st.cooldownUntil > now) {
+        blocks.push(st.cooldownUntil)
+      }
+      if (st.fiveHour && st.fiveHour.remainingFraction <= 0) {
+        if (!st.fiveHour.resetAt || st.fiveHour.resetAt > now) {
+          blocks.push(st.fiveHour.resetAt ?? now + this.baseCooldownMs)
+        }
+      }
+      if (st.sevenDay && st.sevenDay.remainingFraction <= 0) {
+        if (!st.sevenDay.resetAt || st.sevenDay.resetAt > now) {
+          blocks.push(st.sevenDay.resetAt ?? now + this.maxCooldownMs)
+        }
       }
     }
-    if (st.sevenDay && st.sevenDay.remainingFraction <= 0) {
-      if (!st.sevenDay.resetAt || st.sevenDay.resetAt > now) {
-        return st.sevenDay.resetAt ?? now + this.maxCooldownMs
-      }
-    }
-    return null
+
+    return blocks.length > 0 ? Math.max(...blocks) : null
   }
 
   private effectiveRemainingQuota(acc: InternalAccountState, family: ModelFamily, now: number): number {

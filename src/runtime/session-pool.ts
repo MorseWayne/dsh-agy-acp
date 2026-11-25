@@ -1,6 +1,7 @@
 import { cancelled, policyKey, type SessionPolicy, type FilePolicy } from './permission-manager.ts'
 import { EventEmitter } from 'node:events'
 import { AcpClient, AcpProcessExitError, AcpTimeoutError } from '../acp/client.ts'
+import { isGeoUnsupportedError } from '../common/geo.ts'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import type {
   AcpConfigOption,
@@ -15,6 +16,7 @@ import type {
 } from '../acp/protocol.ts'
 import {
   PROVIDER_ID,
+  type AccountEgressSnapshot,
   type AccountHealthSnapshot,
   type AccountLease,
   type AccountProvider,
@@ -27,9 +29,16 @@ import {
 } from '../common/types.ts'
 
 import { AccountQuotaError, readAccountQuota, requireFileCredentialMode } from './account-quota.ts'
+import { EgressBlockedError, EgressGuard } from './egress-guard.ts'
 import { defaultEffort, sortedEfforts } from '../common/effort.ts'
 import { mapUsage } from '../acp/usage.ts'
 import { modelCatalog, selectOption, values } from './model-catalog.ts'
+
+export class EgressCheckError extends Error {
+  constructor(message: string, readonly status = 400) {
+    super(message)
+  }
+}
 
 export interface ManagedAcpSession {
   models: AcpModelOption[]
@@ -85,6 +94,10 @@ export class SingleAccountProvider implements AccountProvider {
     return { accountId: id, release: () => {} }
   }
 
+  getAccountEnv(): NodeJS.ProcessEnv | undefined {
+    return undefined
+  }
+
   getHealthSnapshots(): AccountHealthSnapshot[] {
     return [{ id: 'default', label: '本机默认账号', enabled: true, hasSandboxHome: false, hasProxy: false,
       activeLeases: this.leases, lastUsedAt: this.lastUsedAt, families: {}, lastError: null }]
@@ -103,6 +116,7 @@ export interface SessionPoolDeps {
   hasPersistedConfig?: () => boolean
   onSessionClosed?: (key: string) => void
   accountProvider?: AccountProvider
+  egressGuard?: EgressGuard
   getMcpServers?: (sessionKey: string) => Promise<AcpMcpServerSpec[]>
   log?: (msg: string) => void
 }
@@ -129,7 +143,9 @@ export class AcpSessionPool extends EventEmitter {
   private catalogSignature = ''
   private initResult: InitializeResult | null = null
   private readonly sessions = new Map<string, ManagedAcpSession>()
+  private readonly sessionEnvs = new Map<string, NodeJS.ProcessEnv | undefined>()
   private readonly accountProvider: AccountProvider
+  private readonly egressGuard: EgressGuard
   private cachedModels: AcpModelOption[] = []
   private readonly observedWindows = new Map<string, number>()
   private catalogExpiresAt = 0
@@ -147,10 +163,135 @@ export class AcpSessionPool extends EventEmitter {
   constructor(private readonly deps: SessionPoolDeps) {
     super()
     this.accountProvider = deps.accountProvider ?? new SingleAccountProvider(() => this.emitStatus())
+    this.egressGuard = deps.egressGuard ?? new EgressGuard({ log: deps.log })
     this.sweepTimer = setInterval(() => {
       void this.sweepIdleSessions()
     }, 60_000)
     this.sweepTimer.unref?.()
+  }
+
+  private accountLabel(accountId: string): string {
+    return this.accountProvider.getHealthSnapshots?.().find(a => a.id === accountId)?.label ?? accountId
+  }
+
+  private findActiveGeoBlockedError(): EgressBlockedError | null {
+    const mode = this.deps.getConfig().geoFenceMode
+    if (mode === 'off' || mode === 'warn') return null
+    const now = Date.now()
+    for (const acc of this.accountProvider.getHealthSnapshots?.() ?? []) {
+      if (!acc.enabled) continue
+      const env = this.accountProvider.getAccountEnv?.(acc.id)
+      const snap = this.egressGuard.getSnapshot(acc.id, env)
+      if (!snap || snap.expiresAt <= now) continue
+      if (snap.status === 'unsupported' || (mode === 'strict' && (snap.status === 'unknown' || snap.status === 'error'))) {
+        return new EgressBlockedError(acc.id, acc.label, snap)
+      }
+    }
+    return null
+  }
+
+  private async acquireAccountLease(
+    sessionKey: string,
+    model: string,
+    excludeAccountIds?: ReadonlySet<string>,
+  ): Promise<AccountLease> {
+    try {
+      return await this.accountProvider.acquire(sessionKey, model, excludeAccountIds)
+    } catch (err) {
+      if (err instanceof Error && /No healthy accounts available/i.test(err.message)) {
+        const geoErr = this.findActiveGeoBlockedError()
+        if (geoErr) throw geoErr
+      }
+      throw err
+    }
+  }
+
+  async assertEgressAllowed(
+    accountId: string,
+    env: NodeJS.ProcessEnv | undefined,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const mode = this.deps.getConfig().geoFenceMode
+    if (mode === 'off') return
+    const prev = this.egressGuard.getSnapshot(accountId, env)
+    try {
+      const snap = await this.egressGuard.assertAllowed({
+        accountId,
+        accountLabel: this.accountLabel(accountId),
+        env,
+        mode,
+        signal,
+      })
+      if (snap) {
+        if (snap.status === 'supported') {
+          this.accountProvider.clearGeoBlock?.(accountId)
+        }
+        if (!prev || prev.checkedAt !== snap.checkedAt || prev.status !== snap.status) {
+          this.emitStatus()
+        }
+      }
+    } catch (err) {
+      if (err instanceof EgressBlockedError) {
+        this.accountProvider.markGeoBlocked?.(accountId, err.snapshot.expiresAt, err.message)
+        this.emitStatus()
+      }
+      throw err
+    }
+  }
+
+  async checkAccountEgress(accountId?: string): Promise<void> {
+    if (this.disposed || !this.deps.getConfig().enabled) {
+      throw new EgressCheckError('ACP 插件未启用', 409)
+    }
+    const accounts = this.accountProvider.getHealthSnapshots?.() ?? []
+    const mode = this.deps.getConfig().geoFenceMode
+
+    const probeOne = async (id: string): Promise<AccountEgressSnapshot> => {
+      const env = this.accountProvider.getAccountEnv?.(id)
+      const snap = await this.egressGuard.check(id, env, { force: true, signal: this.lifetime.signal })
+      if (snap.status === 'supported') {
+        this.accountProvider.clearGeoBlock?.(id)
+      } else if (snap.status === 'unsupported' && mode !== 'off' && mode !== 'warn') {
+        this.accountProvider.markGeoBlocked?.(id, snap.expiresAt, snap.reason)
+      }
+      return snap
+    }
+
+    let anySupported = false
+    if (accountId !== undefined) {
+      const target = accounts.find(a => a.id === accountId)
+      if (!target) {
+        throw new EgressCheckError('未找到该账号', 404)
+      }
+      const snap = await probeOne(accountId)
+      anySupported = snap.status === 'supported'
+    } else {
+      const enabled = accounts.filter(a => a.enabled)
+      const results = await Promise.all(enabled.map(a => probeOne(a.id)))
+      anySupported = results.some(r => r.status === 'supported')
+    }
+
+    if (anySupported && this.lastError && (this.lastError.startsWith('[安全拦截]') || this.lastError.startsWith('[地域风控熔断]'))) {
+      this.lastError = null
+      if (this.cachedModels.length === 0) {
+        void this.refreshModels().catch(() => {})
+      }
+    }
+    this.emitStatus()
+  }
+
+  recordGeoRejection(accountId: string, env?: NodeJS.ProcessEnv): AccountEgressSnapshot {
+    const resolvedEnv = env ?? this.accountProvider.getAccountEnv?.(accountId)
+    const snap = this.egressGuard.recordGeoRejection(accountId, resolvedEnv, () => {
+      if (!this.disposed) this.emitStatus()
+    })
+    const mode = this.deps.getConfig().geoFenceMode
+    if (mode !== 'off' && mode !== 'warn') {
+      this.accountProvider.markGeoBlocked?.(accountId, snap.expiresAt, snap.reason)
+    }
+    this.lastError = `[地域风控熔断] 账号“${this.accountLabel(accountId)}”触发上游 Google 地域限制（400），已在本地熔断 60 秒；请切换至支持地区节点后点击「检测出口」。`
+    this.emitStatus()
+    return snap
   }
 
   notifyStatusChange(): void {
@@ -173,10 +314,16 @@ export class AcpSessionPool extends EventEmitter {
   }
 
   getAccountHealthSnapshots(): AccountHealthSnapshot[] {
-    return (this.accountProvider.getHealthSnapshots?.() ?? []).map(account => ({
-      ...account, quota: this.quotaSamples.get(account.id),
-      quotaRefreshUnavailable: !this.deps.getConfig().enabled ? 'ACP 插件未启用' : account.quotaRefreshUnavailable,
-    }))
+    return (this.accountProvider.getHealthSnapshots?.() ?? []).map(account => {
+      const env = this.accountProvider.getAccountEnv?.(account.id)
+      const egress = this.egressGuard.getSnapshot(account.id, env)
+      return {
+        ...account,
+        ...(egress ? { egress } : {}),
+        quota: this.quotaSamples.get(account.id),
+        quotaRefreshUnavailable: !this.deps.getConfig().enabled ? 'ACP 插件未启用' : account.quotaRefreshUnavailable,
+      }
+    })
   }
 
   /** Manual observation only: never acquire a scheduler-selected fallback or change local cooldowns. */
@@ -203,6 +350,14 @@ export class AcpSessionPool extends EventEmitter {
     try {
       signal.throwIfAborted()
       if (lease.accountId !== id) throw new AccountQuotaError('账号环境不匹配，未查询配额', 409)
+      try {
+        await this.assertEgressAllowed(lease.accountId, lease.env, signal)
+      } catch (err) {
+        if (err instanceof EgressBlockedError) {
+          throw new AccountQuotaError(err.message, 451)
+        }
+        throw err
+      }
       const policy: FilePolicy = { sessionId: '__quota__', mode: 'read-only', workspaceRoot: cwd }
       if (lease.requiresFileCredentialMode) {
         const versionArgv = await this.deps.prepareArgv([bin, '--version'], policy, signal)
@@ -303,6 +458,7 @@ export class AcpSessionPool extends EventEmitter {
         mcpBridge: cfg.mcpBridge,
         sessionIdleTtlMs: cfg.sessionIdleTtlMs,
         requestTimeoutMs: cfg.requestTimeoutMs,
+        geoFenceMode: cfg.geoFenceMode,
       },
       hasPersistedConfig: this.deps.hasPersistedConfig?.() ?? false,
       lastError: this.lastError,
@@ -387,6 +543,8 @@ export class AcpSessionPool extends EventEmitter {
     const existing = this.sessions.get(key)
     const current = this.clients.get(key)
     if (existing && current?.isRunning && !exclude?.has(existing.accountId) && this.policies.get(key) === fingerprint) {
+      const existingEnv = this.sessionEnvs.get(key) ?? this.accountProvider.getAccountEnv?.(existing.accountId)
+      await this.assertEgressAllowed(existing.accountId, existingEnv, this.lifetime.signal)
       existing.lastActiveAt = Date.now()
       return { client: current, session: existing, created: false }
     }
@@ -398,7 +556,9 @@ export class AcpSessionPool extends EventEmitter {
     let lease: AccountLease | undefined
     let client: AcpClient | undefined
     try {
-      lease = await this.accountProvider.acquire(key, model, exclude)
+      lease = await this.acquireAccountLease(key, model, exclude)
+      opening.signal.throwIfAborted()
+      await this.assertEgressAllowed(lease.accountId, lease.env, opening.signal)
       opening.signal.throwIfAborted()
       const launched = await this.newClient(
         policy,
@@ -414,6 +574,7 @@ export class AcpSessionPool extends EventEmitter {
           this.deps.log?.(`agy acp session "${key}" exited unexpectedly (code=${String(code)}, signal=${String(signal)})`)
           this.clients.delete(key)
           this.sessions.delete(key)
+          this.sessionEnvs.delete(key)
           this.policies.delete(key)
           const activeTurn = this.active.get(key)
           if (activeTurn) {
@@ -455,6 +616,7 @@ export class AcpSessionPool extends EventEmitter {
       }
       this.clients.set(key, client)
       this.sessions.set(key, session)
+      this.sessionEnvs.set(key, lease.env)
       this.policies.set(key, fingerprint)
       this.emitStatus()
       return { client, session, created: true }
@@ -482,127 +644,155 @@ export class AcpSessionPool extends EventEmitter {
     cwd = cwd || cfg.workspaceRoot || process.cwd()
 
     const requestedModel = params.model || cfg.defaultModel || ''
-    const lease = await this.accountProvider.acquire('__auxiliary__', requestedModel)
-    let client: AcpClient | undefined
-    let acpSessionId: string | undefined
-    let unsub: (() => void) | undefined
-    const onAbort = (): void => {
-      if (acpSessionId && client?.isRunning) client.sessionCancel(acpSessionId)
-    }
+    const maxAccounts = Math.max(1, cfg.accounts.filter((a) => a.enabled !== false).length || 1)
+    const triedAccounts = new Set<string>()
 
     const denyAllPermissions = async (req: RequestPermissionParams): Promise<RequestPermissionResult> => {
       const reject = req.options.find(o => o.kind === 'reject_once')
       return reject ? { outcome: { outcome: 'selected', optionId: reject.optionId } } : cancelled()
     }
 
-    try {
-      runSignal.throwIfAborted()
-      const launched = await this.newClient(
-        { sessionId: '__auxiliary__', mode: 'read-only', workspaceRoot: cwd },
-        lease.env,
-        runSignal,
-        denyAllPermissions,
+    for (let attempt = 0; attempt < maxAccounts; attempt++) {
+      const lease = await this.acquireAccountLease(
+        '__auxiliary__',
+        requestedModel,
+        triedAccounts.size > 0 ? triedAccounts : undefined,
       )
-      client = launched.client
-      const supportsAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
-      runSignal.throwIfAborted()
-
-      const res = await client.sessionNew({
-        cwd,
-        mcpServers: [],
-        ...(supportsAppend && params.systemPromptAppend
-          ? { _meta: { antigravity: { systemPrompt: { append: params.systemPromptAppend } } } }
-          : {}),
-      })
-      acpSessionId = res.sessionId
-      runSignal.throwIfAborted()
-
-      let configOptions = res.configOptions ?? []
-      const modeOpt = selectOption(configOptions, 'mode')
-      let currentMode = modeOpt?.currentValue ?? res.modes?.currentModeId ?? ''
-      if (currentMode !== 'default') {
-        const canSetDefault =
-          values(modeOpt).some(o => o.value === 'default') ||
-          Boolean(res.modes?.availableModes?.some(m => m.id === 'default'))
-        if (canSetDefault) {
-          const modeRes = await client.sessionSetConfigOption({
-            sessionId: acpSessionId,
-            configId: modeOpt?.id ?? 'mode',
-            value: 'default',
-          })
-          if (modeRes.configOptions) configOptions = modeRes.configOptions
-          currentMode = modeRes.configOptions ? (findCurrentOption(modeRes.configOptions, 'mode') ?? '') : 'default'
-        }
-        if (currentMode !== 'default' && currentMode !== 'plan' && currentMode !== '') {
-          throw new Error(`Antigravity auxiliary call refused unsafe permission mode "${currentMode}"`)
-        }
+      let client: AcpClient | undefined
+      let acpSessionId: string | undefined
+      let unsub: (() => void) | undefined
+      const onAbort = (): void => {
+        if (acpSessionId && client?.isRunning) client.sessionCancel(acpSessionId)
       }
 
-      const { routes } = modelCatalog(res)
-      let currentModel = findCurrentOption(configOptions, 'model') ?? res.models?.currentModelId ?? ''
-      if (requestedModel) {
-        const route = routes.get(requestedModel)
-        const targetModel = route?.value ?? requestedModel
-        if (targetModel && targetModel !== currentModel) {
-          if (route?.kind === 'legacy') {
-            await client.request('session/set_model', { sessionId: acpSessionId, modelId: targetModel }, 15_000)
-            currentModel = targetModel
-          } else if (route?.kind === 'config' || values(selectOption(configOptions, 'model')).some(o => o.value === targetModel)) {
-            const mRes = await client.sessionSetConfigOption({
+      try {
+        runSignal.throwIfAborted()
+        await this.assertEgressAllowed(lease.accountId, lease.env, runSignal)
+        runSignal.throwIfAborted()
+        const launched = await this.newClient(
+          { sessionId: '__auxiliary__', mode: 'read-only', workspaceRoot: cwd },
+          lease.env,
+          runSignal,
+          denyAllPermissions,
+        )
+        client = launched.client
+        const supportsAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
+        runSignal.throwIfAborted()
+
+        const res = await client.sessionNew({
+          cwd,
+          mcpServers: [],
+          ...(supportsAppend && params.systemPromptAppend
+            ? { _meta: { antigravity: { systemPrompt: { append: params.systemPromptAppend } } } }
+            : {}),
+        })
+        acpSessionId = res.sessionId
+        runSignal.throwIfAborted()
+
+        let configOptions = res.configOptions ?? []
+        const modeOpt = selectOption(configOptions, 'mode')
+        let currentMode = modeOpt?.currentValue ?? res.modes?.currentModeId ?? ''
+        if (currentMode !== 'default') {
+          const canSetDefault =
+            values(modeOpt).some(o => o.value === 'default') ||
+            Boolean(res.modes?.availableModes?.some(m => m.id === 'default'))
+          if (canSetDefault) {
+            const modeRes = await client.sessionSetConfigOption({
               sessionId: acpSessionId,
-              configId: selectOption(configOptions, 'model')?.id ?? 'model',
-              value: targetModel,
+              configId: modeOpt?.id ?? 'mode',
+              value: 'default',
             })
-            if (mRes.configOptions) configOptions = mRes.configOptions
-            currentModel = mRes.configOptions ? (findCurrentOption(mRes.configOptions, 'model') ?? targetModel) : targetModel
+            if (modeRes.configOptions) configOptions = modeRes.configOptions
+            currentMode = modeRes.configOptions ? (findCurrentOption(modeRes.configOptions, 'mode') ?? '') : 'default'
+          }
+          if (currentMode !== 'default' && currentMode !== 'plan' && currentMode !== '') {
+            throw new Error(`Antigravity auxiliary call refused unsafe permission mode "${currentMode}"`)
           }
         }
-      }
 
-      if (params.effort) {
-        const thoughtOpt = selectOption(configOptions, 'thought_level')
-        if (thoughtOpt && values(thoughtOpt).some(o => o.value === params.effort) && thoughtOpt.currentValue !== params.effort) {
-          const eRes = await client.sessionSetConfigOption({
-            sessionId: acpSessionId,
-            configId: thoughtOpt.id,
-            value: params.effort,
-          })
-          if (eRes.configOptions) configOptions = eRes.configOptions
+        const { routes } = modelCatalog(res)
+        let currentModel = findCurrentOption(configOptions, 'model') ?? res.models?.currentModelId ?? ''
+        if (requestedModel) {
+          const route = routes.get(requestedModel)
+          const targetModel = route?.value ?? requestedModel
+          if (targetModel && targetModel !== currentModel) {
+            if (route?.kind === 'legacy') {
+              await client.request('session/set_model', { sessionId: acpSessionId, modelId: targetModel }, 15_000)
+              currentModel = targetModel
+            } else if (route?.kind === 'config' || values(selectOption(configOptions, 'model')).some(o => o.value === targetModel)) {
+              const mRes = await client.sessionSetConfigOption({
+                sessionId: acpSessionId,
+                configId: selectOption(configOptions, 'model')?.id ?? 'model',
+                value: targetModel,
+              })
+              if (mRes.configOptions) configOptions = mRes.configOptions
+              currentModel = mRes.configOptions ? (findCurrentOption(mRes.configOptions, 'model') ?? targetModel) : targetModel
+            }
+          }
         }
-      }
 
-      if (params.onUpdate) {
-        unsub = client.onSessionUpdate(acpSessionId, params.onUpdate)
-      }
-      runSignal.addEventListener('abort', onAbort, { once: true })
-      runSignal.throwIfAborted()
+        if (params.effort) {
+          const thoughtOpt = selectOption(configOptions, 'thought_level')
+          if (thoughtOpt && values(thoughtOpt).some(o => o.value === params.effort) && thoughtOpt.currentValue !== params.effort) {
+            const eRes = await client.sessionSetConfigOption({
+              sessionId: acpSessionId,
+              configId: thoughtOpt.id,
+              value: params.effort,
+            })
+            if (eRes.configOptions) configOptions = eRes.configOptions
+          }
+        }
 
-      const promptBlocks = supportsAppend ? params.prompt : [params.systemFallbackBlock, ...params.prompt]
-      const timeoutMs = params.timeoutMs ?? Math.min(cfg.requestTimeoutMs, 90_000)
-      const result = await client.sessionPrompt({ sessionId: acpSessionId, prompt: promptBlocks }, timeoutMs)
-      this.reportAccountSuccess(lease.accountId, requestedModel)
-      this.recordTurnUsage(result.usage)
-      return result
-    } catch (err) {
-      this.reportAccountFailure(lease.accountId, requestedModel, err)
-      throw err
-    } finally {
-      runSignal.removeEventListener('abort', onAbort)
-      unsub?.()
-      if (acpSessionId && client?.isRunning && !runSignal.aborted) {
-        let timer: ReturnType<typeof setTimeout> | undefined
-        await Promise.race([
-          client.sessionClose(acpSessionId).catch(() => {}),
-          new Promise<void>(resolve => {
-            timer = setTimeout(resolve, 1_000)
-            timer.unref?.()
-          }),
-        ])
-        if (timer) clearTimeout(timer)
+        if (params.onUpdate) {
+          unsub = client.onSessionUpdate(acpSessionId, params.onUpdate)
+        }
+        runSignal.addEventListener('abort', onAbort, { once: true })
+        runSignal.throwIfAborted()
+
+        const promptBlocks = supportsAppend ? params.prompt : [params.systemFallbackBlock, ...params.prompt]
+        const timeoutMs = params.timeoutMs ?? Math.min(cfg.requestTimeoutMs, 90_000)
+        const result = await client.sessionPrompt({ sessionId: acpSessionId, prompt: promptBlocks }, timeoutMs)
+        this.reportAccountSuccess(lease.accountId, requestedModel)
+        this.recordTurnUsage(result.usage)
+        return result
+      } catch (err) {
+        if (err instanceof EgressBlockedError) {
+          triedAccounts.add(lease.accountId)
+          if (triedAccounts.size < maxAccounts && !runSignal.aborted) {
+            continue
+          }
+          throw err
+        }
+        if (isGeoUnsupportedError(err)) {
+          this.recordGeoRejection(lease.accountId, lease.env)
+          triedAccounts.add(lease.accountId)
+          this.reportAccountFailure(lease.accountId, requestedModel, err)
+          if (triedAccounts.size < maxAccounts && !runSignal.aborted) {
+            continue
+          }
+          throw err
+        }
+        this.reportAccountFailure(lease.accountId, requestedModel, err)
+        throw err
+      } finally {
+        runSignal.removeEventListener('abort', onAbort)
+        unsub?.()
+        if (acpSessionId && client?.isRunning && !runSignal.aborted) {
+          let timer: ReturnType<typeof setTimeout> | undefined
+          await Promise.race([
+            client.sessionClose(acpSessionId).catch(() => {}),
+            new Promise<void>(resolve => {
+              timer = setTimeout(resolve, 1_000)
+              timer.unref?.()
+            }),
+          ])
+          if (timer) clearTimeout(timer)
+        }
+        client?.dispose()
+        lease.release()
       }
-      client?.dispose()
-      lease.release()
     }
+    throw new Error('Auxiliary prompt exhausted all candidate accounts')
   }
 
   async syncSessionOptions(
@@ -687,7 +877,8 @@ export class AcpSessionPool extends EventEmitter {
         // A failed group is cached by DSH's menu just like a successful group. Retry
         // the constrained discovery, then publish its recovery without requiring a chat turn.
         this.lastError = formatCatalogProbeError(err)
-        const delay = [5_000, 30_000, 60_000][this.catalogRetryCount]
+        const isGeoBlocked = err instanceof EgressBlockedError || isGeoUnsupportedError(err)
+        const delay = isGeoBlocked ? undefined : [5_000, 30_000, 60_000][this.catalogRetryCount]
         if (delay !== undefined && !this.catalogRetry) {
           this.catalogRetryCount++
           this.catalogRetry = setTimeout(() => {
@@ -731,26 +922,55 @@ export class AcpSessionPool extends EventEmitter {
   }
 
   private async probeCatalog(cwd?: string, expectedGen?: number): Promise<AcpModelOption[]> {
-    const lease = await this.accountProvider.acquire('__catalog__', '')
-    let client: AcpClient | undefined
-    try {
-      const root = cwd || this.deps.getConfig().workspaceRoot || process.cwd()
-      // No initiating agent: never prompt, attach MCP, or start an unrestricted helper.
-      client = (await this.newClient({ sessionId: '__catalog__', workspaceRoot: root, mode: 'read-only' }, lease.env, this.lifetime.signal)).client
-      this.lifetime.signal.throwIfAborted()
-      const stop = () => client?.dispose()
-      this.lifetime.signal.addEventListener('abort', stop, { once: true })
+    const cfg = this.deps.getConfig()
+    const maxAccounts = Math.max(1, cfg.accounts.filter((a) => a.enabled !== false).length || 1)
+    const triedAccounts = new Set<string>()
+    for (let attempt = 0; attempt < maxAccounts; attempt++) {
+      const lease = await this.acquireAccountLease(
+        '__catalog__',
+        '',
+        triedAccounts.size > 0 ? triedAccounts : undefined,
+      )
+      let client: AcpClient | undefined
       try {
-        const res = await client.sessionNew({ cwd: root, mcpServers: [] })
-        if (expectedGen !== undefined && expectedGen !== this.catalogGeneration) {
-          return this.cachedModels
+        await this.assertEgressAllowed(lease.accountId, lease.env, this.lifetime.signal)
+        const root = cwd || cfg.workspaceRoot || process.cwd()
+        // No initiating agent: never prompt, attach MCP, or start an unrestricted helper.
+        client = (await this.newClient({ sessionId: '__catalog__', workspaceRoot: root, mode: 'read-only' }, lease.env, this.lifetime.signal)).client
+        this.lifetime.signal.throwIfAborted()
+        const stop = () => client?.dispose()
+        this.lifetime.signal.addEventListener('abort', stop, { once: true })
+        try {
+          const res = await client.sessionNew({ cwd: root, mcpServers: [] })
+          if (expectedGen !== undefined && expectedGen !== this.catalogGeneration) {
+            return this.cachedModels
+          }
+          const catalog = this.captureCatalogFromSession(res)
+          if (!catalog.models.length) throw new Error('agy returned an empty ACP model catalog')
+        } finally {
+          this.lifetime.signal.removeEventListener('abort', stop)
         }
-        const catalog = this.captureCatalogFromSession(res)
-        if (!catalog.models.length) throw new Error('agy returned an empty ACP model catalog')
+        return this.cachedModels
+      } catch (err) {
+        if (err instanceof EgressBlockedError) {
+          triedAccounts.add(lease.accountId)
+          if (triedAccounts.size < maxAccounts && !this.lifetime.signal.aborted) {
+            continue
+          }
+        } else if (isGeoUnsupportedError(err)) {
+          this.recordGeoRejection(lease.accountId, lease.env)
+          triedAccounts.add(lease.accountId)
+          if (triedAccounts.size < maxAccounts && !this.lifetime.signal.aborted) {
+            continue
+          }
+        }
+        throw err
+      } finally {
+        client?.dispose()
+        lease.release()
       }
-      finally { this.lifetime.signal.removeEventListener('abort', stop) }
-      return this.cachedModels
-    } finally { client?.dispose(); lease.release() }
+    }
+    return this.cachedModels
   }
 
   invalidate(key: string): void {
@@ -760,6 +980,7 @@ export class AcpSessionPool extends EventEmitter {
     this.active.get(key)?.settle()
     this.active.delete(key)
     this.sessions.delete(key)
+    this.sessionEnvs.delete(key)
     this.policies.delete(key)
     const client = this.clients.get(key)
     this.clients.delete(key)
@@ -794,6 +1015,7 @@ export class AcpSessionPool extends EventEmitter {
     this.disposed = true
     clearTimeout(this.catalogRetry)
     this.lifetime.abort()
+    this.egressGuard.dispose()
     void this.resetAllSessions()
     this.accountProvider.dispose?.()
     this.removeAllListeners()
@@ -830,6 +1052,12 @@ function findCurrentOption(options: AcpConfigOption[], id: string): string | und
 }
 
 export function formatCatalogProbeError(err: unknown): string {
+  if (err instanceof EgressBlockedError) {
+    return sanitizeDiagnosticText(err.message, 260)
+  }
+  if (isGeoUnsupportedError(err)) {
+    return '[地域限制熔断] ACP 模型目录探测被上游 Google 地域限制（400）拒绝，已暂停自动重试；请切换至支持地区节点后点击「检测出口」或「重新探测目录」。'
+  }
   if (err instanceof AcpTimeoutError) {
     return err.stderrTail
       ? `ACP 模型目录探测超时，请检查 agy CLI 登录状态或网络连接（${err.stderrTail}）`

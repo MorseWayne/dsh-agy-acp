@@ -12,6 +12,7 @@ import { AcpProcessExitError, AcpRpcError, AcpTimeoutError } from '../acp/client
 import type { AcpToolCallUpdate } from '../acp/protocol.ts'
 import { mapUsage } from '../acp/usage.ts'
 import { defaultEffort, effortLabel } from '../common/effort.ts'
+import { isGeoUnsupportedError } from '../common/geo.ts'
 import {
   MIRROR_TOOL_NAME,
   PROVIDER_ID,
@@ -19,7 +20,8 @@ import {
   type PluginConfig,
 } from '../common/types.ts'
 import { isQuotaOrRateLimitError } from '../runtime/account-pool.ts'
-import type { AcpSessionPool } from '../runtime/session-pool.ts'
+import { EgressBlockedError } from '../runtime/egress-guard.ts'
+import type { AcpSessionPool, ManagedAcpSession } from '../runtime/session-pool.ts'
 import { compactDisplayInput } from './mirror-tool.ts'
 import {
   buildAuxiliaryPromptBlocks,
@@ -136,23 +138,59 @@ export class AcpAdapter extends LlmAdapter {
       }
     }
 
-    // 2. Fresh turn over persistent ACP session (with automatic 429 failover + 1x pre-output crash recovery).
+    // 2. Fresh turn over persistent ACP session (with automatic 429/geo failover + 1x pre-output crash recovery).
     const cwd = this.deps.pool.policy(sessionKey).workspaceRoot
     const requestedModel = options.model || cfg.defaultModel || ''
     const preparedSystem = prepareSystemPrompt(options.system)
     const triedAccounts = new Set<string>()
     let crashRetried = false
+    let lastEgressBlockedError: EgressBlockedError | null = null
     const maxAccounts = Math.max(1, cfg.accounts.filter((a) => a.enabled !== false).length || 1)
     const maxIterations = maxAccounts + 2
 
     for (let iter = 0; iter < maxIterations; iter++) {
-      const { client, session, created } = await this.deps.pool.getOrCreateSession(
-        sessionKey,
-        cwd,
-        requestedModel,
-        triedAccounts.size > 0 ? triedAccounts : undefined,
-        preparedSystem ?? undefined,
-      )
+      let client: Awaited<ReturnType<AcpSessionPool['getOrCreateSession']>>['client']
+      let session: ManagedAcpSession
+      let created: boolean
+      try {
+        ;({ client, session, created } = await this.deps.pool.getOrCreateSession(
+          sessionKey,
+          cwd,
+          requestedModel,
+          triedAccounts.size > 0 ? triedAccounts : undefined,
+          preparedSystem ?? undefined,
+        ))
+      } catch (err) {
+        if (err instanceof EgressBlockedError && !options.signal?.aborted) {
+          lastEgressBlockedError = err
+          triedAccounts.add(err.accountId)
+          if (triedAccounts.size < maxAccounts) {
+            this.deps.log?.(
+              `account "${err.accountId}" blocked by local egress geo-fence, failing over (${triedAccounts.size}/${maxAccounts} tried)`,
+            )
+            continue
+          }
+          yield {
+            type: 'finish',
+            reason: {
+              kind: 'error',
+              failure: { code: 'ACP_ERROR', message: err.message },
+            },
+          }
+          return
+        }
+        if (lastEgressBlockedError && err instanceof Error && /No healthy accounts available/i.test(err.message)) {
+          yield {
+            type: 'finish',
+            reason: {
+              kind: 'error',
+              failure: { code: 'ACP_ERROR', message: lastEgressBlockedError.message },
+            },
+          }
+          return
+        }
+        throw err
+      }
 
       const targetModel = requestedModel || session.currentModel
       const policy = this.deps.pool.policy(sessionKey)
@@ -234,12 +272,23 @@ export class AcpAdapter extends LlmAdapter {
           rec.finish(res.stopReason, res.usage)
         })
         .catch((err: unknown) => {
-          const error = err instanceof Error ? err : new Error(String(err))
-          this.deps.pool.reportAccountFailure(session.accountId, targetModel, error)
+          const isCleanRpcError = err instanceof AcpRpcError
+          let error = err instanceof Error ? err : new Error(String(err))
+          if (isGeoUnsupportedError(error)) {
+            const snap = this.deps.pool.recordGeoRejection(session.accountId)
+            this.deps.pool.reportAccountFailure(session.accountId, targetModel, error)
+            const regionHint = snap.country ? `（当前检测地区：${snap.country}）` : ''
+            error = new LlmError(
+              `[地域限制熔断] 上游 Google API 拒绝了当前网络出口地域（400 FAILED_PRECONDITION）${regionHint}。已在本地立即熔断该账号出口 60 秒以防连续请求触发风控；请切换至 US / JP / SG / TW 等支持区域节点后，在控制台点击「检测出口」恢复。`,
+              'ACP_GEO_UNSUPPORTED',
+            )
+          } else {
+            this.deps.pool.reportAccountFailure(session.accountId, targetModel, error)
+          }
           // Preserve healthy persistent processes on clean JSON-RPC application errors (`AcpRpcError`).
           // Invalidate on timeout, process crash, transport failure, or dead child.
           const shouldInvalidate =
-            !client.isRunning || error instanceof AcpTimeoutError || !(error instanceof AcpRpcError)
+            !client.isRunning || err instanceof AcpTimeoutError || !isCleanRpcError
           if (shouldInvalidate && this.deps.pool.owns(session)) {
             this.deps.pool.invalidate(sessionKey)
           }
@@ -250,14 +299,17 @@ export class AcpAdapter extends LlmAdapter {
           cleanupTurn()
         })
 
-      // Peek first item before yielding so quota/429 failover and pre-output crash recovery stay seamless.
+      // Peek first item before yielding so quota/429/geo failover and pre-output crash recovery stay seamless.
       const firstItem = await rec.waitFor(0, options.signal)
       if (firstItem?.kind === 'error' && !options.signal?.aborted) {
-        if (isQuotaOrRateLimitError(firstItem.error)) {
+        const isGeoErr =
+          isGeoUnsupportedError(firstItem.error) ||
+          (firstItem.error instanceof LlmError && firstItem.error.code === 'ACP_GEO_UNSUPPORTED')
+        if (isQuotaOrRateLimitError(firstItem.error) || isGeoErr) {
           triedAccounts.add(session.accountId)
           if (triedAccounts.size < maxAccounts) {
             this.deps.log?.(
-              `account "${session.accountId}" hit quota/rate-limit on "${targetModel}", failing over (${triedAccounts.size}/${maxAccounts} tried)`,
+              `account "${session.accountId}" hit ${isGeoErr ? 'geo-restriction' : 'quota/rate-limit'} on "${targetModel}", failing over (${triedAccounts.size}/${maxAccounts} tried)`,
             )
             await this.deps.pool.closeSession(sessionKey)
             continue
@@ -311,7 +363,13 @@ export class AcpAdapter extends LlmAdapter {
         rec.finish(res.stopReason, res.usage)
       })
       .catch((err: unknown) => {
-        const error = err instanceof Error ? err : new Error(String(err))
+        let error = err instanceof Error ? err : new Error(String(err))
+        if (isGeoUnsupportedError(error)) {
+          error = new LlmError(
+            '[地域限制熔断] 上游 Google API 拒绝了当前网络出口地域（400 FAILED_PRECONDITION）。已在本地熔断该账号出口 60 秒；请切换至支持区域节点后重试。',
+            'ACP_GEO_UNSUPPORTED',
+          )
+        }
         rec.fail(error)
       })
       .finally(() => {

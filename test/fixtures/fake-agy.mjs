@@ -529,6 +529,18 @@ async function handleRequest(id, method, params) {
       return
     }
 
+    if (process.env.FAKE_FORCE_GEO_400 === '1' || promptText.includes('FORCE_GEO_400')) {
+      send({
+        jsonrpc: '2.0',
+        id,
+        error: {
+          code: 400,
+          message: 'FAILED_PRECONDITION (code 400): User location is not supported for the API use.',
+        },
+      })
+      return
+    }
+
     // Default multi-turn echo
     const acctPrefix = process.env.FAKE_ACCOUNT_TAG ? `<${process.env.FAKE_ACCOUNT_TAG}> ` : ''
     sendUpdate(sessionId, {

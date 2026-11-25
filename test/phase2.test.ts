@@ -8,6 +8,7 @@ import test from 'node:test'
 import { resolveConfig } from '../src/common/config.ts'
 import { MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME } from '../src/common/types.ts'
 import { ReverseMcpBridge } from '../src/mcp/server.ts'
+import { EgressGuard } from '../src/runtime/egress-guard.ts'
 import { AcpSessionPool } from '../src/runtime/session-pool.ts'
 import { registerAcpRoutes, type WebServerLike } from '../src/transport/sse.ts'
 
@@ -255,6 +256,130 @@ test('HTTP config save/reset and models/refresh validate input, isolate disk fai
     assert.match(refreshFailJson.error, /probe down/)
     assert.ok(refreshFailJson.status.models.length > 0)
     assert.ok(refreshFailJson.status.lastError)
+  } finally {
+    disposeRoutes()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    pool.dispose()
+  }
+})
+
+test('HTTP accounts/egress/check enforces JSON Content-Type, validates accountId, rechecks single/all accounts, and pushes SSE', async () => {
+  let probeCountry = 'HK'
+  let probeCount = 0
+  let cfg = resolveConfig({ geoFenceMode: 'block' })
+  const sseEvents: unknown[] = []
+
+  const pool = new AcpSessionPool({
+    ...fakeHost,
+    egressGuard: new EgressGuard({
+      probeFn: async () => {
+        probeCount++
+        return {
+          status: probeCountry === 'HK' ? 'unsupported' : 'supported',
+          country: probeCountry,
+          ipMasked: '203.0.113.*',
+          proxyMode: 'proxy',
+          probeSource: 'test-probe',
+        }
+      },
+    }),
+    getConfig: () => cfg,
+    resolveBin: () => null,
+    onConfigPatch: (patch) => {
+      cfg = { ...cfg, ...patch }
+    },
+  })
+  pool.on('status', (s) => sseEvents.push(s))
+
+  const routes = new Map<string, (req: IncomingMessage, res: ServerResponse) => void | Promise<void>>()
+  const webServer: WebServerLike = {
+    route(method, routePath, handler) {
+      routes.set(`${method} ${routePath}`, handler)
+      return () => routes.delete(`${method} ${routePath}`)
+    },
+  }
+  const disposeRoutes = registerAcpRoutes(webServer, pool)
+  const server = createServer((req, res) => {
+    const handler = routes.get(`${req.method ?? 'GET'} ${req.url ?? '/'}`)
+    if (!handler) {
+      res.writeHead(404)
+      res.end('Not found')
+      return
+    }
+    void handler(req, res)
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+  const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+
+  try {
+    // 1. Missing Content-Type -> 415
+    assert.equal(
+      (await fetch(`${baseUrl}/plugins/agy-acp/accounts/egress/check`, { method: 'POST', body: '{}' })).status,
+      415,
+    )
+
+    // 2. Unknown accountId -> 404; empty string accountId -> 400
+    assert.equal(
+      (await fetch(`${baseUrl}/plugins/agy-acp/accounts/egress/check`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accountId: 'non-existent' }),
+      })).status,
+      404,
+    )
+    assert.equal(
+      (await fetch(`${baseUrl}/plugins/agy-acp/accounts/egress/check`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accountId: '   ' }),
+      })).status,
+      400,
+    )
+
+    // 3. Single account check returns 200 even when egress is HK (status reflected in accounts[].egress)
+    const hkCheck = await fetch(`${baseUrl}/plugins/agy-acp/accounts/egress/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountId: 'default' }),
+    })
+    assert.equal(hkCheck.status, 200)
+    const hkJson = await hkCheck.json() as { ok: boolean; status: { accounts: Array<{ egress?: { status: string; country: string } }> } }
+    assert.equal(hkJson.ok, true)
+    assert.equal(hkJson.status.accounts[0]?.egress?.status, 'unsupported')
+    assert.equal(hkJson.status.accounts[0]?.egress?.country, 'HK')
+    assert.equal(probeCount, 1)
+
+    // 4. All-accounts force check bypasses cache and updates to US + emits SSE status
+    probeCountry = 'US'
+    const eventsBefore = sseEvents.length
+    const allCheck = await fetch(`${baseUrl}/plugins/agy-acp/accounts/egress/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+    assert.equal(allCheck.status, 200)
+    const allJson = await allCheck.json() as { status: { accounts: Array<{ egress?: { status: string; country: string } }> } }
+    assert.equal(allJson.status.accounts[0]?.egress?.status, 'supported')
+    assert.equal(allJson.status.accounts[0]?.egress?.country, 'US')
+    assert.equal(probeCount, 2)
+    assert.ok(sseEvents.length > eventsBefore)
+
+    // 5. Persisting geoFenceMode via POST /plugins/agy-acp/config
+    const badGeo = await fetch(`${baseUrl}/plugins/agy-acp/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ geoFenceMode: 'bad' }),
+    })
+    assert.equal(badGeo.status, 400)
+
+    const okGeo = await fetch(`${baseUrl}/plugins/agy-acp/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ geoFenceMode: 'strict' }),
+    })
+    assert.equal(okGeo.status, 200)
+    const okGeoJson = await okGeo.json() as { status: { config: { geoFenceMode: string } } }
+    assert.equal(okGeoJson.status.config.geoFenceMode, 'strict')
   } finally {
     disposeRoutes()
     await new Promise<void>((resolve) => server.close(() => resolve()))

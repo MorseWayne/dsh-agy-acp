@@ -10,7 +10,8 @@ import {
   SESSION_IDLE_TTL_MIN_MS,
 } from '../common/config.ts'
 import { effortLabel, sortedEfforts } from '../common/effort.ts'
-import type { SessionSummary, StatusSnapshot } from '../common/types.ts'
+import { isGeoFenceMode } from '../common/geo.ts'
+import type { GeoFenceMode, SessionSummary, StatusSnapshot } from '../common/types.ts'
 import { AccountCard } from './account-card.ts'
 import { sessionAccountLabel } from './account-display.ts'
 import { snapshotNotice, type SnapshotState } from './snapshot-state.ts'
@@ -119,6 +120,7 @@ function AgyAcpSettingsSection(): unknown {
 
 interface FormBaseline {
   mcpBridge: boolean
+  geoFenceMode: GeoFenceMode
   defaultModel: string
   defaultEffort: string
   agyBin: string
@@ -128,8 +130,10 @@ interface FormBaseline {
 }
 
 function baselineFromStatus(status: StatusSnapshot): FormBaseline {
+  const rawMode = status.config?.geoFenceMode
   return {
     mcpBridge: Boolean(status.config?.mcpBridge),
+    geoFenceMode: isGeoFenceMode(rawMode) ? rawMode : 'block',
     defaultModel: status.config?.defaultModel ?? '',
     defaultEffort: status.config?.defaultEffort ?? '',
     agyBin: status.config?.agyBin ?? '',
@@ -147,6 +151,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
   const initialBase = status ? baselineFromStatus(status) : null
   const [baseline, setBaseline] = React.useState(initialBase as FormBaseline | null)
   const [mcpBridge, setMcpBridge] = React.useState(initialBase?.mcpBridge ?? false)
+  const [geoFenceMode, setGeoFenceMode] = React.useState(initialBase?.geoFenceMode ?? ('block' as GeoFenceMode))
   const [defaultModel, setDefaultModel] = React.useState(initialBase?.defaultModel ?? '')
   const [defaultEffort, setDefaultEffort] = React.useState(initialBase?.defaultEffort ?? '')
   const [agyBin, setAgyBin] = React.useState(initialBase?.agyBin ?? '')
@@ -157,6 +162,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
   const syncFormTo = React.useCallback((nextBase: FormBaseline) => {
     setBaseline(nextBase)
     setMcpBridge(nextBase.mcpBridge)
+    setGeoFenceMode(nextBase.geoFenceMode)
     setDefaultModel(nextBase.defaultModel)
     setDefaultEffort(nextBase.defaultEffort)
     setAgyBin(nextBase.agyBin)
@@ -174,6 +180,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
     }
     const isCurrentlyClean =
       mcpBridge === baseline.mcpBridge &&
+      geoFenceMode === baseline.geoFenceMode &&
       defaultModel === baseline.defaultModel &&
       defaultEffort === baseline.defaultEffort &&
       agyBin === baseline.agyBin &&
@@ -183,7 +190,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
     if (isCurrentlyClean && JSON.stringify(incoming) !== JSON.stringify(baseline)) {
       syncFormTo(incoming)
     }
-  }, [status, baseline, mcpBridge, defaultModel, defaultEffort, agyBin, workspaceRoot, idleMinutes, timeoutSeconds, syncFormTo])
+  }, [status, baseline, mcpBridge, geoFenceMode, defaultModel, defaultEffort, agyBin, workspaceRoot, idleMinutes, timeoutSeconds, syncFormTo])
 
   if (!status) {
     return React.createElement(
@@ -230,6 +237,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
   const dirty = Boolean(
     baseline && (
       mcpBridge !== baseline.mcpBridge ||
+      geoFenceMode !== baseline.geoFenceMode ||
       defaultModel !== baseline.defaultModel ||
       defaultEffort !== baseline.defaultEffort ||
       agyBin !== baseline.agyBin ||
@@ -254,6 +262,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
     try {
       const res = await postJson('/plugins/agy-acp/config', {
         mcpBridge,
+        geoFenceMode,
         defaultModel,
         defaultEffort,
         agyBin,
@@ -586,6 +595,29 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
             style: styles.input,
           }),
         ),
+        React.createElement(
+          'div',
+          null,
+          React.createElement(
+            'label',
+            null,
+            React.createElement('div', { style: { ...styles.secondaryText, marginBottom: '4px' } }, '地域合规防护（防封号拦截）'),
+            React.createElement(
+              'select',
+              {
+                value: geoFenceMode,
+                onChange: (e: { target: { value: string } }) => {
+                  if (isGeoFenceMode(e.target.value)) setGeoFenceMode(e.target.value)
+                },
+                style: styles.input,
+              },
+              React.createElement('option', { value: 'block' }, '拦截受限地区（推荐，默认）'),
+              React.createElement('option', { value: 'strict' }, '严格模式（受限与未知均拦截）'),
+              React.createElement('option', { value: 'warn' }, '仅告警不拦截'),
+              React.createElement('option', { value: 'off' }, '关闭'),
+            ),
+          ),
+        ),
       ),
 
       React.createElement(
@@ -764,7 +796,11 @@ function AgyAcpConsoleWidget(props?: SlotOwnerProps): unknown {
     : current
       ? `AGY·ACP · 上下文 ${current.contextUsed == null ? '待上报' : formatTokens(current.contextUsed)}`
       : 'AGY·ACP'
-  const dotColor = status?.lastError ? theme.stateError : current ? theme.stateSuccess : theme.stateIdle
+  const hasGeoAlert = Boolean(
+    status?.config?.geoFenceMode !== 'off' &&
+      status?.accounts.some(a => a.enabled && a.egress?.status === 'unsupported'),
+  )
+  const dotColor = status?.lastError || hasGeoAlert ? theme.stateError : current ? theme.stateSuccess : theme.stateIdle
 
   const modal = open
     ? portalToBody(

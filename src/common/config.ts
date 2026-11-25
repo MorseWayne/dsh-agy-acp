@@ -1,3 +1,4 @@
+import { isGeoFenceMode } from './geo.ts'
 import type { AccountProfileConfig, PersistedConfigPatch, PluginConfig } from './types.ts'
 
 export const SESSION_IDLE_TTL_MIN_MS = 60_000
@@ -18,6 +19,7 @@ const ALLOWED_PERSIST_KEYS = new Set<keyof PersistedConfigPatch>([
   'workspaceRoot',
   'sessionIdleTtlMs',
   'requestTimeoutMs',
+  'geoFenceMode',
 ])
 
 function parseBool(v: unknown, fallback: boolean): boolean {
@@ -130,6 +132,12 @@ export function validateConfigPatchInput(
       }
       patch.requestTimeoutMs = val
       count++
+    } else if (key === 'geoFenceMode') {
+      if (!isGeoFenceMode(val)) {
+        return { ok: false, error: 'geoFenceMode 必须为 block、strict、warn 或 off' }
+      }
+      patch.geoFenceMode = val
+      count++
     }
   }
 
@@ -153,6 +161,7 @@ export function sanitizePersistedConfigObject(raw: Record<string, unknown>): Per
 }
 
 export function resolveConfig(raw: Record<string, unknown> = {}): PluginConfig {
+  const rawGeoMode = typeof raw.geoFenceMode === 'string' ? raw.geoFenceMode.trim() : ''
   return {
     enabled: parseBool(raw.enabled, true),
     agyBin: typeof raw.agyBin === 'string' ? raw.agyBin.trim() : '',
@@ -162,6 +171,7 @@ export function resolveConfig(raw: Record<string, unknown> = {}): PluginConfig {
     sessionIdleTtlMs: parseNumber(raw.sessionIdleTtlMs, 30 * 60_000, SESSION_IDLE_TTL_MIN_MS, SESSION_IDLE_TTL_MAX_MS),
     requestTimeoutMs: parseNumber(raw.requestTimeoutMs, 10 * 60_000, REQUEST_TIMEOUT_MIN_MS, REQUEST_TIMEOUT_MAX_MS),
     mcpBridge: parseBool(raw.mcpBridge, false),
+    geoFenceMode: isGeoFenceMode(rawGeoMode) ? rawGeoMode : 'block',
     accounts: parseAccounts(raw.accounts),
     credentialSlotDir: typeof raw.credentialSlotDir === 'string' ? raw.credentialSlotDir.trim() : '',
   }

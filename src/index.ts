@@ -12,6 +12,7 @@ import { resolveAgyBin } from './runtime/bin.ts'
 import { MultiAccountPool } from './runtime/account-pool.ts'
 import { ConfigStore } from './runtime/config-store.ts'
 import { CredentialSlotLeaseManager } from './runtime/credential-lease.ts'
+import { EgressGuard } from './runtime/egress-guard.ts'
 import { hostPermissions, type SessionAgent } from './runtime/host-permissions.ts'
 import { AcpSessionPool } from './runtime/session-pool.ts'
 import { registerAcpRoutes, type WebServerLike } from './transport/sse.ts'
@@ -60,10 +61,12 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       : undefined
 
   const runs = new AcpRunStore()
+  const egressGuard = new EgressGuard({ log })
   const pool: AcpSessionPool = new AcpSessionPool({
     getConfig: () => cfg,
     resolveBin: () => resolveAgyBin(cfg.agyBin),
     accountProvider: multiAccountPool,
+    egressGuard,
     ...permissions,
     isMcpBridgeActive: () => bridges.size > 0,
     hasPersistedConfig: () => configStore.hasPersistedOverrides,
@@ -71,9 +74,14 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       configStore.savePatch(patch)
       const prevBin = cfg.agyBin
       const prevRoot = cfg.workspaceRoot
+      const prevGeo = cfg.geoFenceMode
       cfg = { ...cfg, ...patch }
       if (!cfg.mcpBridge) for (const key of bridges.keys()) releaseBridge(key)
-      if (cfg.agyBin !== prevBin || cfg.workspaceRoot !== prevRoot) {
+      if (
+        cfg.agyBin !== prevBin ||
+        cfg.workspaceRoot !== prevRoot ||
+        (cfg.geoFenceMode !== prevGeo && (cfg.geoFenceMode === 'off' || cfg.geoFenceMode === 'warn') && pool.getStatus().models.length === 0)
+      ) {
         pool.invalidateCatalog()
         void pool.refreshModels().catch(() => {})
       }
@@ -82,9 +90,14 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       configStore.reset()
       const prevBin = cfg.agyBin
       const prevRoot = cfg.workspaceRoot
+      const prevGeo = cfg.geoFenceMode
       cfg = { ...baseCfg }
       if (!cfg.mcpBridge) for (const key of bridges.keys()) releaseBridge(key)
-      if (cfg.agyBin !== prevBin || cfg.workspaceRoot !== prevRoot) {
+      if (
+        cfg.agyBin !== prevBin ||
+        cfg.workspaceRoot !== prevRoot ||
+        (cfg.geoFenceMode !== prevGeo && pool.getStatus().models.length === 0)
+      ) {
         pool.invalidateCatalog()
         void pool.refreshModels().catch(() => {})
       }

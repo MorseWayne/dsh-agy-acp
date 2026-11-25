@@ -1,7 +1,14 @@
 // @ts-expect-error runtime React is supplied by the DSH web host
 import React from 'react'
 import type { AccountHealthSnapshot, QuotaBucketState, StatusSnapshot } from '../common/types.ts'
-import { activeCooldowns, bucketDisplay, nextAccountExpiry, requestAccountAction } from './account-display.ts'
+import {
+  activeCooldowns,
+  bucketDisplay,
+  formatEgressBadge,
+  nextAccountExpiry,
+  requestAccountAction,
+  type AccountActionKind,
+} from './account-display.ts'
 import { styles, theme } from './theme.ts'
 
 const h = React.createElement
@@ -24,7 +31,7 @@ function quotaWindow(title: string, bucket: QuotaBucketState | undefined, now: n
 }
 
 export function AccountCard({ account, applyStatus }: { account: AccountHealthSnapshot; applyStatus: (value: StatusSnapshot) => void }): unknown {
-  const [pending, setPending] = React.useState(null as 'refresh' | 'clear' | null)
+  const [pending, setPending] = React.useState(null as AccountActionKind | null)
   const [feedback, setFeedback] = React.useState('')
   const locked = React.useRef(false)
   const [, redraw] = React.useReducer((n: number) => n + 1, 0)
@@ -37,16 +44,39 @@ export function AccountCard({ account, applyStatus }: { account: AccountHealthSn
   }, [deadline, now])
 
   const cooldowns = activeCooldowns(account.families, now)
-  const { quota } = account
+  const { quota, egress } = account
+  const egressBadge = formatEgressBadge(egress)
+  const egressColor =
+    egressBadge.tone === 'success'
+      ? theme.stateSuccess
+      : egressBadge.tone === 'error'
+        ? theme.stateError
+        : egressBadge.tone === 'warn'
+          ? theme.stateWarn
+          : theme.stateIdle
   const unavailable = account.quotaRefreshUnavailable || (!account.enabled ? '账号已停用。' : undefined)
-  const act = async (action: 'refresh' | 'clear'): Promise<void> => {
-    if (locked.current || (action === 'refresh' && unavailable)) return
+  const act = async (action: AccountActionKind): Promise<void> => {
+    if (locked.current || (action === 'refresh' && unavailable) || (action === 'egress' && !account.enabled)) return
     locked.current = true
     setPending(action)
     setFeedback('')
     try {
-      applyStatus(await requestAccountAction(action, account.id))
-      setFeedback(action === 'refresh' ? '配额已刷新。' : '已清除本地冷却，上游配额不变。')
+      const nextStatus = await requestAccountAction(action, account.id)
+      applyStatus(nextStatus)
+      if (action === 'refresh') {
+        setFeedback('配额已刷新。')
+      } else if (action === 'egress') {
+        const updatedEgress = nextStatus.accounts.find(a => a.id === account.id)?.egress
+        setFeedback(
+          updatedEgress?.status === 'supported'
+            ? `出口检测通过（${updatedEgress.country ?? '合规'}）。`
+            : updatedEgress?.status === 'unsupported'
+              ? `检测到受限出口（${updatedEgress.country ?? '受限区'}），请求将在本地安全拦截。`
+              : '出口检测已完成。',
+        )
+      } else {
+        setFeedback('已清除本地冷却，上游配额不变。')
+      }
     } catch (error) {
       // requestAccountAction emits only locally authored messages.
       const failure = error instanceof Error ? error.message : '操作未完成，请重试。'
@@ -65,6 +95,37 @@ export function AccountCard({ account, applyStatus }: { account: AccountHealthSn
       `活跃租约 ${account.activeLeases}`, `最近分配：${account.lastUsedAt != null ? localTime(account.lastUsedAt) : '暂无记录'}`,
       account.hasSandboxHome && '独立 HOME', account.hasProxy && '独立代理', account.lastError && '最近请求出现错误',
     ].filter(Boolean).join(' · ')),
+    h('div', { style: { ...row, marginTop: '10px' } },
+      h('strong', null, '网络出口合规'),
+      h('button', {
+        type: 'button',
+        disabled: !!pending || !account.enabled,
+        style: button,
+        onClick: () => void act('egress'),
+        'aria-label': `检测 ${account.label} 的网络出口`,
+      }, pending === 'egress' ? '检测中…' : '检测出口')),
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginTop: '4px' } },
+      h('span', {
+        style: {
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: '6px',
+          fontSize: '12px',
+          fontWeight: 500,
+          color: egressBadge.tone === 'idle' ? 'inherit' : egressColor,
+        },
+      },
+      h('span', { style: { width: '7px', height: '7px', borderRadius: '999px', backgroundColor: egressColor } }),
+      egressBadge.label),
+      egress
+        ? h('span', { style: secondary }, [
+            egress.ipMasked && `IP ${egress.ipMasked}`,
+            `检测于 ${localTime(egress.checkedAt)}`,
+          ].filter(Boolean).join(' · '))
+        : h('span', { style: secondary }, '首次请求前自动预检，也可点击右侧手动检测')),
+    egress?.reason && egress.status !== 'supported'
+      ? h('div', { style: { ...secondary, color: egressBadge.tone === 'error' ? theme.stateError : theme.stateWarn, opacity: 0.95, marginTop: '2px' } }, egress.reason)
+      : null,
     h('div', { style: { ...row, marginTop: '10px' } },
       h('strong', null, '本地路由冷却'),
       cooldowns.length > 0 ? h('button', { type: 'button', disabled: !!pending, style: button,

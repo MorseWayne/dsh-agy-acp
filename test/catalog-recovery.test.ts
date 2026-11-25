@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { AcpProcessExitError, AcpTimeoutError } from '../src/acp/client.ts'
 import { resolveConfig } from '../src/common/config.ts'
+import { EgressGuard } from '../src/runtime/egress-guard.ts'
 import { AcpSessionPool, formatCatalogProbeError } from '../src/runtime/session-pool.ts'
 import { fakeHost } from './fixtures/session-policy.ts'
 
@@ -92,4 +93,50 @@ test('forceRefreshModels emits SSE status on recovery and rejects on failure whi
   await pool.forceRefreshModels()
   assert.equal(pool.getStatus().lastError, null)
   assert.equal(statusEvents[statusEvents.length - 1]?.lastError, null)
+})
+
+test('catalog probe blocked by HK egress launches zero subprocesses, pauses background retry timers, and recovers after checkAccountEgress', async (t) => {
+  let launches = 0
+  let country: 'HK' | 'US' = 'HK'
+  const guard = new EgressGuard({
+    probeFn: async () => ({
+      status: country === 'HK' ? 'unsupported' : 'supported',
+      country,
+      ipMasked: '203.0.113.*',
+      proxyMode: 'proxy',
+      probeSource: 'mock',
+    }),
+  })
+  const pool = new AcpSessionPool({
+    ...fakeHost,
+    egressGuard: guard,
+    getConfig: () => resolveConfig({ geoFenceMode: 'block' }),
+    resolveBin: () => process.execPath,
+    async prepareArgv() {
+      launches++
+      return [process.execPath, fileURLToPath(new URL('./fixtures/fake-agy.mjs', import.meta.url))]
+    },
+  })
+  t.after(() => pool.dispose())
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
+
+  await assert.rejects(pool.refreshModels(), /\[安全拦截\].*HK/)
+  assert.equal(launches, 0)
+  assert.match(pool.getStatus().lastError ?? '', /\[安全拦截\].*HK/)
+
+  // Advancing timers across all retry windows (5s / 30s / 60s) must NOT trigger background retries while geo-blocked
+  t.mock.timers.tick(5_000)
+  t.mock.timers.tick(30_000)
+  t.mock.timers.tick(60_000)
+  await Promise.resolve()
+  assert.equal(launches, 0)
+
+  // User switches node to US and clicks "检测出口" -> automatically clears error & discovers models
+  country = 'US'
+  const recovered = once(pool, 'models-updated')
+  await pool.checkAccountEgress('default')
+  await recovered
+  assert.equal(launches, 1)
+  assert.equal(pool.getStatus().lastError, null)
+  assert.ok(pool.getStatus().models.length > 0)
 })

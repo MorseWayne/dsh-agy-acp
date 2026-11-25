@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { validateConfigPatchInput } from '../common/config.ts'
 import type { StatusSnapshot } from '../common/types.ts'
 import { AccountQuotaError } from '../runtime/account-quota.ts'
-import type { AcpSessionPool } from '../runtime/session-pool.ts'
+import { EgressCheckError, type AcpSessionPool } from '../runtime/session-pool.ts'
 
 export interface ExactRouteSpec {
   kind: 'exact'
@@ -95,6 +95,7 @@ function readJsonBody(req: IncomingMessage, maxBytes = 64 * 1024): Promise<Recor
  * - POST /plugins/agy-acp/models/refresh      (force-refresh ACP model catalog)
  * - POST /plugins/agy-acp/sessions/reset      (close one or all active ACP sessions)
  * - POST /plugins/agy-acp/accounts/quota/refresh
+ * - POST /plugins/agy-acp/accounts/egress/check
  * - POST /plugins/agy-acp/accounts/cooldown/clear
  */
 export function registerAcpRoutes(
@@ -267,6 +268,36 @@ export function registerAcpRoutes(
       // Never expose child stderr, slot paths, sandbox argv or inherited env values.
       sendJson(res, err instanceof AccountQuotaError ? err.status : 503,
         { error: err instanceof AccountQuotaError ? err.message : '无法在对应账号的只读环境中查询配额' })
+    }
+  })
+
+  addRoute('POST', '/plugins/agy-acp/accounts/egress/check', async (req, res) => {
+    if (!requireJsonContentType(req, res)) return
+    let body: Record<string, unknown>
+    try {
+      body = await readJsonBody(req)
+    } catch (err) {
+      const status = err instanceof HttpInputError ? err.status : 400
+      sendJson(res, status, { error: err instanceof Error ? err.message : '无效的 JSON 请求' })
+      return
+    }
+    let accountId: string | undefined
+    if (Object.hasOwn(body, 'accountId') && body.accountId !== undefined) {
+      if (typeof body.accountId !== 'string' || !body.accountId.trim()) {
+        sendJson(res, 400, { error: '请选择有效的账号标识' })
+        return
+      }
+      accountId = body.accountId.trim()
+    }
+    try {
+      await pool.checkAccountEgress(accountId)
+      sendJson(res, 200, { ok: true, status: pool.getStatus() })
+    } catch (err) {
+      sendJson(
+        res,
+        err instanceof EgressCheckError ? err.status : 503,
+        { error: err instanceof EgressCheckError ? err.message : '无法完成网络出口检测，请稍后重试' },
+      )
     }
   })
 

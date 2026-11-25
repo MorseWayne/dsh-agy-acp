@@ -12,6 +12,8 @@ import { MIRROR_TOOL_NAME, PROVIDER_ID, WRAPPER_TOOL_NAME } from '../src/common/
 import { AcpAdapter } from '../src/provider/adapter.ts'
 import { defineAgyAcpMirrorTool } from '../src/provider/mirror-tool.ts'
 import { AcpRunStore } from '../src/provider/run-store.ts'
+import { MultiAccountPool } from '../src/runtime/account-pool.ts'
+import { EgressGuard } from '../src/runtime/egress-guard.ts'
 import { AcpSessionPool } from '../src/runtime/session-pool.ts'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -766,5 +768,187 @@ test('pre-output process crash auto-recovers once with digest, reports sanitized
     else process.env.FAKE_CRASH_ON_SYNC_FILE = prevSync
     pool.dispose()
     rmSync(tmpDir, { recursive: true, force: true })
+  }
+})
+
+test('EgressGuard blocks HK main chat & auxiliary calls with zero subprocess launches, guards reused sessions on TTL drift, circuit-breaks runtime 400, and fails over across MultiAccountPool', async () => {
+  // 1. Single account on HK: main chat & auxiliary call must spawn 0 subprocesses
+  let launches = 0
+  let currentCountry: 'HK' | 'US' = 'HK'
+  let fakeNow = 1_000_000
+  const cfg1 = resolveConfig({ enabled: true, geoFenceMode: 'block', requestTimeoutMs: 10_000 })
+  const guard1 = new EgressGuard({
+    now: () => fakeNow,
+    probeFn: async () => ({
+      status: currentCountry === 'HK' ? 'unsupported' : 'supported',
+      country: currentCountry,
+      ipMasked: '203.0.113.*',
+      proxyMode: 'proxy',
+      probeSource: 'mock-trace',
+    }),
+  })
+  const runs1 = new AcpRunStore()
+  const pool1 = new AcpSessionPool({
+    ...fakeHost,
+    egressGuard: guard1,
+    getConfig: () => cfg1,
+    resolveBin: () => FAKE_AGY_BIN,
+    prepareArgv: async (argv) => {
+      launches++
+      return argv
+    },
+  })
+  const adapter1 = new AcpAdapter({ getConfig: () => cfg1, pool: pool1, runs: runs1 })
+
+  try {
+    const blockedMain = await collectChunks(
+      adapter1.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hello from HK' }] } as Message],
+        sessionId: 'dsh-hk-block',
+      } as GenerateOptions),
+    )
+    const finMain = blockedMain.find(c => c.type === 'finish')
+    assert.ok(finMain && finMain.type === 'finish' && finMain.reason.kind === 'error')
+    assert.match(finMain.reason.failure.message, /\[安全拦截\].*HK/)
+    assert.equal(launches, 0, 'main chat must not launch agy subprocess when egress is HK')
+
+    const blockedAux = await collectChunks(
+      adapter1.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        purpose: 'session-title',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'summarize title' }] } as Message],
+      } as GenerateOptions),
+    )
+    const finAux = blockedAux.find(c => c.type === 'finish')
+    assert.ok(finAux && finAux.type === 'finish' && finAux.reason.kind === 'error')
+    assert.match(finAux.reason.failure.message, /\[安全拦截\].*HK/)
+    assert.equal(launches, 0, 'auxiliary call must not launch agy subprocess when egress is HK')
+
+    // 2. Switch VPN to US + manual check -> creates session; then TTL expires & drifts to HK -> reused session blocked locally!
+    currentCountry = 'US'
+    await pool1.checkAccountEgress('default')
+    const turn1 = await collectChunks(
+      adapter1.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'turn 1 on US' }] } as Message],
+        sessionId: 'dsh-drift-reuse',
+      } as GenerateOptions),
+    )
+    assert.equal(turn1.filter(c => c.type === 'text-delta').map(c => c.text).join(''), '[sess_1#1] turn 1 on US')
+    assert.equal(launches, 1)
+
+    // Advance past 5-minute supported TTL and flip node to HK
+    fakeNow += 301_000
+    currentCountry = 'HK'
+    const driftedTurn2 = await collectChunks(
+      adapter1.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'turn 2 drifted to HK' }] } as Message],
+        sessionId: 'dsh-drift-reuse',
+      } as GenerateOptions),
+    )
+    const finDrift = driftedTurn2.find(c => c.type === 'finish')
+    assert.ok(finDrift && finDrift.type === 'finish' && finDrift.reason.kind === 'error')
+    assert.match(finDrift.reason.failure.message, /\[安全拦截\].*HK/)
+    assert.equal(launches, 1)
+
+    // Switch back to US -> existing persistent session [sess_1] resumes at turn #2 (proving turn 2 never reached fake-agy!)
+    currentCountry = 'US'
+    await pool1.checkAccountEgress('default')
+    const turn3 = await collectChunks(
+      adapter1.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'turn 3 back on US' }] } as Message],
+        sessionId: 'dsh-drift-reuse',
+      } as GenerateOptions),
+    )
+    assert.equal(turn3.filter(c => c.type === 'text-delta').map(c => c.text).join(''), '[sess_1#2] turn 3 back on US')
+
+    // 3. Leaked upstream Google 400 (`FORCE_GEO_400`) during valid cache window immediately arms local circuit breaker
+    const leaked400 = await collectChunks(
+      adapter1.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'FORCE_GEO_400' }] } as Message],
+        sessionId: 'dsh-drift-reuse',
+      } as GenerateOptions),
+    )
+    const fin400 = leaked400.find(c => c.type === 'finish')
+    assert.ok(fin400 && fin400.type === 'finish' && fin400.reason.kind === 'error')
+    assert.match(fin400.reason.failure.message, /\[地域限制熔断\]/)
+    assert.equal(pool1.getStatus().accounts[0]?.egress?.probeSource, 'runtime-400')
+
+    // Immediate next turn (1ms later!) is blocked locally BEFORE sending `session/prompt` to fake-agy
+    const blockedAfter400 = await collectChunks(
+      adapter1.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'immediate follow-up' }] } as Message],
+        sessionId: 'dsh-drift-reuse',
+      } as GenerateOptions),
+    )
+    const finNext = blockedAfter400.find(c => c.type === 'finish')
+    assert.ok(finNext && finNext.type === 'finish' && finNext.reason.kind === 'error')
+    assert.match(finNext.reason.failure.message, /\[安全拦截\]/)
+  } finally {
+    pool1.dispose()
+  }
+
+  // 4. MultiAccountPool: Account A (HK) is skipped with 0 subprocess launches, seamlessly failing over to Account B (US)
+  const cfgMulti = resolveConfig({
+    enabled: true,
+    geoFenceMode: 'block',
+    accounts: [
+      { id: 'acct-hk', label: '香港节点账号', proxyUrl: 'http://127.0.0.1:18081', env: { FAKE_ACCOUNT_TAG: 'acct-hk' } },
+      { id: 'acct-us', label: '美国节点账号', proxyUrl: 'http://127.0.0.1:18082', env: { FAKE_ACCOUNT_TAG: 'acct-us' } },
+    ],
+  })
+  const launchedEnvs: string[] = []
+  const multiPool = new MultiAccountPool({ accounts: cfgMulti.accounts })
+  const multiGuard = new EgressGuard({
+    probeFn: async (accountId) => ({
+      status: accountId === 'acct-hk' ? 'unsupported' : 'supported',
+      country: accountId === 'acct-hk' ? 'HK' : 'US',
+      ipMasked: '198.51.100.*',
+      proxyMode: 'proxy',
+      probeSource: 'mock',
+    }),
+  })
+  const poolMulti = new AcpSessionPool({
+    ...fakeHost,
+    accountProvider: multiPool,
+    egressGuard: multiGuard,
+    getConfig: () => cfgMulti,
+    resolveBin: () => FAKE_AGY_BIN,
+    prepareArgv: async (argv) => {
+      launchedEnvs.push(argv.join(' '))
+      return argv
+    },
+  })
+  const adapterMulti = new AcpAdapter({ getConfig: () => cfgMulti, pool: poolMulti, runs: new AcpRunStore() })
+
+  try {
+    const failoverTurn = await collectChunks(
+      adapterMulti.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hello multi geo' }] } as Message],
+        sessionId: 'dsh-multi-geo',
+      } as GenerateOptions),
+    )
+    const text = failoverTurn.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+    assert.equal(text, '<acct-us> [sess_1#1] hello multi geo')
+    assert.equal(launchedEnvs.length, 1, 'only acct-us should launch an agy subprocess')
+    assert.equal(poolMulti.getStatus().sessions[0]?.accountId, 'acct-us')
+    assert.equal(poolMulti.getStatus().accounts.find(a => a.id === 'acct-hk')?.egress?.status, 'unsupported')
+    assert.equal(poolMulti.getStatus().accounts.find(a => a.id === 'acct-us')?.egress?.status, 'supported')
+  } finally {
+    poolMulti.dispose()
   }
 })

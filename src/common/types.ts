@@ -42,7 +42,28 @@ export interface AccountQuotaSample {
   groups: AccountQuotaGroup[]
 }
 
+export type GeoFenceMode = 'block' | 'strict' | 'warn' | 'off'
+
+export type EgressCheckStatus = 'supported' | 'unsupported' | 'unknown' | 'error'
+
+export interface AccountEgressSnapshot {
+  status: EgressCheckStatus
+  /** ISO 3166-1 alpha-2 uppercase country/region code, e.g. "US", "JP", "HK"; null when unknown. */
+  country: string | null
+  /** Masked egress IP (e.g. "203.0.113.*" / "2001:db8::*") to avoid exposing full public IP. */
+  ipMasked: string | null
+  /** Actual outbound routing mode used for this probe. */
+  proxyMode: 'proxy' | 'direct'
+  /** Probe source identifier, e.g. "cloudflare-trace" | "ipsb" | "runtime-400". */
+  probeSource: string | null
+  checkedAt: number
+  expiresAt: number
+  /** Sanitized concise Chinese explanation (populated when restricted or degraded). */
+  reason?: string
+}
+
 export interface AccountHealthSnapshot {
+  egress?: AccountEgressSnapshot
   quota?: AccountQuotaSample
   quotaRefreshUnavailable?: string
   id: string
@@ -64,6 +85,7 @@ export interface PersistedConfigPatch {
   workspaceRoot?: string
   sessionIdleTtlMs?: number
   requestTimeoutMs?: number
+  geoFenceMode?: GeoFenceMode
 }
 
 export interface PluginConfig {
@@ -76,6 +98,8 @@ export interface PluginConfig {
   requestTimeoutMs: number
   /** Attach session-scoped reverse MCP bridge via ACP session/new. */
   mcpBridge: boolean
+  /** Local egress geo-fence protection policy (default: 'block'). */
+  geoFenceMode: GeoFenceMode
   /** Optional multi-account pool profiles (Phase 3). */
   accounts: AccountProfileConfig[]
   /** Optional shared directory for cross-process credential slot leases. */
@@ -133,6 +157,7 @@ export interface StatusSnapshot {
     mcpBridge: boolean
     sessionIdleTtlMs: number
     requestTimeoutMs: number
+    geoFenceMode?: GeoFenceMode
   }
   hasPersistedConfig?: boolean
   lastError: string | null
@@ -156,6 +181,10 @@ export interface AccountProvider {
   reportFailure?(accountId: string, model: string, error: unknown): void
   /** Acquire only this profile's environment, without invoking model selection or changing stickiness. */
   acquireQuotaLease?(accountId: string): Promise<AccountLease & { requiresFileCredentialMode?: boolean }>
+  /** Read effective environment for egress probing without mutating lease counters or stickiness. */
+  getAccountEnv?(accountId: string): NodeJS.ProcessEnv | undefined
+  markGeoBlocked?(accountId: string, untilMs: number, reason?: string): void
+  clearGeoBlock?(accountId?: string): void
   getHealthSnapshots?(): AccountHealthSnapshot[]
   clearCooldown?(accountId?: string): void
   dispose?(): void

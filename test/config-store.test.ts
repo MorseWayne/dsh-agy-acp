@@ -107,9 +107,12 @@ test('validateConfigPatchInput strictly enforces whitelist, bounds, effort forma
   assert.equal(validateConfigPatchInput({ defaultEffort: 'bad effort!' }).ok, false)
   assert.equal(validateConfigPatchInput({ sessionIdleTtlMs: 59_000 }).ok, false)
   assert.equal(validateConfigPatchInput({ requestTimeoutMs: 9_000 }).ok, false)
+  assert.equal(validateConfigPatchInput({ geoFenceMode: 'invalid-mode' }).ok, false)
+  assert.equal(validateConfigPatchInput({ geoFenceMode: true }).ok, false)
 
   const ok = validateConfigPatchInput({
     mcpBridge: true,
+    geoFenceMode: 'strict',
     defaultModel: ' gemini-4-neon ',
     defaultEffort: '',
     sessionIdleTtlMs: 120_000,
@@ -119,6 +122,7 @@ test('validateConfigPatchInput strictly enforces whitelist, bounds, effort forma
   if (ok.ok) {
     assert.deepEqual(ok.patch, {
       mcpBridge: true,
+      geoFenceMode: 'strict',
       defaultModel: 'gemini-4-neon',
       defaultEffort: '',
       sessionIdleTtlMs: 120_000,

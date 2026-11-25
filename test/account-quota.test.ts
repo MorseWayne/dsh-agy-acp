@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { parseQuotaOutput, readAccountQuota } from '../src/runtime/account-quota.ts'
+import { resolveConfig } from '../src/common/config.ts'
+import { AccountQuotaError, parseQuotaOutput, readAccountQuota } from '../src/runtime/account-quota.ts'
+import { EgressGuard } from '../src/runtime/egress-guard.ts'
+import { AcpSessionPool } from '../src/runtime/session-pool.ts'
+import { fakeHost } from './fixtures/session-policy.ts'
 
 const usage = (groups: unknown[]) => JSON.stringify({ event: 'command_result', command: { name: 'usage', data: { groups } } })
 
@@ -26,4 +30,33 @@ test('quota runner rejects command failure without echoing stderr and respects c
   const reading = readAccountQuota([process.execPath, '-e', 'setInterval(() => {}, 30000)'], {}, process.cwd(), abort.signal)
   abort.abort()
   await assert.rejects(reading)
+})
+
+test('refreshAccountQuota blocks locally with HTTP 451 and zero subprocess launches when egress is HK', async (t) => {
+  let launches = 0
+  const pool = new AcpSessionPool({
+    ...fakeHost,
+    egressGuard: new EgressGuard({
+      probeFn: async () => ({
+        status: 'unsupported',
+        country: 'HK',
+        ipMasked: '203.0.113.*',
+        proxyMode: 'direct',
+        probeSource: 'mock',
+      }),
+    }),
+    getConfig: () => resolveConfig({ geoFenceMode: 'block' }),
+    resolveBin: () => 'fake-agy',
+    prepareArgv: async (argv) => {
+      launches++
+      return argv
+    },
+  })
+  t.after(() => pool.dispose())
+
+  await assert.rejects(
+    pool.refreshAccountQuota('default'),
+    (err: unknown) => err instanceof AccountQuotaError && err.status === 451 && err.message.includes('HK'),
+  )
+  assert.equal(launches, 0)
 })
