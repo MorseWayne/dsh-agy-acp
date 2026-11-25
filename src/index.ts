@@ -295,6 +295,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   // 5. Cleanup on plugin unload
   ctx.effect(() => () => {
     pool.dispose()
+    slotManager?.dispose()
     for (const key of bridges.keys()) releaseBridge(key)
   })
 }

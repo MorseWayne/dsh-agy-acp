@@ -11,8 +11,6 @@ export interface AccountProfileConfig {
   enabled?: boolean
   /** Isolated HOME / USERPROFILE sandbox directory for this account. */
   homeDir?: string
-  /** Per-account HTTP/SOCKS proxy URL injected into `agy acp`. */
-  proxyUrl?: string
   /** Optional extra environment variables for this account. */
   env?: Record<string, string>
 }
@@ -67,11 +65,13 @@ export interface AccountHealthSnapshot {
   egress?: AccountEgressSnapshot
   quota?: AccountQuotaSample
   quotaRefreshUnavailable?: string
+  tosBlocked?: boolean
+  tosBlockedAt?: number
+  tosBlockedReason?: string
   id: string
   label: string
   enabled: boolean
   hasSandboxHome: boolean
-  hasProxy: boolean
   activeLeases: number
   families: Partial<Record<ModelFamily, FamilyQuotaState>>
   lastError: string | null

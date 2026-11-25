@@ -1,6 +1,6 @@
 import { fakeHost } from './fixtures/session-policy.ts'
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -98,7 +98,7 @@ test('AcpAdapter.stream() reuses persistent ACP session across multi-turn conver
 
     const usageChunk = turn2.find((c) => c.type === 'usage')
     assert.ok(usageChunk && usageChunk.type === 'usage')
-    assert.equal(usageChunk.usage.inputTokens, 200) // 500 - 300 cachedReadTokens
+    assert.equal(usageChunk.usage.inputTokens, 200) // agy reports the uncached prompt only
     assert.equal(usageChunk.usage.cacheReadTokens, 300)
   } finally {
     pool.dispose()
@@ -207,9 +207,11 @@ async function assertMirrorContinuation(format: 'legacy' | 'tool role' | 'runtim
 
     const usage2 = span2.find((c) => c.type === 'usage')
     assert.ok(usage2 && usage2.type === 'usage')
-    // ACP prompt usage is cumulative (1000 > live context 320), so pressure is clamped to usage_update.used.
-    assert.equal(usage2.usage.inputTokens, 320)
-    assert.equal(usage2.usage.cacheReadTokens, undefined)
+    // No agy transcript here: the run-cumulative ACP usage (1000 prompt-side > live context 320) is scaled
+    // down to usage_update.used while keeping its cache-hit ratio (40% read, 10% write).
+    assert.equal(usage2.usage.inputTokens, 160)
+    assert.equal(usage2.usage.cacheReadTokens, 128)
+    assert.equal(usage2.usage.cacheWriteTokens, 32)
     assert.equal(usage2.usage.reasoningTokens, 120)
     assert.equal(pool.getStatus().usageTotals.inputTokens, 500) // pool totals keep raw ACP buckets
     assert.equal(pool.getStatus().usageTotals.cachedWriteTokens, 100)
@@ -235,6 +237,53 @@ async function assertMirrorContinuation(format: 'legacy' | 'tool role' | 'runtim
 for (const format of ['legacy', 'tool role', 'runtime-context', 'time-context'] as const) {
   test(`AcpAdapter.stream() resumes the original ACP prompt after a ${format} mirror result`, () => assertMirrorContinuation(format))
 }
+
+test('each mirrored DSH step reports the exact usage of its agy model calls from the transcript', async () => {
+  const appData = mkdtempSync(path.join(os.tmpdir(), 'agy-acp-transcript-'))
+  const saved = { appData: process.env.ANTIGRAVITY_APP_DATA_DIR, flag: process.env.FAKE_TRANSCRIPT }
+  process.env.ANTIGRAVITY_APP_DATA_DIR = appData
+  process.env.FAKE_TRANSCRIPT = '1'
+  // A previous turn's call must never be re-billed.
+  const logs = path.join(appData, 'brain', 'sess_1', '.system_generated', 'logs')
+  mkdirSync(logs, { recursive: true })
+  writeFileSync(path.join(logs, 'transcript.jsonl'),
+    JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', status: 'DONE', input_tokens: 9999, output_tokens: 9 }) + '\n')
+  const { adapter, pool, mirrorTool } = createHarness()
+  try {
+    const mirrorSchema = { name: MIRROR_TOOL_NAME, description: '', parameters: { type: 'object', properties: {} } }
+    const userMsg = { role: 'user', content: [{ type: 'text', text: 'please USE_TOOL now' }] }
+    // A fresh fake agy process names its first ACP session sess_1.
+    const span1 = await collectChunks(adapter.stream({ provider: PROVIDER_ID, model: 'gemini-4-neon', tools: [mirrorSchema],
+      messages: [userMsg], sessionId: 'dsh-transcript' } as unknown as GenerateOptions))
+    const usage1 = span1.filter(c => c.type === 'usage')
+    assert.equal(usage1.length, 1)
+    assert.deepEqual(usage1[0]!.type === 'usage' && usage1[0]!.usage,
+      { inputTokens: 300, outputTokens: 40, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 340 })
+
+    const toolBlockEnd = span1.find(c => c.type === 'block-end' && c.block.type === 'tool-call')
+    assert.ok(toolBlockEnd && toolBlockEnd.type === 'block-end' && toolBlockEnd.block.type === 'tool-call')
+    const parsedArgs = JSON.parse(toolBlockEnd.block.arguments) as Record<string, unknown>
+    const value = await mirrorTool.execute(parsedArgs, { agent: { session: { id: 'dsh-transcript' } } } as ToolRunContext)
+    const rendered = mirrorTool.output.render(parsedArgs, value as never)
+    const span2 = await collectChunks(adapter.stream({ provider: PROVIDER_ID, model: 'gemini-4-neon', tools: [mirrorSchema],
+      messages: [userMsg, { role: 'assistant', content: [toolBlockEnd.block] },
+        { role: 'tool', source: { kind: 'tool' }, toolCallId: toolBlockEnd.block.id, content: rendered, isError: false }],
+      sessionId: 'dsh-transcript' } as unknown as GenerateOptions))
+    const usage2 = span2.filter(c => c.type === 'usage')
+    assert.equal(usage2.length, 1)
+    // The cached second call is reported as such (94% hit), not as the run-cumulative ACP envelope.
+    assert.deepEqual(usage2[0]!.type === 'usage' && usage2[0]!.usage,
+      { inputTokens: 20, outputTokens: 60, cacheReadTokens: 330, cacheWriteTokens: 0, totalTokens: 410 })
+    assert.equal(pool.getStatus().usageTotals.cachedReadTokens, 400) // pool totals use the exact run envelope
+  } finally {
+    pool.dispose()
+    if (saved.appData === undefined) delete process.env.ANTIGRAVITY_APP_DATA_DIR
+    else process.env.ANTIGRAVITY_APP_DATA_DIR = saved.appData
+    if (saved.flag === undefined) delete process.env.FAKE_TRANSCRIPT
+    else process.env.FAKE_TRANSCRIPT = saved.flag
+    rmSync(appData, { recursive: true, force: true })
+  }
+})
 
 test('resolved reasoning defaults match persistent ACP selection after returning to Default', async () => {
   const { adapter, pool, cfg } = createHarness()
@@ -909,8 +958,8 @@ test('EgressGuard blocks HK main chat & auxiliary calls with zero subprocess lau
     enabled: true,
     geoFenceMode: 'block',
     accounts: [
-      { id: 'acct-hk', label: '香港节点账号', proxyUrl: 'http://127.0.0.1:18081', env: { FAKE_ACCOUNT_TAG: 'acct-hk' } },
-      { id: 'acct-us', label: '美国节点账号', proxyUrl: 'http://127.0.0.1:18082', env: { FAKE_ACCOUNT_TAG: 'acct-us' } },
+      { id: 'acct-hk', label: '香港节点账号', env: { FAKE_ACCOUNT_TAG: 'acct-hk' } },
+      { id: 'acct-us', label: '美国节点账号', env: { FAKE_ACCOUNT_TAG: 'acct-us' } },
     ],
   })
   const launchedEnvs: string[] = []

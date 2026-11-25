@@ -27,7 +27,8 @@ export interface CredentialLeaseHandle {
   leaseId: string
   accountId: string
   switched: boolean
-  release: () => void
+  /** Releases the lease without blocking the event loop; returns a promise settled once persisted. */
+  release: () => Promise<void>
 }
 
 export interface CredentialSlotOptions {
@@ -54,8 +55,11 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+function sleep(ms: number, unref = false): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    if (unref) timer.unref?.()
+  })
 }
 
 /**
@@ -73,6 +77,13 @@ export class CredentialSlotLeaseManager {
   private readonly acquireTimeoutMs: number
   private readonly staleLockMs: number
   private readonly staleLeaseMs: number
+  private readonly activeLeases = new Set<string>()
+  private readonly pendingReleases = new Set<string>()
+  private releaseDrainPromise: Promise<void> | null = null
+  private exitHookAttached = false
+  private readonly onProcessExit = (): void => {
+    this.releaseAllSyncBestEffort()
+  }
 
   constructor(private readonly opts: CredentialSlotOptions) {
     mkdirSync(opts.slotDir, { recursive: true })
@@ -90,6 +101,14 @@ export class CredentialSlotLeaseManager {
     while (true) {
       const attempt = await this.withMutex(async () => {
         const state = this.pruneDeadHolders(this.readState())
+        // Apply any queued async releases from this process while we already hold the mutex.
+        if (this.pendingReleases.size > 0) {
+          for (const pendingId of this.pendingReleases) {
+            delete state.holders[pendingId]
+          }
+          this.pendingReleases.clear()
+          this.syncExitHook()
+        }
         const holderCount = Object.keys(state.holders).length
 
         // Can acquire immediately if slot is free OR already bound to the same account
@@ -112,15 +131,17 @@ export class CredentialSlotLeaseManager {
       })
 
       if (attempt.acquired) {
+        this.activeLeases.add(leaseId)
+        this.syncExitHook()
         let released = false
         return {
           leaseId,
           accountId,
           switched: attempt.switched,
           release: () => {
-            if (released) return
+            if (released) return Promise.resolve()
             released = true
-            this.releaseSync(leaseId)
+            return this.releaseLease(leaseId)
           },
         }
       }
@@ -138,20 +159,101 @@ export class CredentialSlotLeaseManager {
     return this.pruneDeadHolders(this.readState())
   }
 
-  private releaseSync(leaseId: string): void {
-    const deadline = Date.now() + 2_000
-    while (Date.now() < deadline) {
-      if (this.tryLockSync()) {
-        try {
-          const state = this.pruneDeadHolders(this.readState())
-          delete state.holders[leaseId]
-          state.updatedAt = Date.now()
-          this.writeState(state)
-        } finally {
-          this.unlockSync()
-        }
-        return
+  dispose(): void {
+    this.releaseAllSyncBestEffort()
+    this.activeLeases.clear()
+    this.pendingReleases.clear()
+    this.syncExitHook()
+  }
+
+  private syncExitHook(): void {
+    const needHook = this.activeLeases.size > 0 || this.pendingReleases.size > 0
+    if (needHook && !this.exitHookAttached) {
+      process.on('exit', this.onProcessExit)
+      this.exitHookAttached = true
+    } else if (!needHook && this.exitHookAttached) {
+      process.off('exit', this.onProcessExit)
+      this.exitHookAttached = false
+    }
+  }
+
+  /**
+   * Non-blocking fast path + async contended retry.
+   * Never busy-spins on the Node.js event loop when the file lock is held by another process.
+   */
+  private releaseLease(leaseId: string): Promise<void> {
+    this.activeLeases.delete(leaseId)
+    this.pendingReleases.add(leaseId)
+    this.syncExitHook()
+
+    // Uncontended fast path: single non-spinning lock attempt (microseconds, zero loop).
+    if (this.drainPendingReleasesOnce()) {
+      return Promise.resolve()
+    }
+
+    // Contended path: yield immediately and retry asynchronously so HTTP/SSE stay responsive.
+    return this.drainPendingReleasesAsync()
+  }
+
+  private drainPendingReleasesOnce(): boolean {
+    if (this.pendingReleases.size === 0) {
+      this.syncExitHook()
+      return true
+    }
+    if (!this.tryLockSync()) return false
+    try {
+      const state = this.pruneDeadHolders(this.readState())
+      for (const id of this.pendingReleases) {
+        delete state.holders[id]
       }
+      state.updatedAt = Date.now()
+      this.writeState(state)
+      this.pendingReleases.clear()
+    } finally {
+      this.unlockSync()
+      this.syncExitHook()
+    }
+    return true
+  }
+
+  private drainPendingReleasesAsync(): Promise<void> {
+    if (this.releaseDrainPromise) return this.releaseDrainPromise
+    const run = (async () => {
+      const deadline = Date.now() + Math.max(this.acquireTimeoutMs, 5_000)
+      while (this.pendingReleases.size > 0 && Date.now() < deadline) {
+        await sleep(20, true)
+        if (this.drainPendingReleasesOnce()) return
+      }
+      // If lock remained held past deadline, drop local pending markers; dead-PID pruning will recover on exit.
+      this.pendingReleases.clear()
+      this.syncExitHook()
+    })().finally(() => {
+      if (this.releaseDrainPromise === run) {
+        this.releaseDrainPromise = null
+      }
+    })
+    this.releaseDrainPromise = run
+    return run
+  }
+
+  /** Single-shot non-spinning cleanup for `process.on('exit')` and `dispose()`. */
+  private releaseAllSyncBestEffort(): void {
+    if (this.activeLeases.size === 0 && this.pendingReleases.size === 0) return
+    try {
+      if (!this.tryLockSync()) return
+      try {
+        const state = this.pruneDeadHolders(this.readState())
+        for (const id of this.activeLeases) delete state.holders[id]
+        for (const id of this.pendingReleases) delete state.holders[id]
+        state.updatedAt = Date.now()
+        this.writeState(state)
+        this.activeLeases.clear()
+        this.pendingReleases.clear()
+      } finally {
+        this.unlockSync()
+      }
+    } catch {
+      // ignore during shutdown; other processes prune dead PIDs automatically
     }
   }
 

@@ -95,7 +95,7 @@ export function AccountCard({ account, applyStatus }: { account: AccountHealthSn
       h('span', { style: { ...secondary, border, borderRadius: '12px', padding: '0 8px' } }, account.enabled ? '已启用' : '已停用')),
     h('div', { style: { ...secondary, marginTop: '4px' }, title: '最近分配指最近一次租约分配（包括模型探测），不是最近一轮对话。' }, [
       `活跃租约 ${account.activeLeases}`, `最近分配：${account.lastUsedAt != null ? localTime(account.lastUsedAt) : '暂无记录'}`,
-      account.hasSandboxHome && '独立 HOME', account.hasProxy && '独立代理', account.lastError && '最近请求出现错误',
+      account.hasSandboxHome && '独立 HOME', account.lastError && '最近请求出现错误',
     ].filter(Boolean).join(' · ')),
     h('div', { style: { ...row, marginTop: '10px' } },
       h('strong', null, '网络出口合规'),
@@ -130,12 +130,18 @@ export function AccountCard({ account, applyStatus }: { account: AccountHealthSn
       : null,
     h('div', { style: { ...row, marginTop: '10px' } },
       h('strong', null, '本地路由冷却'),
-      cooldowns.length > 0 ? h('button', { type: 'button', disabled: !!pending, style: button,
+      cooldowns.length > 0 || account.tosBlocked ? h('button', { type: 'button', disabled: !!pending, style: button,
         onClick: () => void act('clear'), 'aria-label': `清除 ${account.label} 的本地冷却`,
-      }, pending === 'clear' ? '清除中…' : '清除本地冷却') : null),
+      }, pending === 'clear' ? '清除中…' : account.tosBlocked ? '解除隔离与冷却' : '清除本地冷却') : null),
+    account.tosBlocked
+      ? h('div', {
+          role: 'alert',
+          style: { fontSize: '12px', fontWeight: 500, color: theme.stateError, marginTop: '4px' },
+        }, '风控/TOS 隔离中：已停止调度与自动切号，以防连坐封禁；核查后可点击「解除隔离与冷却」。')
+      : null,
     cooldowns.length ? h('ul', { style: { paddingInlineStart: '18px', margin: '4px 0', ...secondary } }, ...cooldowns.map(({ family, until }) =>
       h('li', { key: family }, `${family} · 冷却至 ${localTime(until)}`)))
-      : h('div', { style: secondary }, '无进行中的冷却'),
+      : !account.tosBlocked ? h('div', { style: secondary }, '无进行中的冷却') : null,
     h('div', { style: { ...row, marginTop: '12px' } },
       h('strong', null, '上游剩余配额'),
       h('button', { type: 'button', disabled: !!pending || !!unavailable, style: button,

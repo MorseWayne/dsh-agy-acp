@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 
 // Minimal ACP JSON-RPC 2.0 server over stdio for end-to-end integration tests.
@@ -46,6 +47,15 @@ function sendUpdate(sessionId, update) {
     method: 'session/update',
     params: { sessionId, update },
   })
+}
+
+// Mirrors agy's per-call transcript, only when a test opts in with an isolated app data dir.
+function writeTranscript(sessionId, record) {
+  const appData = process.env.FAKE_TRANSCRIPT === '1' ? process.env.ANTIGRAVITY_APP_DATA_DIR : undefined
+  if (!appData) return
+  const dir = join(appData, 'brain', sessionId, '.system_generated', 'logs')
+  mkdirSync(dir, { recursive: true })
+  appendFileSync(join(dir, 'transcript.jsonl'), JSON.stringify(record) + '\n')
 }
 
 function requestClient(method, params) {
@@ -341,6 +351,7 @@ async function handleRequest(id, method, params) {
     }
 
     if (promptText.includes('USE_TOOL')) {
+      writeTranscript(sessionId, { step_index: 0, type: 'USER_INPUT', status: 'DONE' })
       sendUpdate(sessionId, {
         sessionUpdate: 'agent_thought_chunk',
         content: { type: 'text', text: 'Let me run a command.' },
@@ -349,6 +360,8 @@ async function handleRequest(id, method, params) {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Running check...' },
       })
+      // Model call #1 (cold) finished and asked for the tool.
+      writeTranscript(sessionId, { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', input_tokens: 300, cache_read_tokens: 0, output_tokens: 40 })
       sendUpdate(sessionId, {
         sessionUpdate: 'usage_update',
         used: 320,
@@ -393,6 +406,8 @@ async function handleRequest(id, method, params) {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: allowed ? 'Command succeeded with hello.' : 'Command was denied.' },
       })
+      // Model call #2 reused the cached prefix.
+      writeTranscript(sessionId, { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', input_tokens: 20, cache_read_tokens: 330, output_tokens: 60 })
 
       send({
         jsonrpc: '2.0',
@@ -400,12 +415,12 @@ async function handleRequest(id, method, params) {
         result: {
           stopReason: 'end_turn',
           usage: {
-            inputTokens: 1000,
+            inputTokens: 500,
             cachedReadTokens: 400,
             cachedWriteTokens: 100,
-            outputTokens: 50,
+            outputTokens: 150,
             thoughtTokens: 120,
-            totalTokens: 1050,
+            totalTokens: 1150,
           },
         },
       })
@@ -606,6 +621,25 @@ async function handleRequest(id, method, params) {
       return
     }
 
+    if (promptText.includes('STDERR_NOISE_OK')) {
+      process.stderr.write('OLD_TURN_STDERR_NOISE_MARKER\n')
+      sendUpdate(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'noisy turn ok' },
+      })
+      send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } })
+      return
+    }
+
+    if (promptText.includes('TIMEOUT_SILENT')) {
+      return
+    }
+
+    if (promptText.includes('CRASH_WITH_TURN_STDERR')) {
+      process.stderr.write('CURRENT_TURN_CRASH_MARKER\n')
+      process.exit(1)
+    }
+
     if (promptText.includes('TIMEOUT_NEVER_REPLY')) {
       process.stderr.write('Authorization: Bearer super_secret_token_999\nupstream slow hang\n')
       return
@@ -651,6 +685,20 @@ async function handleRequest(id, method, params) {
       return
     }
 
+    if (process.env.FAKE_FORCE_TOS === '1') {
+      send({
+        jsonrpc: '2.0',
+        id,
+        error: {
+          code: 403,
+          message:
+            process.env.FAKE_FORCE_TOS_MESSAGE ||
+            'HTTP 403 TOS_VIOLATION: account suspended due to terms of service violation (quota 429 revoked)',
+        },
+      })
+      return
+    }
+
     if (process.env.FAKE_FORCE_429 === '1') {
       send({
         jsonrpc: '2.0',
@@ -684,7 +732,8 @@ async function handleRequest(id, method, params) {
       result: {
         stopReason: 'end_turn',
         usage: {
-          inputTokens: 500,
+          // Real agy semantics: inputTokens is the uncached prompt only.
+          inputTokens: sess.turns > 1 ? 200 : 500,
           cachedReadTokens: sess.turns > 1 ? 300 : 0,
           outputTokens: 25,
           totalTokens: 525,

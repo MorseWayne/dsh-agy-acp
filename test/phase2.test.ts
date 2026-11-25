@@ -5,6 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net'
 import { createInterface } from 'node:readline'
 import test from 'node:test'
+import { AcpClient, AcpProcessExitError, AcpTimeoutError } from '../src/acp/client.ts'
 import { resolveConfig } from '../src/common/config.ts'
 import { MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME } from '../src/common/types.ts'
 import { ReverseMcpBridge } from '../src/mcp/server.ts'
@@ -469,5 +470,115 @@ test('ReverseMcpBridge enforces per-call timeout with AbortSignal, caps concurre
   } finally {
     releaseHold()
     await bridge.dispose()
+  }
+})
+
+test('ReverseMcpBridge stdio bridge.mjs bypasses dead HTTP_PROXY / NODE_USE_ENV_PROXY for loopback calls', async () => {
+  const bridge = new ReverseMcpBridge({
+    listTools: () => [{ name: 'ping_tool', description: 'Loopback check' }],
+    callTool: async (name) => ({
+      content: [{ type: 'text', text: `direct:${name}` }],
+      isError: false,
+    }),
+  })
+
+  await bridge.start()
+  const spec = bridge.getMcpServerSpec()!
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HTTP_PROXY: 'http://127.0.0.1:1',
+    HTTPS_PROXY: 'http://127.0.0.1:1',
+    ALL_PROXY: 'http://127.0.0.1:1',
+    http_proxy: 'http://127.0.0.1:1',
+    NODE_USE_ENV_PROXY: '1',
+    NO_PROXY: '',
+    no_proxy: '',
+  }
+  for (const item of spec.env ?? []) {
+    env[item.name] = item.value
+  }
+  const child = spawn(spec.command, spec.args, { env, stdio: ['pipe', 'pipe', 'pipe'] })
+  const rl = createInterface({ input: child.stdout, crlfDelay: Infinity })
+  const replies = new Map<number, (msg: Record<string, unknown>) => void>()
+  rl.on('line', (line) => {
+    const msg = JSON.parse(line) as Record<string, unknown>
+    if (typeof msg.id === 'number' && replies.has(msg.id)) {
+      const resolve = replies.get(msg.id)!
+      replies.delete(msg.id)
+      resolve(msg)
+    }
+  })
+
+  const rpc = (id: number, method: string, params?: unknown): Promise<Record<string, unknown>> =>
+    new Promise((resolve) => {
+      replies.set(id, resolve)
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
+    })
+
+  try {
+    const res = await rpc(1, 'tools/call', { name: 'ping_tool', arguments: {} })
+    const out = res.result as { content?: Array<{ text: string }>; isError?: boolean }
+    assert.equal(out?.isError, false)
+    assert.equal(out?.content?.[0]?.text, 'direct:ping_tool')
+  } finally {
+    rl.close()
+    child.kill()
+    await bridge.dispose()
+  }
+})
+
+test('AcpClient slices stderr per-turn so prior-turn noise never leaks into subsequent timeout or crash diagnostics', async () => {
+  const fakeBin = new URL('./fixtures/fake-agy.mjs', import.meta.url).pathname
+  const client = new AcpClient({
+    bin: process.execPath,
+    args: [fakeBin],
+    defaultTimeoutMs: 5_000,
+  })
+  client.start()
+  try {
+    await client.initialize()
+    const sess = await client.sessionNew({ cwd: process.cwd(), mcpServers: [] })
+
+    // Turn 1 emits stderr noise and succeeds cleanly on the persistent process
+    const offsetBeforeT1 = client.stderrOffset()
+    await client.sessionPrompt({
+      sessionId: sess.sessionId,
+      prompt: [{ type: 'text', text: 'STDERR_NOISE_OK' }],
+    })
+    // Wait a tick for stderr pipe to flush
+    await new Promise((r) => setTimeout(r, 30))
+    assert.match(client.readStderrSince(offsetBeforeT1), /OLD_TURN_STDERR_NOISE_MARKER/)
+    const offsetAfterT1 = client.stderrOffset()
+    assert.equal(client.readStderrSince(offsetAfterT1), '')
+
+    // Turn 2 times out silently -> stderrTail must NOT contain Turn 1's noise
+    await assert.rejects(
+      client.sessionPrompt(
+        { sessionId: sess.sessionId, prompt: [{ type: 'text', text: 'TIMEOUT_SILENT' }] },
+        80,
+      ),
+      (err: unknown) => {
+        assert.ok(err instanceof AcpTimeoutError)
+        assert.equal(err.stderrTail, '')
+        assert.equal(err.message.includes('OLD_TURN_STDERR_NOISE_MARKER'), false)
+        return true
+      },
+    )
+
+    // Turn 3 crashes with its own stderr -> AcpProcessExitError must ONLY include Turn 3's stderr
+    await assert.rejects(
+      client.sessionPrompt(
+        { sessionId: sess.sessionId, prompt: [{ type: 'text', text: 'CRASH_WITH_TURN_STDERR' }] },
+        5_000,
+      ),
+      (err: unknown) => {
+        assert.ok(err instanceof AcpProcessExitError)
+        assert.match(err.stderrTail, /CURRENT_TURN_CRASH_MARKER/)
+        assert.equal(err.stderrTail.includes('OLD_TURN_STDERR_NOISE_MARKER'), false)
+        return true
+      },
+    )
+  } finally {
+    client.dispose()
   }
 })

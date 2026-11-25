@@ -36,6 +36,10 @@ function summarizeAccountLine(account: AccountHealthSnapshot, now: number): stri
     parts.push('出口=待检测')
   }
 
+  if (account.tosBlocked) {
+    parts.push('风控隔离(TOS)')
+  }
+
   const activeCooldowns = Object.entries(account.families).filter(
     ([, st]) => st?.cooldownUntil != null && st.cooldownUntil > now,
   )

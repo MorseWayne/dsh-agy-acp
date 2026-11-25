@@ -46,7 +46,6 @@ test('formatAgyStatusReport outputs structured Chinese overview and redacts any 
         label: '主力账号',
         enabled: true,
         hasSandboxHome: true,
-        hasProxy: true,
         activeLeases: 1,
         families: { claude: { consecutiveFailures: 1, cooldownUntil: now + 60_000 } },
         lastError: null,

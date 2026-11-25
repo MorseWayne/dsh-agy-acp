@@ -40,6 +40,7 @@ export interface AcpClientOptions {
 
 interface PendingCall {
   method: string
+  stderrStartOffset: number
   resolve: (value: unknown) => void
   reject: (err: Error) => void
   timer?: ReturnType<typeof setTimeout>
@@ -119,6 +120,8 @@ export class AcpClient {
   private readonly globalListeners = new Set<(notif: SessionUpdateNotification) => void>()
   private stderrRing: string[] = []
   private stderrBytes = 0
+  private stderrTotalChars = 0
+  private stderrBaseOffset = 0
   private closed = false
   private disposedByCaller = false
   private exitSettled = false
@@ -135,6 +138,23 @@ export class AcpClient {
     return this.stderrRing.join('')
   }
 
+  /** Monotonic character offset into this client's stderr stream for per-turn slicing. */
+  stderrOffset(): number {
+    return this.stderrTotalChars
+  }
+
+  /** Returns retained stderr written since `offset` (clamped if older chunks rolled off the ring). */
+  readStderrSince(offset: number): string {
+    if (!Number.isFinite(offset) || offset <= this.stderrBaseOffset) {
+      return this.recentStderr
+    }
+    if (offset >= this.stderrTotalChars) {
+      return ''
+    }
+    const rel = Math.floor(offset) - this.stderrBaseOffset
+    return rel <= 0 ? this.recentStderr : this.recentStderr.slice(rel)
+  }
+
   start(): void {
     if (this.child !== null) return
     this.closed = false
@@ -143,6 +163,8 @@ export class AcpClient {
     this.lastExitError = null
     this.stderrRing = []
     this.stderrBytes = 0
+    this.stderrTotalChars = 0
+    this.stderrBaseOffset = 0
 
     const args = this.opts.args ?? ['acp']
     const child = spawn(this.opts.bin, args, {
@@ -165,18 +187,22 @@ export class AcpClient {
       const bytes = Buffer.byteLength(text, 'utf8')
       this.stderrRing.push(text)
       this.stderrBytes += bytes
+      this.stderrTotalChars += text.length
       while (
         this.stderrRing.length > 1 &&
         (this.stderrRing.length > MAX_STDERR_CHUNKS || this.stderrBytes > MAX_STDERR_BYTES)
       ) {
         const dropped = this.stderrRing.shift()!
         this.stderrBytes -= Buffer.byteLength(dropped, 'utf8')
+        this.stderrBaseOffset += dropped.length
       }
       if (this.stderrBytes > MAX_STDERR_BYTES && this.stderrRing.length === 1) {
         const only = this.stderrRing[0]!
-        const clipped = only.slice(Math.max(0, only.length - MAX_STDERR_BYTES))
+        const sliceStart = Math.max(0, only.length - MAX_STDERR_BYTES)
+        const clipped = only.slice(sliceStart)
         this.stderrRing[0] = clipped
         this.stderrBytes = Buffer.byteLength(clipped, 'utf8')
+        this.stderrBaseOffset += sliceStart
       }
     })
 
@@ -245,17 +271,19 @@ export class AcpClient {
     const id = this.nextId++
     const payload = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'
     const limit = timeoutMs ?? this.opts.defaultTimeoutMs ?? 120_000
+    const stderrStartOffset = this.stderrOffset()
 
     return new Promise<T>((resolve, reject) => {
       const entry: PendingCall = {
         method,
+        stderrStartOffset,
         resolve: resolve as (v: unknown) => void,
         reject,
       }
       if (limit > 0) {
         entry.timer = setTimeout(() => {
           this.pending.delete(id)
-          reject(new AcpTimeoutError(method, limit, sanitizeDiagnosticText(this.recentStderr)))
+          reject(new AcpTimeoutError(method, limit, sanitizeDiagnosticText(this.readStderrSince(entry.stderrStartOffset))))
         }, limit)
         entry.timer.unref?.()
       }
@@ -269,7 +297,7 @@ export class AcpClient {
               new AcpProcessExitError(
                 null,
                 null,
-                sanitizeDiagnosticText(this.recentStderr),
+                sanitizeDiagnosticText(this.readStderrSince(entry.stderrStartOffset)),
                 err.message,
               ),
             )
@@ -300,7 +328,7 @@ export class AcpClient {
         fs: { readTextFile: false, writeTextFile: false },
         terminal: false,
       },
-      clientInfo: { name: 'dsh-agy-acp', version: '0.4.1' },
+      clientInfo: { name: 'dsh-agy-acp', version: '0.4.2' },
       ...params,
     }, 15_000)
   }
@@ -377,7 +405,12 @@ export class AcpClient {
       causeErr?.message,
     )
     this.lastExitError = exitErr
-    this.failAllPending(exitErr)
+    for (const [id, entry] of this.pending) {
+      if (entry.timer) clearTimeout(entry.timer)
+      const turnStderr = sanitizeDiagnosticText(this.readStderrSince(entry.stderrStartOffset))
+      entry.reject(new AcpProcessExitError(code, signal, turnStderr, causeErr?.message))
+      this.pending.delete(id)
+    }
     this.opts.onExit?.(code, signal, this)
   }
 

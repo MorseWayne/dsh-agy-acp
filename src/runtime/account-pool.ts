@@ -29,7 +29,35 @@ export function classifyModelFamily(model: string): ModelFamily {
   return 'other'
 }
 
+const TOS_VIOLATION_PATTERNS: readonly RegExp[] = [
+  /\btos[_ -]?violation\b/i,
+  /\bterms\s+of\s+service\b[\s\S]{0,60}\b(?:violat|suspend|ban|terminat|disable|restrict)/i,
+  /\b(?:violat|suspend|ban|terminat|disable|restrict)\w*\b[\s\S]{0,60}\bterms\s+of\s+service\b/i,
+  /\b(?:account|user)\s+(?:has\s+been\s+)?(?:suspended|banned|disabled|terminated|restricted)\b/i,
+  /\b(?:validation_required|account_restricted|abuse_detected)\b/i,
+]
+
+const LOOPBACK_NO_PROXY_ENTRIES = ['127.0.0.1', 'localhost', '::1'] as const
+
+const PROXY_ENV_KEYS = [
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'ALL_PROXY',
+  'https_proxy',
+  'http_proxy',
+  'all_proxy',
+] as const
+
+export type AccountErrorCategory = 'tos' | 'geo' | 'quota' | 'other'
+
+export function isTosViolationError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error ?? '')
+  if (!msg) return false
+  return TOS_VIOLATION_PATTERNS.some((re) => re.test(msg))
+}
+
 export function isQuotaOrRateLimitError(error: unknown): boolean {
+  if (isTosViolationError(error)) return false
   const msg = error instanceof Error ? error.message : String(error ?? '')
   const lower = msg.toLowerCase()
   return (
@@ -44,11 +72,49 @@ export function isQuotaOrRateLimitError(error: unknown): boolean {
   )
 }
 
+/** Classifies an upstream/account failure by strict risk precedence: TOS > geo > quota > other. */
+export function classifyAccountError(error: unknown): AccountErrorCategory {
+  if (isTosViolationError(error)) return 'tos'
+  if (isGeoUnsupportedError(error)) return 'geo'
+  if (isQuotaOrRateLimitError(error)) return 'quota'
+  return 'other'
+}
+
+/** Merges `127.0.0.1,localhost,::1` into a `NO_PROXY` list without duplicating existing entries. */
+export function mergeLoopbackNoProxy(existing: string | undefined): string {
+  const parts = (existing ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  if (parts.includes('*')) return parts.join(',')
+
+  const seen = new Set<string>()
+  const out: string[] = []
+  const normalize = (entry: string): string => entry.toLowerCase().replace(/^\[|\]$/g, '')
+
+  for (const part of parts) {
+    const key = normalize(part)
+    if (!seen.has(key)) {
+      seen.add(key)
+      out.push(part)
+    }
+  }
+  for (const loopback of LOOPBACK_NO_PROXY_ENTRIES) {
+    if (!seen.has(loopback)) {
+      seen.add(loopback)
+      out.push(loopback)
+    }
+  }
+  return out.join(',')
+}
+
 interface InternalAccountState {
   profile: AccountProfileConfig
   activeLeases: number
   families: Map<ModelFamily, FamilyQuotaState>
   geoBlockedUntil?: number
+  tosBlockedAt?: number
+  tosBlockedReason?: string
   lastError: string | null
   lastUsedAt: number | null
 }
@@ -76,21 +142,23 @@ function buildAccountEnv(profile: AccountProfileConfig): NodeJS.ProcessEnv | und
     modified = true
   }
 
-  if (profile.proxyUrl) {
-    env.HTTPS_PROXY = profile.proxyUrl
-    env.HTTP_PROXY = profile.proxyUrl
-    env.ALL_PROXY = profile.proxyUrl
-    env.https_proxy = profile.proxyUrl
-    env.http_proxy = profile.proxyUrl
-    env.all_proxy = profile.proxyUrl
-    modified = true
-  }
-
+  let hasProxy = false
   if (profile.env) {
     for (const [k, v] of Object.entries(profile.env)) {
       env[k] = v
+      if ((PROXY_ENV_KEYS as readonly string[]).includes(k) && v.trim()) {
+        hasProxy = true
+      }
       modified = true
     }
+  }
+
+  if (hasProxy) {
+    const existingNoProxy = [env.NO_PROXY, env.no_proxy].filter((v): v is string => Boolean(v?.trim())).join(',')
+    const merged = mergeLoopbackNoProxy(existingNoProxy)
+    env.NO_PROXY = merged
+    env.no_proxy = merged
+    modified = true
   }
 
   return modified ? env : undefined
@@ -130,7 +198,7 @@ function quotaUnavailable(profile: AccountProfileConfig, profiles: AccountProfil
  * Phase 3 multi-account pool implementing `AccountProvider`.
  *
  * Features:
- * - Per-account isolated `HOME` / `XDG_*` sandbox & independent proxy injection
+ * - Per-account isolated `HOME` / `XDG_*` sandbox & custom environment injection
  * - Optional cross-process credential slot lease (`CredentialSlotLeaseManager`)
  * - Dual-bucket quota tracking (5h rolling + 7d weekly) per model family
  * - Independent per-model-family cooldown & automatic 429/exhaustion failover
@@ -241,10 +309,15 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
 
     const candidates: InternalAccountState[] = []
     let earliestReset = Number.POSITIVE_INFINITY
+    let tosBlockedCount = 0
 
     for (const acc of this.accounts.values()) {
       if (acc.profile.enabled === false) continue
       if (excludeAccountIds?.has(acc.profile.id)) continue
+      if (acc.tosBlockedAt !== undefined) {
+        tosBlockedCount += 1
+        continue
+      }
       const blockedUntil = this.getBlockedUntil(acc, family, now)
       if (blockedUntil !== null) {
         if (blockedUntil < earliestReset) earliestReset = blockedUntil
@@ -254,6 +327,11 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     }
 
     if (candidates.length === 0) {
+      if (tosBlockedCount > 0 && !Number.isFinite(earliestReset)) {
+        throw new Error(
+          `No healthy accounts available for model family "${family}": ${tosBlockedCount} account(s) quarantined due to TOS violation`,
+        )
+      }
       const waitHint = Number.isFinite(earliestReset)
         ? ` (earliest recovery in ${Math.max(1, Math.ceil((earliestReset - now) / 1000))}s)`
         : ''
@@ -317,7 +395,14 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     acc.lastError = safeMessage || 'Request failed'
     state.consecutiveFailures += 1
 
-    if (isQuotaOrRateLimitError(error)) {
+    const category = classifyAccountError(error)
+    if (category === 'tos') {
+      acc.tosBlockedAt = this.now()
+      acc.tosBlockedReason = safeMessage || 'TOS_VIOLATION'
+      this.opts.log?.(
+        `account "${accountId}" quarantined due to TOS/account-restriction violation (failover halted): ${acc.tosBlockedReason}`,
+      )
+    } else if (category === 'quota') {
       const backoff = Math.min(
         this.maxCooldownMs,
         this.baseCooldownMs * 2 ** Math.min(state.consecutiveFailures - 1, 6),
@@ -326,7 +411,7 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
       this.opts.log?.(
         `account "${accountId}" entered ${Math.round(backoff / 1000)}s cooldown for family "${family}": ${safeMessage}`,
       )
-    } else if (isGeoUnsupportedError(error)) {
+    } else if (category === 'geo') {
       acc.geoBlockedUntil = Math.max(acc.geoBlockedUntil ?? 0, this.now() + 60_000)
     }
     this.emit('change')
@@ -337,6 +422,8 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
       if (accountId && acc.profile.id !== accountId) continue
       acc.lastError = null
       acc.geoBlockedUntil = undefined
+      acc.tosBlockedAt = undefined
+      acc.tosBlockedReason = undefined
       for (const state of acc.families.values()) {
         state.cooldownUntil = undefined
         state.consecutiveFailures = 0
@@ -362,8 +449,14 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
         label: acc.profile.label ?? acc.profile.id,
         enabled: acc.profile.enabled !== false,
         quotaRefreshUnavailable: this.quotaRestrictions.get(acc.profile.id),
+        ...(acc.tosBlockedAt !== undefined
+          ? {
+              tosBlocked: true,
+              tosBlockedAt: acc.tosBlockedAt,
+              ...(acc.tosBlockedReason ? { tosBlockedReason: acc.tosBlockedReason } : {}),
+            }
+          : {}),
         hasSandboxHome: Boolean(acc.profile.homeDir),
-        hasProxy: Boolean(acc.profile.proxyUrl),
         activeLeases: acc.activeLeases,
         families,
         lastError: acc.lastError,

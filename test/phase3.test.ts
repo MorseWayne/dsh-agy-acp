@@ -1,6 +1,6 @@
 import { fakeHost } from './fixtures/session-policy.ts'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, rmSync } from 'node:fs'
+import { chmodSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -10,7 +10,14 @@ import { resolveConfig } from '../src/common/config.ts'
 import { PROVIDER_ID } from '../src/common/types.ts'
 import { AcpAdapter } from '../src/provider/adapter.ts'
 import { AcpRunStore } from '../src/provider/run-store.ts'
-import { classifyModelFamily, MultiAccountPool } from '../src/runtime/account-pool.ts'
+import {
+  classifyAccountError,
+  classifyModelFamily,
+  isQuotaOrRateLimitError,
+  isTosViolationError,
+  mergeLoopbackNoProxy,
+  MultiAccountPool,
+} from '../src/runtime/account-pool.ts'
 import { CredentialSlotLeaseManager } from '../src/runtime/credential-lease.ts'
 import { AcpSessionPool } from '../src/runtime/session-pool.ts'
 
@@ -64,7 +71,7 @@ test('CredentialSlotLeaseManager supports same-account ref-counting and cross-ac
   }
 })
 
-test('MultiAccountPool isolates HOME/proxy, tracks 5h+7d buckets, and cools down per model family', async () => {
+test('MultiAccountPool isolates HOME/env, tracks 5h+7d buckets, and cools down per model family', async () => {
   let fakeNow = 1_000_000
   const pool = new MultiAccountPool({
     now: () => fakeNow,
@@ -73,12 +80,12 @@ test('MultiAccountPool isolates HOME/proxy, tracks 5h+7d buckets, and cools down
       {
         id: 'acct-1',
         homeDir: '/tmp/agy-home-1',
-        proxyUrl: 'http://127.0.0.1:8081',
+        env: { ACCOUNT_MARKER: 'acct-1' },
       },
       {
         id: 'acct-2',
         homeDir: '/tmp/agy-home-2',
-        proxyUrl: 'http://127.0.0.1:8082',
+        env: { ACCOUNT_MARKER: 'acct-2' },
       },
     ],
   })
@@ -87,11 +94,11 @@ test('MultiAccountPool isolates HOME/proxy, tracks 5h+7d buckets, and cools down
   assert.equal(classifyModelFamily('gemini-3.8-flash'), 'gemini-flash')
   assert.equal(classifyModelFamily('claude-sonnet-5-5'), 'claude')
 
-  // First acquire picks acct-1 and injects isolated HOME + proxy
+  // First acquire picks acct-1 and injects isolated HOME + custom env
   const lease1 = await pool.acquire('sess-1', 'claude-sonnet-5-5')
   assert.equal(lease1.accountId, 'acct-1')
   assert.equal(lease1.env?.HOME, path.resolve('/tmp/agy-home-1'))
-  assert.equal(lease1.env?.HTTPS_PROXY, 'http://127.0.0.1:8081')
+  assert.equal(lease1.env?.ACCOUNT_MARKER, 'acct-1')
   lease1.release()
 
   // 429 failure on claude cools down acct-1 ONLY for claude family and redacts secrets in lastError
@@ -104,7 +111,7 @@ test('MultiAccountPool isolates HOME/proxy, tracks 5h+7d buckets, and cools down
   // Next claude request fails over to acct-2
   const leaseClaude = await pool.acquire('sess-1', 'claude-sonnet-5-5')
   assert.equal(leaseClaude.accountId, 'acct-2')
-  assert.equal(leaseClaude.env?.HTTPS_PROXY, 'http://127.0.0.1:8082')
+  assert.equal(leaseClaude.env?.ACCOUNT_MARKER, 'acct-2')
   leaseClaude.release()
 
   // Meanwhile acct-1 is STILL healthy for gemini-pro!
@@ -188,5 +195,150 @@ test('AcpAdapter.stream() automatically fails over to secondary account on 429 q
     assert.ok(primary?.families['gemini-pro']?.cooldownUntil)
   } finally {
     pool.dispose()
+  }
+})
+
+test('MultiAccountPool merges loopback NO_PROXY when proxy env is passed via account env', async () => {
+  assert.equal(mergeLoopbackNoProxy(undefined), '127.0.0.1,localhost,::1')
+  assert.equal(mergeLoopbackNoProxy('internal.corp,LOCALHOST,[::1]'), 'internal.corp,LOCALHOST,[::1],127.0.0.1')
+  assert.equal(mergeLoopbackNoProxy('*'), '*')
+
+  const pool = new MultiAccountPool({
+    accounts: [
+      {
+        id: 'env-proxied',
+        env: { HTTPS_PROXY: 'socks5://127.0.0.1:1080', NO_PROXY: 'corp.internal' },
+      },
+    ],
+  })
+
+  try {
+    const env = pool.getAccountEnv('env-proxied')
+    assert.equal(env?.HTTPS_PROXY, 'socks5://127.0.0.1:1080')
+    assert.ok(env?.NO_PROXY?.includes('corp.internal'))
+    assert.ok(env?.NO_PROXY?.includes('127.0.0.1'))
+    assert.ok(env?.NO_PROXY?.includes('localhost'))
+    assert.ok(env?.NO_PROXY?.includes('::1'))
+    assert.equal(env?.no_proxy, env?.NO_PROXY)
+  } finally {
+    pool.dispose()
+  }
+})
+
+test('TOS_VIOLATION takes precedence over quota/429, quarantines account, and halts automatic failover', async () => {
+  const combinedErr = new Error('HTTP 403 TOS_VIOLATION: account suspended, quota 429 revoked')
+  assert.equal(isTosViolationError(combinedErr), true)
+  assert.equal(isQuotaOrRateLimitError(combinedErr), false)
+  assert.equal(classifyAccountError(combinedErr), 'tos')
+  assert.equal(isTosViolationError(new Error('Your account has been suspended due to policy')), true)
+  assert.equal(isTosViolationError(new Error('HTTP 429 RESOURCE_EXHAUSTED')), false)
+
+  const cfg = resolveConfig({
+    enabled: true,
+    requestTimeoutMs: 10_000,
+    accounts: [
+      { id: 'primary', env: { FAKE_FORCE_TOS: '1', FAKE_ACCOUNT_TAG: 'primary' } },
+      { id: 'backup', env: { FAKE_ACCOUNT_TAG: 'backup' } },
+    ],
+  })
+
+  const accountPool = new MultiAccountPool({ accounts: cfg.accounts })
+  const runs = new AcpRunStore()
+  const pool = new AcpSessionPool({
+    ...fakeHost,
+    getConfig: () => cfg,
+    resolveBin: () => FAKE_AGY_BIN,
+    accountProvider: accountPool,
+  })
+  const adapter = new AcpAdapter({
+    getConfig: () => cfg,
+    pool,
+    runs,
+  })
+
+  try {
+    const chunks: StreamChunk[] = []
+    for await (const c of adapter.stream({
+      provider: PROVIDER_ID,
+      model: 'gemini-4-neon',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'trigger tos' }] } as Message],
+      sessionId: 'dsh-tos-conv',
+    } as unknown as GenerateOptions)) {
+      chunks.push(c)
+    }
+
+    // Must NOT have failed over to backup account!
+    const text = chunks
+      .filter((c) => c.type === 'text-delta')
+      .map((c) => c.text)
+      .join('')
+    assert.equal(text, '')
+
+    const finish = chunks.find((c) => c.type === 'finish')
+    assert.ok(finish && finish.type === 'finish')
+    assert.equal(finish.reason.kind, 'error')
+    assert.match(finish.reason.failure?.message ?? '', /风控熔断/)
+    assert.match(finish.reason.failure?.message ?? '', /TOS_VIOLATION/)
+
+    const primaryHealth = pool.getAccountHealthSnapshots().find((a) => a.id === 'primary')
+    const backupHealth = pool.getAccountHealthSnapshots().find((a) => a.id === 'backup')
+    assert.equal(primaryHealth?.tosBlocked, true)
+    assert.ok(primaryHealth?.tosBlockedAt)
+    assert.equal(backupHealth?.lastUsedAt, null)
+
+    // Primary stays excluded across all model families until manually cleared
+    const leaseForClaude = await accountPool.acquire('other-sess', 'claude-sonnet-5-5')
+    assert.equal(leaseForClaude.accountId, 'backup')
+    leaseForClaude.release()
+
+    // Manual clearCooldown lifts quarantine
+    accountPool.clearCooldown('primary')
+    assert.equal(pool.getAccountHealthSnapshots().find((a) => a.id === 'primary')?.tosBlocked, undefined)
+  } finally {
+    pool.dispose()
+  }
+})
+
+test('CredentialSlotLeaseManager releases asynchronously without blocking the event loop under lock contention', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'dsh-agy-slot-async-'))
+  const lockFile = path.join(dir, 'credential-slot.lock')
+  const mgr = new CredentialSlotLeaseManager({
+    slotDir: dir,
+    acquireTimeoutMs: 2_000,
+    staleLockMs: 10_000,
+  })
+
+  try {
+    const lease = await mgr.acquire('acct-a')
+    assert.equal(Object.keys(mgr.inspect().holders).length, 1)
+
+    // Simulate another live process holding the mutex lock
+    writeFileSync(lockFile, JSON.stringify({ pid: process.pid, ts: Date.now() }), 'utf8')
+
+    let timerTicks = 0
+    const ticker = setInterval(() => {
+      timerTicks += 1
+    }, 10)
+
+    const start = Date.now()
+    const releasePromise = lease.release()
+    const syncElapsed = Date.now() - start
+
+    // Must return immediately without synchronous spin-waiting (previously blocked up to 2000ms)
+    assert.ok(syncElapsed < 50, `expected non-blocking release, took ${syncElapsed}ms`)
+
+    // Verify event loop stays responsive while lock is held
+    await new Promise((r) => setTimeout(r, 60))
+    assert.ok(timerTicks >= 2, `expected event loop to keep ticking, got ${timerTicks} ticks`)
+    assert.equal(Object.keys(mgr.inspect().holders).length, 1)
+
+    // Free the external lock -> async drain completes and removes the holder
+    unlinkSync(lockFile)
+    await releasePromise
+    clearInterval(ticker)
+    assert.equal(Object.keys(mgr.inspect().holders).length, 0)
+  } finally {
+    mgr.dispose()
+    rmSync(dir, { recursive: true, force: true })
   }
 })

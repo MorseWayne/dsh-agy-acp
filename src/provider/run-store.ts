@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { AcpToolCallUpdate, AcpUsage, SessionUpdatePayload } from '../acp/protocol.ts'
+import { mergeCallUsage, type CallUsage, type CallUsageSource } from '../acp/transcript-usage.ts'
 
 export interface NormalizedLocation {
   path: string
@@ -134,6 +135,37 @@ export class AcpRunRecording {
 
   /** Latest `usage_update.used` seen during this run: the real live context occupancy. */
   contextUsed: number | undefined
+
+  private usageSource: CallUsageSource | null = null
+  private pendingUsage: CallUsage | null = null
+
+  /** Attach agy's per-call usage source (the transcript tailer) for this run. */
+  attachUsageSource(source: CallUsageSource): void {
+    this.usageSource = source
+  }
+
+  get hasUsageSource(): boolean {
+    return this.usageSource?.available === true
+  }
+
+  /** Pull newly completed model calls into the current DSH step; returns how many arrived. */
+  flushUsage(): number {
+    if (!this.usageSource) return 0
+    const samples = this.usageSource.poll()
+    for (const s of samples) this.pendingUsage = mergeCallUsage(this.pendingUsage, s)
+    return samples.length
+  }
+
+  get hasPendingUsage(): boolean {
+    return this.pendingUsage !== null
+  }
+
+  /** Usage of the model calls since the previous DSH step, or null when none arrived (never re-billed). */
+  consumeSpanUsage(): CallUsage | null {
+    const out = this.pendingUsage
+    this.pendingUsage = null
+    return out
+  }
 
   pushUpdate(update: SessionUpdatePayload): number {
     if (this.settled) return this.items.length - 1

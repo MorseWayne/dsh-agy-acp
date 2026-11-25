@@ -12,7 +12,7 @@ import { SettingsView } from '../src/client/index.ts'
 import { createStatusStore, type EventSourceLike } from '../src/client/status-store.ts'
 
 const account: AccountHealthSnapshot = {
-  id: 'default', label: '本机默认账号', enabled: true, hasProxy: false, hasSandboxHome: false,
+  id: 'default', label: '本机默认账号', enabled: true, hasSandboxHome: false,
   activeLeases: 0, families: {}, lastError: null, lastUsedAt: null,
 }
 const now = 10_000
@@ -415,4 +415,13 @@ test('AccountCard renders supported, unsupported, error, and unchecked egress st
     },
   })
   assert.match(lowHtml, /低配额预警：Gemini Models · 5 小时仅剩 12%/)
+
+  const tosHtml = markup({
+    ...account,
+    tosBlocked: true,
+    tosBlockedAt: now,
+    tosBlockedReason: 'TOS_VIOLATION',
+  })
+  assert.match(tosHtml, /风控\/TOS 隔离中/)
+  assert.match(tosHtml, /解除隔离与冷却/)
 })

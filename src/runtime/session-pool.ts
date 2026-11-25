@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { AcpClient, AcpProcessExitError, AcpTimeoutError } from '../acp/client.ts'
+import { transcriptCandidates } from '../acp/transcript-usage.ts'
 import { isGeoUnsupportedError } from '../common/geo.ts'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import {
@@ -35,6 +36,7 @@ import {
   type UsageTotals,
 } from '../common/types.ts'
 
+import { isTosViolationError } from './account-pool.ts'
 import { AccountQuotaError, mapQuotaGroupsToFamilies, readAccountQuota, requireFileCredentialMode } from './account-quota.ts'
 import { EgressBlockedError, EgressGuard } from './egress-guard.ts'
 import type { SessionIndex } from './session-index.ts'
@@ -110,7 +112,7 @@ export class SingleAccountProvider implements AccountProvider {
   }
 
   getHealthSnapshots(): AccountHealthSnapshot[] {
-    return [{ id: 'default', label: '本机默认账号', enabled: true, hasSandboxHome: false, hasProxy: false,
+    return [{ id: 'default', label: '本机默认账号', enabled: true, hasSandboxHome: false,
       activeLeases: this.leases, lastUsedAt: this.lastUsedAt, families: {}, lastError: null }]
   }
 }
@@ -165,6 +167,12 @@ export class AcpSessionPool extends EventEmitter {
   private initResult: InitializeResult | null = null
   private readonly sessions = new Map<string, ManagedAcpSession>()
   private readonly sessionEnvs = new Map<string, NodeJS.ProcessEnv | undefined>()
+
+  /** Where agy writes this session's per-call transcript, under the account's own HOME. */
+  transcriptPaths(session: ManagedAcpSession): string[] {
+    const env = this.sessionEnvs.get(session.dshSessionKey) ?? this.accountProvider.getAccountEnv?.(session.accountId)
+    return transcriptCandidates(session.acpSessionId, env)
+  }
   private readonly sessionUnsubs = new Map<string, () => void>()
   private readonly accountProvider: AccountProvider
   private readonly egressGuard: EgressGuard
@@ -1036,6 +1044,10 @@ export class AcpSessionPool extends EventEmitter {
         this.recordTurnUsage(result.usage)
         return result
       } catch (err) {
+        if (isTosViolationError(err)) {
+          this.reportAccountFailure(lease.accountId, requestedModel, err)
+          throw err
+        }
         if (err instanceof EgressBlockedError) {
           triedAccounts.add(lease.accountId)
           if (triedAccounts.size < maxAccounts && !runSignal.aborted) {
@@ -1157,8 +1169,8 @@ export class AcpSessionPool extends EventEmitter {
         // A failed group is cached by DSH's menu just like a successful group. Retry
         // the constrained discovery, then publish its recovery without requiring a chat turn.
         this.lastError = formatCatalogProbeError(err)
-        const isGeoBlocked = err instanceof EgressBlockedError || isGeoUnsupportedError(err)
-        const delay = isGeoBlocked ? undefined : [5_000, 30_000, 60_000][this.catalogRetryCount]
+        const stopAutoRetry = err instanceof EgressBlockedError || isGeoUnsupportedError(err) || isTosViolationError(err)
+        const delay = stopAutoRetry ? undefined : [5_000, 30_000, 60_000][this.catalogRetryCount]
         if (delay !== undefined && !this.catalogRetry) {
           this.catalogRetryCount++
           this.catalogRetry = setTimeout(() => {
@@ -1232,6 +1244,10 @@ export class AcpSessionPool extends EventEmitter {
         }
         return this.cachedModels
       } catch (err) {
+        if (isTosViolationError(err)) {
+          this.reportAccountFailure(lease.accountId, '', err)
+          throw err
+        }
         if (err instanceof EgressBlockedError) {
           triedAccounts.add(lease.accountId)
           if (triedAccounts.size < maxAccounts && !this.lifetime.signal.aborted) {
@@ -1354,6 +1370,9 @@ function findCurrentOption(options: AcpConfigOption[], id: string): string | und
 }
 
 export function formatCatalogProbeError(err: unknown): string {
+  if (isTosViolationError(err)) {
+    return '[风控熔断] 账号触发上游服务条款/账号风控限制（TOS_VIOLATION），已本地隔离并暂停自动重试与切号；请核查账号状态后再手动解除隔离。'
+  }
   if (err instanceof EgressBlockedError) {
     return sanitizeDiagnosticText(err.message, 260)
   }

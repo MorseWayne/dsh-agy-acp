@@ -1,34 +1,56 @@
 import type { TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { AcpUsage } from './protocol.ts'
 
-/** ACP includes cache hits and writes in input; DSH counts the three buckets separately. */
+/**
+ * agy reports `inputTokens` as the UNCACHED prompt only (a cached call arrives as e.g. 2,316 input +
+ * 35,595 cache read), which is exactly DSH's `inputTokens` bucket, so nothing is subtracted.
+ * The total is kept only when DSH's token meter would accept it; otherwise it is derived.
+ */
 export function mapUsage(raw: AcpUsage): TokenUsage {
+  const input = raw.inputTokens ?? 0
+  const output = raw.outputTokens ?? 0
   const read = raw.cachedReadTokens ?? 0
   const write = raw.cachedWriteTokens ?? 0
+  const known = input + read + write + output
+  const reported = raw.totalTokens
+  // With both cache buckets present DSH demands `total - output === input + read + write` exactly.
+  const bothCacheBuckets = read > 0 && write > 0
+  const total = reported !== undefined && reported >= known && (!bothCacheBuckets || reported === known) ? reported : known
   return {
-    inputTokens: Math.max(0, (raw.inputTokens ?? 0) - read - write),
-    outputTokens: raw.outputTokens ?? 0,
+    inputTokens: input,
+    outputTokens: output,
     ...(read > 0 ? { cacheReadTokens: read } : {}),
     ...(write > 0 ? { cacheWriteTokens: write } : {}),
-    ...(raw.thoughtTokens ? { reasoningTokens: raw.thoughtTokens } : {}),
-    ...(raw.totalTokens !== undefined ? { totalTokens: raw.totalTokens } : {}),
+    ...(raw.thoughtTokens && raw.thoughtTokens <= output ? { reasoningTokens: raw.thoughtTokens } : {}),
+    totalTokens: total,
   }
 }
 
 /**
- * DSH derives context occupancy from prompt-side tokens of the latest usage sample, but the ACP
- * `session/prompt` usage is cumulative over every internal model call of the run, so its cache-read
- * bucket can exceed the context window. Prefer the live `usage_update.used` figure as the pressure.
+ * Fallback used only when agy's per-call transcript is unavailable.
+ *
+ * DSH derives context occupancy from the prompt side of the latest usage sample, but the ACP
+ * `session/prompt` usage is cumulative over every internal model call of the run, so its prompt side
+ * can exceed the context window. Scale it down to the live `usage_update.used` occupancy while keeping
+ * the run's cache-hit ratio, instead of dropping the cache buckets.
  */
 export function mapContextUsage(raw: AcpUsage | undefined, contextUsed: number | undefined): TokenUsage | undefined {
   const mapped = raw ? mapUsage(raw) : undefined
   if (contextUsed === undefined) return mapped
   if (!mapped) return { inputTokens: contextUsed, outputTokens: 0 }
-  const pressure = mapped.inputTokens + (mapped.cacheReadTokens ?? 0) + (mapped.cacheWriteTokens ?? 0)
+  const read = mapped.cacheReadTokens ?? 0
+  const write = mapped.cacheWriteTokens ?? 0
+  const pressure = mapped.inputTokens + read + write
   if (pressure <= contextUsed) return mapped
+  const scaledRead = Math.round(contextUsed * read / pressure)
+  const scaledWrite = Math.min(contextUsed - scaledRead, Math.round(contextUsed * write / pressure))
+  const scaledInput = contextUsed - scaledRead - scaledWrite
   return {
-    inputTokens: contextUsed,
+    inputTokens: scaledInput,
     outputTokens: mapped.outputTokens,
+    ...(scaledRead > 0 ? { cacheReadTokens: scaledRead } : {}),
+    ...(scaledWrite > 0 ? { cacheWriteTokens: scaledWrite } : {}),
     ...(mapped.reasoningTokens !== undefined ? { reasoningTokens: mapped.reasoningTokens } : {}),
+    totalTokens: contextUsed + mapped.outputTokens,
   }
 }

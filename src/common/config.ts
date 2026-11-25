@@ -60,7 +60,6 @@ function parseAccounts(raw: unknown): AccountProfileConfig[] {
       ...(typeof rec.label === 'string' && rec.label.trim() ? { label: rec.label.trim() } : {}),
       enabled: parseBool(rec.enabled, true),
       ...(typeof rec.homeDir === 'string' && rec.homeDir.trim() ? { homeDir: rec.homeDir.trim() } : {}),
-      ...(typeof rec.proxyUrl === 'string' && rec.proxyUrl.trim() ? { proxyUrl: rec.proxyUrl.trim() } : {}),
       ...(Object.keys(env).length > 0 ? { env } : {}),
     })
   }

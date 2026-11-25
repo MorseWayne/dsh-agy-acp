@@ -11,6 +11,7 @@ import { ReasoningEffortId, type ToolCallId } from '@deepseek-ai/dsh-llm/brand'
 import { AcpProcessExitError, AcpRpcError, AcpTimeoutError } from '../acp/client.ts'
 import type { AcpToolCallUpdate } from '../acp/protocol.ts'
 import { mapContextUsage } from '../acp/usage.ts'
+import { callUsageToTokenUsage, TranscriptUsageTailer } from '../acp/transcript-usage.ts'
 import { defaultEffort, effortLabel } from '../common/effort.ts'
 import { isGeoUnsupportedError } from '../common/geo.ts'
 import {
@@ -19,7 +20,7 @@ import {
   WRAPPER_TOOL_NAME,
   type PluginConfig,
 } from '../common/types.ts'
-import { isQuotaOrRateLimitError } from '../runtime/account-pool.ts'
+import { isQuotaOrRateLimitError, isTosViolationError } from '../runtime/account-pool.ts'
 import { policyKey, SessionPolicyChangedError } from '../runtime/permission-manager.ts'
 import { EgressBlockedError } from '../runtime/egress-guard.ts'
 import type { AcpSessionPool, ManagedAcpSession } from '../runtime/session-pool.ts'
@@ -254,12 +255,18 @@ export class AcpAdapter extends LlmAdapter {
       const rec = this.deps.runs.create(sessionKey)
       // agy emits usage_update at the end of a prompt, so seed with the last known occupancy for mirror boundaries.
       if (typeof session.contextUsed === 'number') rec.contextUsed = session.contextUsed
+      // Exact per-call usage (cache hits included) comes from agy's transcript; ACP only reports a run total.
+      rec.attachUsageSource(new TranscriptUsageTailer(this.deps.pool.transcriptPaths(session)))
       rec.setCancelHandler(() => {
         turn.cancel()
         client.sessionCancel(session.acpSessionId)
       })
 
       const unsubscribe = client.onSessionUpdate(session.acpSessionId, (update) => {
+        // A finished model call is on disk by the time its tool call / occupancy is announced.
+        if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update' || update.sessionUpdate === 'usage_update') {
+          rec.flushUsage()
+        }
         rec.pushUpdate(update)
         if (update.sessionUpdate === 'usage_update' && typeof update.used === 'number') {
           this.deps.pool.recordContextUsage(session, targetModel, update.used, typeof update.size === 'number' ? update.size : 0)
@@ -311,7 +318,15 @@ export class AcpAdapter extends LlmAdapter {
               error = new Error(`工具已获准执行，但未收到执行结果。请先核对执行状态，再决定是否重试。 ${err.message}`, { cause: err })
             }
           }
-          if (!(err instanceof AcpProcessExitError) && isGeoUnsupportedError(error)) {
+          let forceInvalidate = false
+          if (!(err instanceof AcpProcessExitError) && isTosViolationError(error)) {
+            this.deps.pool.reportAccountFailure(session.accountId, targetModel, error)
+            forceInvalidate = true
+            error = new LlmError(
+              `[风控熔断] 账号“${session.accountId}”触发上游服务条款/账号风控限制（TOS_VIOLATION）。已立即本地隔离该账号并中止自动切换备用账号，以防连坐封禁；请排查请求内容与账号状态后在控制台手动解除隔离。`,
+              'ACP_TOS_VIOLATION',
+            )
+          } else if (!(err instanceof AcpProcessExitError) && isGeoUnsupportedError(error)) {
             const snap = this.deps.pool.recordGeoRejection(session.accountId)
             this.deps.pool.reportAccountFailure(session.accountId, targetModel, error)
             const regionHint = snap.country ? `（当前检测地区：${snap.country}）` : ''
@@ -323,9 +338,9 @@ export class AcpAdapter extends LlmAdapter {
             this.deps.pool.reportAccountFailure(session.accountId, targetModel, error)
           }
           // Preserve healthy persistent processes on clean JSON-RPC application errors (`AcpRpcError`).
-          // Invalidate on timeout, process crash, transport failure, or dead child.
+          // Invalidate on timeout, process crash, transport failure, TOS quarantine, or dead child.
           const shouldInvalidate =
-            !client.isRunning || err instanceof AcpTimeoutError || !isCleanRpcError
+            forceInvalidate || !client.isRunning || err instanceof AcpTimeoutError || !isCleanRpcError
           if (shouldInvalidate && this.deps.pool.owns(session)) {
             this.deps.pool.invalidate(sessionKey)
           }
@@ -337,12 +352,16 @@ export class AcpAdapter extends LlmAdapter {
         })
 
       // Peek first item before yielding so quota/429/geo failover and pre-output crash recovery stay seamless.
+      // Never fail over on TOS_VIOLATION to avoid cascading bans across backup accounts.
       const firstItem = await rec.waitFor(0, options.signal)
       if (firstItem?.kind === 'error' && !(firstItem.error instanceof AcpProcessExitError) && !turn.permissions.requests && !options.signal?.aborted) {
+        const isTosErr =
+          isTosViolationError(firstItem.error) ||
+          (firstItem.error instanceof LlmError && firstItem.error.code === 'ACP_TOS_VIOLATION')
         const isGeoErr =
           isGeoUnsupportedError(firstItem.error) ||
           (firstItem.error instanceof LlmError && firstItem.error.code === 'ACP_GEO_UNSUPPORTED')
-        if (isQuotaOrRateLimitError(firstItem.error) || isGeoErr) {
+        if (!isTosErr && (isQuotaOrRateLimitError(firstItem.error) || isGeoErr)) {
           triedAccounts.add(session.accountId)
           if (triedAccounts.size < maxAccounts) {
             this.deps.log?.(
@@ -406,7 +425,12 @@ export class AcpAdapter extends LlmAdapter {
       })
       .catch((err: unknown) => {
         let error = err instanceof Error ? err : new Error(String(err))
-        if (isGeoUnsupportedError(error)) {
+        if (isTosViolationError(error)) {
+          error = new LlmError(
+            '[风控熔断] 账号触发上游服务条款/账号风控限制（TOS_VIOLATION）。已本地隔离该账号并中止自动切号；请核查账号状态后手动解除隔离。',
+            'ACP_TOS_VIOLATION',
+          )
+        } else if (isGeoUnsupportedError(error)) {
           error = new LlmError(
             '[地域限制熔断] 上游 Google API 拒绝了当前网络出口地域（400 FAILED_PRECONDITION）。已在本地熔断该账号出口 60 秒；请切换至支持区域节点后重试。',
             'ACP_GEO_UNSUPPORTED',
@@ -538,8 +562,13 @@ export class AcpAdapter extends LlmAdapter {
       if (item.kind === 'done') {
         const closed = closeOpenBlock()
         if (closed) yield closed
-        const usage = mapContextUsage(item.usage, rec.contextUsed)
-        if (usage) yield { type: 'usage', usage }
+        const spanUsage = await takeSpanUsage(rec, FINAL_USAGE_RETRIES, signal)
+        if (spanUsage) {
+          yield { type: 'usage', usage: callUsageToTokenUsage(spanUsage) }
+        } else if (!rec.hasUsageSource) {
+          const usage = mapContextUsage(item.usage, rec.contextUsed)
+          if (usage) yield { type: 'usage', usage }
+        }
         yield { type: 'finish', reason: { kind: 'stop' } }
         return
       }
@@ -608,9 +637,16 @@ export class AcpAdapter extends LlmAdapter {
               }
             }
 
-            // A mirror boundary has no ACP response usage; report live context occupancy so DSH can show it.
-            const boundaryUsage = mapContextUsage(undefined, rec.contextUsed)
-            if (boundaryUsage) yield { type: 'usage', usage: boundaryUsage }
+            // One DSH step = the agy model calls since the previous step. With the transcript, report their exact
+            // usage; a step without a new call (e.g. a second cut of one call) reports nothing rather than re-billing.
+            const spanUsage = await takeSpanUsage(rec, BOUNDARY_USAGE_RETRIES, signal)
+            if (spanUsage) {
+              yield { type: 'usage', usage: callUsageToTokenUsage(spanUsage) }
+            } else if (!rec.hasUsageSource) {
+              // No transcript: report live context occupancy so DSH can still show context pressure.
+              const boundaryUsage = mapContextUsage(undefined, rec.contextUsed)
+              if (boundaryUsage) yield { type: 'usage', usage: boundaryUsage }
+            }
             yield { type: 'finish', reason: { kind: 'tool-calls' } }
             return
           }
@@ -620,6 +656,20 @@ export class AcpAdapter extends LlmAdapter {
       idx++
     }
   }
+}
+
+/** agy appends a call's transcript record asynchronously; wait briefly for it before reporting a step. */
+const BOUNDARY_USAGE_RETRIES = 4
+const FINAL_USAGE_RETRIES = 6
+const USAGE_RETRY_MS = 40
+
+async function takeSpanUsage(rec: AcpRunRecording, retries: number, signal?: AbortSignal) {
+  rec.flushUsage()
+  for (let i = 0; i < retries && !rec.hasPendingUsage && rec.hasUsageSource && !signal?.aborted; i++) {
+    await new Promise(resolve => setTimeout(resolve, USAGE_RETRY_MS))
+    rec.flushUsage()
+  }
+  return rec.consumeSpanUsage()
 }
 
 function isToolReadyToEmit(rec: AcpRunRecording, idx: number, tc: MergedToolCall): boolean {
