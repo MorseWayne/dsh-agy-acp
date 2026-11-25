@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline'
+import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import type {
   InitializeParams,
   InitializeResult,
@@ -32,7 +33,7 @@ export interface AcpClientOptions {
   defaultTimeoutMs?: number
   onPermission?: PermissionHandler
   onLog?: (msg: string) => void
-  onExit?: (code: number | null, signal: NodeJS.Signals | null) => void
+  onExit?: (code: number | null, signal: NodeJS.Signals | null, client: AcpClient) => void
 }
 
 interface PendingCall {
@@ -54,10 +55,55 @@ export class AcpRpcError extends Error {
   }
 }
 
+export class AcpTimeoutError extends Error {
+  readonly method: string
+  readonly timeoutMs: number
+  readonly stderrTail: string
+
+  constructor(method: string, timeoutMs: number, stderrTail = '') {
+    const suffix = stderrTail ? ` [stderr: ${stderrTail}]` : ''
+    super(`ACP request "${method}" timed out after ${timeoutMs}ms${suffix}`)
+    this.name = 'AcpTimeoutError'
+    this.method = method
+    this.timeoutMs = timeoutMs
+    this.stderrTail = stderrTail
+  }
+}
+
+export class AcpProcessExitError extends Error {
+  readonly code: number | null
+  readonly signal: NodeJS.Signals | null
+  readonly stderrTail: string
+  readonly causeError?: string
+
+  constructor(
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    stderrTail = '',
+    causeError?: string,
+  ) {
+    const safeCause = causeError ? sanitizeDiagnosticText(causeError, 200) : undefined
+    const base = safeCause
+      ? `agy acp process error (${safeCause})`
+      : `agy acp exited (code=${String(code)}, signal=${String(signal)})`
+    const suffix = stderrTail ? ` [stderr: ${stderrTail}]` : ''
+    super(`${base}${suffix}`)
+    this.name = 'AcpProcessExitError'
+    this.code = code
+    this.signal = signal
+    this.stderrTail = stderrTail
+    if (safeCause) this.causeError = safeCause
+  }
+}
+
+const MAX_STDERR_CHUNKS = 50
+const MAX_STDERR_BYTES = 64 * 1024
+const EXIT_CLOSE_FALLBACK_MS = 250
+
 /**
  * Bidirectional JSON-RPC 2.0 client over stdio for `agy acp`.
  * Supports concurrent pending requests, server-initiated permission callbacks,
- * and per-session `session/update` streaming subscriptions.
+ * per-session `session/update` streaming subscriptions, and sanitized exit/timeout diagnostics.
  */
 export class AcpClient {
   private child: ChildProcessWithoutNullStreams | null = null
@@ -67,12 +113,17 @@ export class AcpClient {
   private readonly sessionListeners = new Map<string, Set<UpdateListener>>()
   private readonly globalListeners = new Set<(notif: SessionUpdateNotification) => void>()
   private stderrRing: string[] = []
+  private stderrBytes = 0
   private closed = false
+  private disposedByCaller = false
+  private exitSettled = false
+  private exitFallbackTimer: ReturnType<typeof setTimeout> | null = null
+  private lastExitError: AcpProcessExitError | null = null
 
   constructor(private readonly opts: AcpClientOptions) {}
 
   get isRunning(): boolean {
-    return this.child !== null && !this.closed && this.child.exitCode === null
+    return this.child !== null && !this.closed && !this.disposedByCaller && this.child.exitCode === null
   }
 
   get recentStderr(): string {
@@ -82,6 +133,12 @@ export class AcpClient {
   start(): void {
     if (this.child !== null) return
     this.closed = false
+    this.disposedByCaller = false
+    this.exitSettled = false
+    this.lastExitError = null
+    this.stderrRing = []
+    this.stderrBytes = 0
+
     const args = this.opts.args ?? ['acp']
     const child = spawn(this.opts.bin, args, {
       cwd: this.opts.cwd || process.cwd(),
@@ -92,10 +149,29 @@ export class AcpClient {
     })
     this.child = child
 
+    // Prevent unhandled EPIPE crashes if the child exits while writing notifications/responses.
+    child.stdin.on('error', () => {
+      // handled per-request or by process exit settlement
+    })
+
     child.stderr.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8')
+      const bytes = Buffer.byteLength(text, 'utf8')
       this.stderrRing.push(text)
-      if (this.stderrRing.length > 50) this.stderrRing.shift()
+      this.stderrBytes += bytes
+      while (
+        this.stderrRing.length > 1 &&
+        (this.stderrRing.length > MAX_STDERR_CHUNKS || this.stderrBytes > MAX_STDERR_BYTES)
+      ) {
+        const dropped = this.stderrRing.shift()!
+        this.stderrBytes -= Buffer.byteLength(dropped, 'utf8')
+      }
+      if (this.stderrBytes > MAX_STDERR_BYTES && this.stderrRing.length === 1) {
+        const only = this.stderrRing[0]!
+        const clipped = only.slice(Math.max(0, only.length - MAX_STDERR_BYTES))
+        this.stderrRing[0] = clipped
+        this.stderrBytes = Buffer.byteLength(clipped, 'utf8')
+      }
     })
 
     const rl = createInterface({ input: child.stdout, crlfDelay: Infinity })
@@ -103,18 +179,25 @@ export class AcpClient {
     rl.on('line', (line) => this.handleLine(line))
 
     child.on('error', (err) => {
-      this.opts.onLog?.(`agy acp spawn error: ${err.message}`)
-      this.failAllPending(err)
+      this.opts.onLog?.(`agy acp spawn error: ${sanitizeDiagnosticText(err.message, 200)}`)
+      this.settleProcessTermination(null, null, err)
     })
 
     child.on('exit', (code, signal) => {
+      if (this.disposedByCaller) return
       this.closed = true
-      this.child = null
-      this.rl?.close()
-      this.rl = null
-      const err = new Error(`agy acp exited (code=${String(code)}, signal=${String(signal)})`)
-      this.failAllPending(err)
-      this.opts.onExit?.(code, signal)
+      if (!this.exitSettled && !this.exitFallbackTimer) {
+        this.exitFallbackTimer = setTimeout(() => {
+          this.exitFallbackTimer = null
+          this.settleProcessTermination(code, signal)
+        }, EXIT_CLOSE_FALLBACK_MS)
+        this.exitFallbackTimer.unref?.()
+      }
+    })
+
+    // Wait for `close` so stdout/stderr pipes are completely drained before building diagnostics.
+    child.on('close', (code, signal) => {
+      this.settleProcessTermination(code, signal)
     })
   }
 
@@ -140,6 +223,17 @@ export class AcpClient {
 
   async request<T>(method: string, params?: unknown, timeoutMs?: number): Promise<T> {
     if (!this.isRunning || !this.child) {
+      if (!this.disposedByCaller) {
+        if (this.lastExitError) throw this.lastExitError
+        if (this.closed) {
+          throw new AcpProcessExitError(
+            null,
+            null,
+            sanitizeDiagnosticText(this.recentStderr),
+            `AcpClient is not running (cannot call ${method})`,
+          )
+        }
+      }
       throw new Error(`AcpClient is not running (cannot call ${method})`)
     }
     const id = this.nextId++
@@ -155,7 +249,7 @@ export class AcpClient {
       if (limit > 0) {
         entry.timer = setTimeout(() => {
           this.pending.delete(id)
-          reject(new Error(`ACP request "${method}" timed out after ${limit}ms`))
+          reject(new AcpTimeoutError(method, limit, sanitizeDiagnosticText(this.recentStderr)))
         }, limit)
         entry.timer.unref?.()
       }
@@ -163,8 +257,19 @@ export class AcpClient {
       this.child!.stdin.write(payload, (err) => {
         if (err) {
           if (entry.timer) clearTimeout(entry.timer)
-          this.pending.delete(id)
-          reject(err)
+          if (!this.pending.delete(id)) return
+          if (!this.disposedByCaller) {
+            reject(
+              new AcpProcessExitError(
+                null,
+                null,
+                sanitizeDiagnosticText(this.recentStderr),
+                err.message,
+              ),
+            )
+          } else {
+            reject(err)
+          }
         }
       })
     })
@@ -173,7 +278,11 @@ export class AcpClient {
   notify(method: string, params?: unknown): void {
     if (!this.isRunning || !this.child) return
     const payload = JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n'
-    this.child.stdin.write(payload)
+    try {
+      this.child.stdin.write(payload)
+    } catch {
+      // ignore write error on closing pipe
+    }
   }
 
   // ---- High-level ACP methods ---------------------------------------------
@@ -211,7 +320,13 @@ export class AcpClient {
   }
 
   dispose(): void {
+    this.disposedByCaller = true
     this.closed = true
+    this.exitSettled = true
+    if (this.exitFallbackTimer) {
+      clearTimeout(this.exitFallbackTimer)
+      this.exitFallbackTimer = null
+    }
     this.failAllPending(new Error('AcpClient disposed'))
     this.rl?.close()
     this.rl = null
@@ -230,6 +345,32 @@ export class AcpClient {
 
   // ---- Internal JSON-RPC dispatch -----------------------------------------
 
+  private settleProcessTermination(
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    causeErr?: Error,
+  ): void {
+    if (this.exitSettled || this.disposedByCaller) return
+    this.exitSettled = true
+    this.closed = true
+    if (this.exitFallbackTimer) {
+      clearTimeout(this.exitFallbackTimer)
+      this.exitFallbackTimer = null
+    }
+    this.child = null
+    this.rl?.close()
+    this.rl = null
+    const exitErr = new AcpProcessExitError(
+      code,
+      signal,
+      sanitizeDiagnosticText(this.recentStderr),
+      causeErr?.message,
+    )
+    this.lastExitError = exitErr
+    this.failAllPending(exitErr)
+    this.opts.onExit?.(code, signal, this)
+  }
+
   private handleLine(line: string): void {
     const trimmed = line.trim()
     if (!trimmed) return
@@ -237,7 +378,7 @@ export class AcpClient {
     try {
       msg = JSON.parse(trimmed) as Record<string, unknown>
     } catch {
-      this.opts.onLog?.(`non-JSON stdout from agy acp: ${trimmed.slice(0, 200)}`)
+      this.opts.onLog?.(`non-JSON stdout from agy acp: ${sanitizeDiagnosticText(trimmed, 200)}`)
       return
     }
 
@@ -309,12 +450,20 @@ export class AcpClient {
 
   private writeResponse(id: JsonRpcId, result: unknown): void {
     if (!this.isRunning || !this.child) return
-    this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n')
+    try {
+      this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n')
+    } catch {
+      // ignore write error on closing pipe
+    }
   }
 
   private writeError(id: JsonRpcId, code: number, message: string): void {
     if (!this.isRunning || !this.child) return
-    this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } }) + '\n')
+    try {
+      this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } }) + '\n')
+    } catch {
+      // ignore write error on closing pipe
+    }
   }
 
   private failAllPending(err: Error): void {

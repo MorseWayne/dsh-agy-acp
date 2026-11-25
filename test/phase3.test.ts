@@ -94,8 +94,12 @@ test('MultiAccountPool isolates HOME/proxy, tracks 5h+7d buckets, and cools down
   assert.equal(lease1.env?.HTTPS_PROXY, 'http://127.0.0.1:8081')
   lease1.release()
 
-  // 429 failure on claude cools down acct-1 ONLY for claude family
-  pool.reportFailure('acct-1', 'claude-sonnet-5-5', new Error('HTTP 429 RESOURCE_EXHAUSTED'))
+  // 429 failure on claude cools down acct-1 ONLY for claude family and redacts secrets in lastError
+  pool.reportFailure('acct-1', 'claude-sonnet-5-5', new Error('HTTP 429 RESOURCE_EXHAUSTED via https://u:p@proxy.local Authorization: Bearer secret123456'))
+  const snapAfterErr = pool.getHealthSnapshots().find(a => a.id === 'acct-1')
+  assert.ok(snapAfterErr?.lastError)
+  assert.equal(snapAfterErr!.lastError!.includes('u:p'), false)
+  assert.equal(snapAfterErr!.lastError!.includes('secret123456'), false)
 
   // Next claude request fails over to acct-2
   const leaseClaude = await pool.acquire('sess-1', 'claude-sonnet-5-5')

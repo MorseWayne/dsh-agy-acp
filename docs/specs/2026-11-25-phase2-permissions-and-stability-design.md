@@ -21,7 +21,7 @@
 
 ## 2. 架构约束与模块归属
 
-严格遵守 [scripts/lint-arch.mjs](../../../scripts/lint-arch.mjs) 单向分层规则：
+严格遵守 [scripts/lint-arch.mjs](../../scripts/lint-arch.mjs) 单向分层规则：
 
 ```
 common -> (none)

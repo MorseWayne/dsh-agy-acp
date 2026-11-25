@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 
 // Minimal ACP JSON-RPC 2.0 server over stdio for end-to-end integration tests.
@@ -149,6 +150,19 @@ async function handleRequest(id, method, params) {
   }
 
   if (method === 'session/set_config_option') {
+    if (
+      params?.configId === 'model' &&
+      params?.value === 'claude-sonnet-5-5' &&
+      process.env.FAKE_CRASH_ON_SYNC_FILE
+    ) {
+      const f = process.env.FAKE_CRASH_ON_SYNC_FILE
+      const n = existsSync(f) ? Number(readFileSync(f, 'utf8')) : 0
+      writeFileSync(f, String(n + 1))
+      if (n === 0) {
+        process.stderr.write('sync pipe died\n')
+        process.exit(1)
+      }
+    }
     const sess = sessions.get(params?.sessionId)
     if (sess) {
       for (const opt of sess.configOptions) {
@@ -459,6 +473,50 @@ async function handleRequest(id, method, params) {
         id,
         result: { stopReason: 'end_turn', usage: { inputTokens: 30, outputTokens: 10, totalTokens: 40 } },
       })
+      return
+    }
+
+    if (promptText.includes('RPC_ERR_RECOVERABLE')) {
+      send({
+        jsonrpc: '2.0',
+        id,
+        error: { code: -32001, message: 'Recoverable application refusal' },
+      })
+      return
+    }
+
+    if (promptText.includes('TIMEOUT_NEVER_REPLY')) {
+      process.stderr.write('Authorization: Bearer super_secret_token_999\nupstream slow hang\n')
+      return
+    }
+
+    if (promptText.includes('CRASH_BEFORE_OUTPUT')) {
+      const f = process.env.FAKE_CRASH_COUNTER_FILE
+      let shouldCrash = true
+      if (f) {
+        const n = existsSync(f) ? Number(readFileSync(f, 'utf8')) : 0
+        writeFileSync(f, String(n + 1))
+        if (n >= 1 && process.env.FAKE_CRASH_ALWAYS !== '1') shouldCrash = false
+      }
+      if (shouldCrash) {
+        process.stderr.write('GOOGLE_API_KEY=AIzaSySecretKey1234567890123456789\nfatal peer crash\n')
+        process.exit(1)
+      }
+      sendUpdate(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `RECOVERED:${promptText}` },
+      })
+      send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } })
+      return
+    }
+
+    if (promptText.includes('EXIT_IDLE_SOON')) {
+      sendUpdate(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'bye soon' },
+      })
+      send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } })
+      setTimeout(() => process.exit(1), 40)
       return
     }
 

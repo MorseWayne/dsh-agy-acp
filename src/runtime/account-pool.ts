@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import path from 'node:path'
 import { realpathSync } from 'node:fs'
+import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import type {
   AccountHealthSnapshot,
   AccountLease,
@@ -264,7 +265,8 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     const family = classifyModelFamily(model)
     const state = this.getOrCreateFamily(acc, family)
     const message = error instanceof Error ? error.message : String(error)
-    acc.lastError = message
+    const safeMessage = sanitizeDiagnosticText(message, 240)
+    acc.lastError = safeMessage || 'Request failed'
     state.consecutiveFailures += 1
 
     if (isQuotaOrRateLimitError(error)) {
@@ -274,7 +276,7 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
       )
       state.cooldownUntil = this.now() + backoff
       this.opts.log?.(
-        `account "${accountId}" entered ${Math.round(backoff / 1000)}s cooldown for family "${family}": ${message}`,
+        `account "${accountId}" entered ${Math.round(backoff / 1000)}s cooldown for family "${family}": ${safeMessage}`,
       )
     }
     this.emit('change')

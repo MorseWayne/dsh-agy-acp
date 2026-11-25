@@ -1,6 +1,7 @@
 import { cancelled, policyKey, type SessionPolicy, type FilePolicy } from './permission-manager.ts'
 import { EventEmitter } from 'node:events'
-import { AcpClient } from '../acp/client.ts'
+import { AcpClient, AcpProcessExitError, AcpTimeoutError } from '../acp/client.ts'
+import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import type {
   AcpConfigOption,
   AcpMcpServerSpec,
@@ -326,6 +327,7 @@ export class AcpSessionPool extends EventEmitter {
     env: NodeJS.ProcessEnv | undefined,
     signal: AbortSignal,
     onPermission?: (r: RequestPermissionParams) => Promise<RequestPermissionResult>,
+    onExit?: (code: number | null, signal: NodeJS.Signals | null, client: AcpClient) => void,
   ): Promise<{ client: AcpClient; initResult: InitializeResult }> {
     const bin = this.deps.resolveBin()
     if (!bin) throw new Error('agy binary not found — install Antigravity CLI first')
@@ -333,7 +335,7 @@ export class AcpSessionPool extends EventEmitter {
     signal.throwIfAborted()
     if (!exe || this.disposed) throw new Error('ACP launch unavailable')
     const client = new AcpClient({ bin: exe, args, env, cwd: policy.workspaceRoot,
-      defaultTimeoutMs: this.deps.getConfig().requestTimeoutMs, onPermission, onLog: this.deps.log })
+      defaultTimeoutMs: this.deps.getConfig().requestTimeoutMs, onPermission, onExit, onLog: this.deps.log })
     const stop = () => client.dispose()
     signal.addEventListener('abort', stop, { once: true })
     try {
@@ -365,7 +367,7 @@ export class AcpSessionPool extends EventEmitter {
       existing.lastActiveAt = Date.now()
       return { client: current, session: existing, created: false }
     }
-    if (existing) this.invalidate(key)
+    if (existing || current) this.invalidate(key)
     const opening = new AbortController()
     this.opening.set(key, opening)
     const stopOpening = () => client?.dispose()
@@ -375,11 +377,31 @@ export class AcpSessionPool extends EventEmitter {
     try {
       lease = await this.accountProvider.acquire(key, model, exclude)
       opening.signal.throwIfAborted()
-      const launched = await this.newClient(policy, lease.env, opening.signal, async req => {
-        const signal = this.activeSignal(key)
-        if (!signal || this.clients.get(key) !== client || req.sessionId !== this.sessions.get(key)?.acpSessionId) return cancelled()
-        return await this.deps.onPermission?.(req, key, signal) ?? cancelled()
-      })
+      const launched = await this.newClient(
+        policy,
+        lease.env,
+        opening.signal,
+        async req => {
+          const signal = this.activeSignal(key)
+          if (!signal || this.clients.get(key) !== client || req.sessionId !== this.sessions.get(key)?.acpSessionId) return cancelled()
+          return await this.deps.onPermission?.(req, key, signal) ?? cancelled()
+        },
+        (code, signal, exitedClient) => {
+          if (this.clients.get(key) !== exitedClient) return
+          this.deps.log?.(`agy acp session "${key}" exited unexpectedly (code=${String(code)}, signal=${String(signal)})`)
+          this.clients.delete(key)
+          this.sessions.delete(key)
+          this.policies.delete(key)
+          const activeTurn = this.active.get(key)
+          if (activeTurn) {
+            activeTurn.controller.abort()
+            activeTurn.settle()
+            this.active.delete(key)
+          }
+          this.deps.onSessionClosed?.(key)
+          this.emitStatus()
+        },
+      )
       client = launched.client
       const supportsSystemPromptAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
       opening.signal.throwIfAborted()
@@ -631,7 +653,7 @@ export class AcpSessionPool extends EventEmitter {
       if (this.disposed) throw err
       // A failed group is cached by DSH's menu just like a successful group. Retry
       // the constrained discovery, then publish its recovery without requiring a chat turn.
-      this.lastError = 'ACP 模型目录探测失败；请检查 agy 登录状态和只读探测环境。'
+      this.lastError = formatCatalogProbeError(err)
       this.emitStatus()
       const delay = [5_000, 30_000, 60_000][this.catalogRetryCount]
       if (delay !== undefined && !this.catalogRetry) {
@@ -674,15 +696,16 @@ export class AcpSessionPool extends EventEmitter {
   }
 
   invalidate(key: string): void {
-    if (!this.opening.has(key) && !this.sessions.has(key)) return
+    if (!this.opening.has(key) && !this.sessions.has(key) && !this.clients.has(key)) return
     this.opening.get(key)?.abort()
     this.active.get(key)?.controller.abort()
     this.active.get(key)?.settle()
     this.active.delete(key)
     this.sessions.delete(key)
     this.policies.delete(key)
-    this.clients.get(key)?.dispose()
+    const client = this.clients.get(key)
     this.clients.delete(key)
+    client?.dispose()
     this.deps.onSessionClosed?.(key)
     this.emitStatus()
   }
@@ -690,7 +713,7 @@ export class AcpSessionPool extends EventEmitter {
   async closeSession(key: string): Promise<void> { this.invalidate(key) }
 
   async resetAllSessions(): Promise<number> {
-    const keys = new Set([...this.sessions.keys(), ...this.opening.keys()])
+    const keys = new Set([...this.sessions.keys(), ...this.opening.keys(), ...this.clients.keys()])
     for (const key of keys) this.invalidate(key)
     return keys.size
   }
@@ -743,4 +766,34 @@ export class AcpSessionPool extends EventEmitter {
 
 function findCurrentOption(options: AcpConfigOption[], id: string): string | undefined {
   return selectOption(options, id)?.currentValue
+}
+
+export function formatCatalogProbeError(err: unknown): string {
+  if (err instanceof AcpTimeoutError) {
+    return err.stderrTail
+      ? `ACP 模型目录探测超时，请检查 agy CLI 登录状态或网络连接（${err.stderrTail}）`
+      : 'ACP 模型目录探测超时，请检查 agy CLI 登录状态或网络连接。'
+  }
+  if (err instanceof AcpProcessExitError) {
+    if (err.causeError && /ENOENT/i.test(err.causeError)) {
+      return '未找到 agy 可执行文件，请检查 PATH 或插件配置中的 agyBin 路径。'
+    }
+    if (err.causeError) {
+      return `ACP 模型目录探测启动失败：${sanitizeDiagnosticText(err.causeError, 160)}`
+    }
+    const base = `ACP 模型目录探测进程异常退出（code=${String(err.code)}, signal=${String(err.signal)}）`
+    return err.stderrTail ? `${base}：${err.stderrTail}` : base
+  }
+  const msg = err instanceof Error ? err.message : String(err ?? '')
+  if (/binary not found|ENOENT/i.test(msg)) {
+    return '未找到 agy 可执行文件，请检查 PATH 或插件配置中的 agyBin 路径。'
+  }
+  if (/refusing unconfined startup/i.test(msg)) {
+    return '宿主只读沙箱不可用（未满足完整受限约束），已拒绝无沙箱探测模型目录。'
+  }
+  if (/empty ACP model catalog/i.test(msg)) {
+    return 'agy 返回了空的 ACP 模型目录，请检查当前账号登录状态。'
+  }
+  const safe = sanitizeDiagnosticText(msg, 200)
+  return safe ? `ACP 模型目录探测失败：${safe}` : 'ACP 模型目录探测失败；请检查 agy 登录状态和只读探测环境。'
 }

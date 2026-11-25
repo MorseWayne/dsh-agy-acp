@@ -3,6 +3,7 @@ import test from 'node:test'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import { validateJsonSchemaValue, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { resolveConfig } from '../src/common/config.ts'
+import { sanitizeDiagnosticText } from '../src/common/sanitize.ts'
 import { MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME } from '../src/common/types.ts'
 import { detectContinuation } from '../src/provider/adapter.ts'
 import {
@@ -328,4 +329,44 @@ test('detectContinuation takes max itemIndex across out-of-order concurrent tool
     { role: 'user', source: { kind: 'runtime-context' }, content: [{ type: 'text', text: 'ctx' }] },
   ])
   assert.deepEqual(cont, { runId: 'runA', itemIndex: 5 })
+})
+
+test('sanitizeDiagnosticText redacts credentials case-insensitively before tail truncation', () => {
+  const raw = [
+    '\u001b[31mERROR\u001b[0m GOOGLE_API_KEY=AIzaSySecretKey1234567890123456789',
+    'PROXY_PASSWORD=my-secret-pass',
+    '{"access_token": "tok_json_secret", "cookie": "a=secret1; b=secret2"}',
+    'Authorization: BEARER eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123456',
+    'Cookie: sid=abc123; csrf=xyz789',
+    'https://user:pass@proxy.local:8080/path?api_key=querySecret&ok=1',
+    'https://onlytoken@proxy2.local:8080/test',
+    'key=sk-ant-api03-verysecretvalue1234567890',
+    'FINAL_ROOT_CAUSE_MARKER',
+  ].join('\n')
+
+  const clean = sanitizeDiagnosticText(raw, 400)
+  for (const leak of [
+    'AIzaSySecretKey',
+    'my-secret-pass',
+    'tok_json_secret',
+    'secret1',
+    'secret2',
+    'eyJhbGci',
+    'abc123',
+    'xyz789',
+    'user:pass',
+    'onlytoken',
+    'querySecret',
+    'sk-ant-api03',
+    '\u001b[31m',
+  ]) {
+    assert.equal(clean.includes(leak), false, `must not leak "${leak}" in: ${clean}`)
+  }
+  assert.match(clean, /FINAL_ROOT_CAUSE_MARKER/)
+
+  // Tail truncation must happen AFTER redaction so a boundary-spanning token never leaks its suffix
+  const boundaryToken = 'Bearer ' + 'A'.repeat(200)
+  const truncated = sanitizeDiagnosticText(`prefix ${boundaryToken} tail_err`, 40)
+  assert.equal(truncated.includes('AAAA'), false)
+  assert.match(truncated, /tail_err/)
 })

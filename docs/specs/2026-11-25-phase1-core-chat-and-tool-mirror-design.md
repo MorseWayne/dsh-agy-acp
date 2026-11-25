@@ -24,7 +24,7 @@
 
 ## 2. 架构约束
 
-必须严格遵守 [scripts/lint-arch.mjs](../../../scripts/lint-arch.mjs) 定义的单向分层依赖，不新增跨层或循环依赖：
+必须严格遵守 [scripts/lint-arch.mjs](../../scripts/lint-arch.mjs) 定义的单向分层依赖，不新增跨层或循环依赖：
 
 ```
 common -> (none)

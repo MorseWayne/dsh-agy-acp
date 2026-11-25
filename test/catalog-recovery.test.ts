@@ -2,8 +2,9 @@ import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
+import { AcpProcessExitError, AcpTimeoutError } from '../src/acp/client.ts'
 import { resolveConfig } from '../src/common/config.ts'
-import { AcpSessionPool } from '../src/runtime/session-pool.ts'
+import { AcpSessionPool, formatCatalogProbeError } from '../src/runtime/session-pool.ts'
 import { fakeHost } from './fixtures/session-policy.ts'
 
 test('picker recovers after a cold probe failure; expired reads keep the last catalog without notification loops', async t => {
@@ -45,4 +46,15 @@ test('picker recovers after a cold probe failure; expired reads keep the last ca
   t.mock.timers.tick(5 * 60_000 + 1)
   await pool.refreshModels()
   assert.equal(updates, 2, 'unchanged healthy metadata must not retrigger host discovery')
+})
+
+test('formatCatalogProbeError classifies failure causes clearly without leaking secrets', () => {
+  assert.match(formatCatalogProbeError(new Error('agy binary not found')), /未找到 agy 可执行文件/)
+  assert.match(formatCatalogProbeError(new Error('refusing unconfined startup')), /宿主只读沙箱不可用/)
+  assert.match(formatCatalogProbeError(new AcpTimeoutError('initialize', 15000, 'slow')), /探测超时.*slow/)
+  const exitMsg = formatCatalogProbeError(new AcpProcessExitError(1, null, 'bad auth', undefined))
+  assert.match(exitMsg, /异常退出.*code=1.*bad auth/)
+  const generic = formatCatalogProbeError(new Error('failed with GOOGLE_API_KEY=AIzaSySecretKey1234567890123456789'))
+  assert.equal(generic.includes('AIzaSySecretKey'), false)
+  assert.match(generic, /\[REDACTED\]/)
 })

@@ -1,6 +1,7 @@
 import { fakeHost } from './fixtures/session-policy.ts'
 import assert from 'node:assert/strict'
-import { chmodSync } from 'node:fs'
+import { chmodSync, mkdtempSync, rmSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
@@ -633,5 +634,137 @@ test('options.purpose auxiliary calls enforce mode=default, deny all permissions
     )
   } finally {
     pool.dispose()
+  }
+})
+
+test('AcpRpcError preserves persistent process and releases turn lock immediately; AcpTimeoutError invalidates without retry', async () => {
+  const { adapter, pool, cfg } = createHarness()
+  try {
+    // Turn 1: clean JSON-RPC error -> process stays alive & active turn lock is released synchronously
+    const errTurn = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'RPC_ERR_RECOVERABLE' }] } as Message],
+        sessionId: 'dsh-rpc-keep',
+      } as GenerateOptions),
+    )
+    const errFinish = errTurn.find(c => c.type === 'finish')
+    assert.ok(errFinish && errFinish.type === 'finish' && errFinish.reason.kind === 'error')
+    assert.equal(pool.getStatus().activeSessions, 1)
+
+    // Immediate next turn reuses exact same sess_1 (#2) with no lock race
+    const okTurn = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'still alive' }] } as Message],
+        sessionId: 'dsh-rpc-keep',
+      } as GenerateOptions),
+    )
+    assert.equal(okTurn.filter(c => c.type === 'text-delta').map(c => c.text).join(''), '[sess_1#2] still alive')
+
+    // Timeout MUST invalidate process, never auto-retry, and attach sanitized stderr
+    cfg.requestTimeoutMs = 150
+    const timeoutTurn = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'TIMEOUT_NEVER_REPLY' }] } as Message],
+        sessionId: 'dsh-rpc-keep',
+      } as GenerateOptions),
+    )
+    const timeoutFinish = timeoutTurn.find(c => c.type === 'finish')
+    assert.ok(timeoutFinish && timeoutFinish.type === 'finish' && timeoutFinish.reason.kind === 'error')
+    assert.match(timeoutFinish.reason.failure.message, /timed out/)
+    assert.match(timeoutFinish.reason.failure.message, /upstream slow hang/)
+    assert.equal(timeoutFinish.reason.failure.message.includes('super_secret_token_999'), false)
+    assert.equal(pool.getStatus().activeSessions, 0)
+  } finally {
+    pool.dispose()
+  }
+})
+
+test('pre-output process crash auto-recovers once with digest, reports sanitized stderr on repeat crash, and cleans zombie sessions on idle exit', async () => {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'dsh-agy-crash-'))
+  const counterFile = path.join(tmpDir, 'crash-count')
+  const syncCrashFile = path.join(tmpDir, 'sync-crash-count')
+  const prevCounter = process.env.FAKE_CRASH_COUNTER_FILE
+  const prevAlways = process.env.FAKE_CRASH_ALWAYS
+  const prevSync = process.env.FAKE_CRASH_ON_SYNC_FILE
+
+  const { adapter, pool } = createHarness()
+  try {
+    // 1. Pre-output crash on first attempt -> silently recreates and succeeds on retry 1/1
+    process.env.FAKE_CRASH_COUNTER_FILE = counterFile
+    delete process.env.FAKE_CRASH_ALWAYS
+    const recovered = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'earlier context' }] } as Message,
+          { role: 'assistant', content: [{ type: 'text', text: 'earlier answer' }] } as Message,
+          { role: 'user', content: [{ type: 'text', text: 'CRASH_BEFORE_OUTPUT now' }] } as Message,
+        ],
+        sessionId: 'dsh-crash-once',
+      } as GenerateOptions),
+    )
+    const recoveredText = recovered.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+    assert.match(recoveredText, /^RECOVERED:/)
+    assert.match(recoveredText, /earlier context/)
+
+    // 2. Crash during syncSessionOptions on reused session also auto-recovers once
+    process.env.FAKE_CRASH_ON_SYNC_FILE = syncCrashFile
+    const syncRecovered = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'claude-sonnet-5-5',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'after sync crash' }] } as Message],
+        sessionId: 'dsh-crash-once',
+      } as GenerateOptions),
+    )
+    assert.match(syncRecovered.filter(c => c.type === 'text-delta').map(c => c.text).join(''), /after sync crash/)
+    delete process.env.FAKE_CRASH_ON_SYNC_FILE
+
+    // 3. Persistent crash (2x) stops after 1 retry and surfaces sanitized stderr
+    process.env.FAKE_CRASH_ALWAYS = '1'
+    const failed = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'CRASH_BEFORE_OUTPUT again' }] } as Message],
+        sessionId: 'dsh-crash-always',
+      } as GenerateOptions),
+    )
+    const failFinish = failed.find(c => c.type === 'finish')
+    assert.ok(failFinish && failFinish.type === 'finish' && failFinish.reason.kind === 'error')
+    assert.match(failFinish.reason.failure.message, /fatal peer crash/)
+    assert.equal(failFinish.reason.failure.message.includes('AIzaSySecretKey'), false)
+    assert.match(failFinish.reason.failure.message, /\[REDACTED\]/)
+    delete process.env.FAKE_CRASH_ALWAYS
+    delete process.env.FAKE_CRASH_COUNTER_FILE
+
+    // 4. Idle unexpected exit automatically evicts zombie session via onExit
+    const idleTurn = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'EXIT_IDLE_SOON' }] } as Message],
+        sessionId: 'dsh-idle-exit',
+      } as GenerateOptions),
+    )
+    assert.equal(idleTurn.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'bye soon')
+    await new Promise(r => setTimeout(r, 150))
+    assert.equal(pool.getStatus().sessions.some(s => s.dshSessionKey === 'dsh-idle-exit'), false)
+  } finally {
+    if (prevCounter === undefined) delete process.env.FAKE_CRASH_COUNTER_FILE
+    else process.env.FAKE_CRASH_COUNTER_FILE = prevCounter
+    if (prevAlways === undefined) delete process.env.FAKE_CRASH_ALWAYS
+    else process.env.FAKE_CRASH_ALWAYS = prevAlways
+    if (prevSync === undefined) delete process.env.FAKE_CRASH_ON_SYNC_FILE
+    else process.env.FAKE_CRASH_ON_SYNC_FILE = prevSync
+    pool.dispose()
+    rmSync(tmpDir, { recursive: true, force: true })
   }
 })

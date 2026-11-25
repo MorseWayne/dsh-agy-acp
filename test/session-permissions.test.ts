@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import type { RequestPermissionParams } from '../src/acp/protocol.ts'
 import { resolveConfig } from '../src/common/config.ts'
 import { hostPermissions } from '../src/runtime/host-permissions.ts'
-import { decidePermission, type SessionPolicy } from '../src/runtime/permission-manager.ts'
+import { decidePermission, extractEditTargets, formatApprovalReason, type SessionPolicy } from '../src/runtime/permission-manager.ts'
 import { AcpSessionPool } from '../src/runtime/session-pool.ts'
 import { fakeHost } from './fixtures/session-policy.ts'
 
@@ -119,5 +121,106 @@ test('auxiliary prompt fails closed when read-only sandbox confinement is partia
     )
   } finally {
     pool.dispose()
+  }
+})
+
+test('workspace-write accepts safe rawInput paths, rejects multi-key/patch/symlink escapes, and never silently denies >8KB edits', async () => {
+  const tmpBase = mkdtempSync(path.join(os.tmpdir(), 'dsh-agy-perm-'))
+  const workDir = path.join(tmpBase, 'workspace')
+  const outsideDir = path.join(tmpBase, 'outside')
+  const { mkdirSync } = await import('node:fs')
+  mkdirSync(workDir, { recursive: true })
+  mkdirSync(outsideDir, { recursive: true })
+  writeFileSync(path.join(outsideDir, 'secret.txt'), 'secret')
+  const linkPath = path.join(workDir, 'escape-link')
+  symlinkSync(outsideDir, linkPath)
+
+  const wsLocal: SessionPolicy = {
+    sessionId: 's',
+    mode: 'workspace-write',
+    approval: 'ask',
+    workspaceRoot: workDir,
+    preset: 'workspace-write',
+  }
+  const makeReq = (toolCall: Partial<RequestPermissionParams['toolCall']>): RequestPermissionParams => ({
+    sessionId: 's',
+    toolCall: { toolCallId: 't1', sessionUpdate: 'tool_call', kind: 'edit', name: 'edit_file', ...toolCall },
+    options: [{ optionId: 'ok', kind: 'allow_once', name: 'OK' }, { optionId: 'no', kind: 'reject_once', name: 'No' }],
+  })
+
+  try {
+    const neverAsk = async () => { assert.fail('should auto-allow safe workspace edit') }
+    // 1. Safe edit with path only in rawInput (no locations) auto-allows even for large >10KB content
+    assert.deepEqual(
+      await decidePermission(
+        makeReq({ rawInput: { Path: 'src/big.ts', Target: 'old', Replacement: 'x'.repeat(12_000) } }),
+        () => wsLocal,
+        neverAsk,
+        signal(),
+      ),
+      outcome('ok'),
+    )
+
+    // 2. Conflicting locations (inside) + rawInput (outside) must fail-closed to ask
+    let askedReasons: string[] = []
+    const recordAsk = async (reason: string) => { askedReasons.push(reason); return 'rejected' }
+    assert.deepEqual(
+      await decidePermission(
+        makeReq({ locations: [{ path: 'src/ok.ts' }], rawInput: { TargetFile: '../outside/secret.txt' } }),
+        () => wsLocal,
+        recordAsk,
+        signal(),
+      ),
+      outcome('no'),
+    )
+    assert.equal(askedReasons.length, 1)
+
+    // 3. Malformed array entry & suspicious patch key must fail-closed to ask
+    assert.equal(extractEditTargets(makeReq({ rawInput: { paths: ['src/a.ts', 123] } })), null)
+    assert.equal(extractEditTargets(makeReq({ rawInput: { Path: 'src/a.ts', patch: '--- a\n+++ /etc/passwd' } })), null)
+    assert.equal(extractEditTargets(makeReq({ rawInput: { Path: 'src/a.ts', Target: '/etc/passwd' } })), null)
+
+    // 4. Symlink inside workspace pointing outside must NOT auto-allow
+    askedReasons = []
+    assert.deepEqual(
+      await decidePermission(
+        makeReq({ rawInput: { Path: 'escape-link/secret.txt', Content: 'overwrite' } }),
+        () => wsLocal,
+        recordAsk,
+        signal(),
+      ),
+      outcome('no'),
+    )
+    assert.equal(askedReasons.length, 1)
+
+    // 5. Large >10KB edit in `auto` mode prompts with readable summary (NOT silent denial!)
+    const autoPolicy: SessionPolicy = { ...wsLocal, preset: 'auto' }
+    askedReasons = []
+    assert.deepEqual(
+      await decidePermission(
+        makeReq({ rawInput: { Path: 'src/large.ts', Content: 'line\n'.repeat(3000) } }),
+        () => autoPolicy,
+        async (reason) => { askedReasons.push(reason); return 'allowed-once' },
+        signal(),
+      ),
+      outcome('ok'),
+    )
+    assert.equal(askedReasons.length, 1)
+    assert.match(askedReasons[0]!, /src\/large\.ts/)
+    assert.match(askedReasons[0]!, /已截断预览/)
+
+    // 6. Execute reason includes structured args and explicit truncation warning for >16KB commands
+    const argsReason = formatApprovalReason(
+      makeReq({ kind: 'execute', name: 'exec', rawInput: { command: 'bash', args: ['-c', 'rm -rf /tmp/x'], cwd: '/work' } }),
+    )
+    assert.match(argsReason, /bash \["-c","rm -rf \/tmp\/x"\]/)
+    assert.match(argsReason, /\/work/)
+
+    const hugeCmdReason = formatApprovalReason(
+      makeReq({ kind: 'execute', name: 'run_command', rawInput: { CommandLine: 'echo ' + 'z'.repeat(20_000) } }),
+    )
+    assert.match(hugeCmdReason, /命令超长已截断/)
+  } finally {
+    rmSync(tmpBase, { recursive: true, force: true })
   }
 })

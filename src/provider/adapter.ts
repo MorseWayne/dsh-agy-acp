@@ -8,6 +8,7 @@ import {
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { ReasoningEffortId, type ToolCallId } from '@deepseek-ai/dsh-llm/brand'
+import { AcpProcessExitError, AcpRpcError, AcpTimeoutError } from '../acp/client.ts'
 import type { AcpToolCallUpdate } from '../acp/protocol.ts'
 import { mapUsage } from '../acp/usage.ts'
 import { defaultEffort, effortLabel } from '../common/effort.ts'
@@ -135,14 +136,16 @@ export class AcpAdapter extends LlmAdapter {
       }
     }
 
-    // 2. Fresh turn over persistent ACP session (with automatic 429/quota failover).
+    // 2. Fresh turn over persistent ACP session (with automatic 429 failover + 1x pre-output crash recovery).
     const cwd = this.deps.pool.policy(sessionKey).workspaceRoot
     const requestedModel = options.model || cfg.defaultModel || ''
     const preparedSystem = prepareSystemPrompt(options.system)
     const triedAccounts = new Set<string>()
-    const maxAttempts = Math.max(1, cfg.accounts.filter((a) => a.enabled !== false).length || 1)
+    let crashRetried = false
+    const maxAccounts = Math.max(1, cfg.accounts.filter((a) => a.enabled !== false).length || 1)
+    const maxIterations = maxAccounts + 2
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    for (let iter = 0; iter < maxIterations; iter++) {
       const { client, session, created } = await this.deps.pool.getOrCreateSession(
         sessionKey,
         cwd,
@@ -150,19 +153,30 @@ export class AcpAdapter extends LlmAdapter {
         triedAccounts.size > 0 ? triedAccounts : undefined,
         preparedSystem ?? undefined,
       )
-      triedAccounts.add(session.accountId)
 
       const targetModel = requestedModel || session.currentModel
       const policy = this.deps.pool.policy(sessionKey)
       const nativeAuto = session.configOptions.find(o => o.id === 'mode')?.options?.some(o => 'value' in o ? o.value === 'auto' : o.options.some(v => v.value === 'auto'))
       const targetMode = policy.preset === 'auto' && policy.mode === 'danger-full-access' && nativeAuto ? 'auto' : 'default'
 
-      await this.deps.pool.syncSessionOptions(client, session, {
-        model: targetModel,
-        effort: options.reasoningEffort,
-        configuredEffort: cfg.defaultEffort,
-        mode: targetMode,
-      })
+      try {
+        await this.deps.pool.syncSessionOptions(client, session, {
+          model: targetModel,
+          effort: options.reasoningEffort,
+          configuredEffort: cfg.defaultEffort,
+          mode: targetMode,
+        })
+      } catch (err) {
+        if (err instanceof AcpProcessExitError) {
+          if (this.deps.pool.owns(session)) this.deps.pool.invalidate(sessionKey)
+          if (!crashRetried && !options.signal?.aborted) {
+            crashRetried = true
+            this.deps.log?.(`agy acp exited during option sync for "${sessionKey}", recreating session (retry 1/1)`)
+            continue
+          }
+        }
+        throw err
+      }
 
       this.deps.pool.notifyStatusChange()
       const baseBlocks = buildPromptBlocks(options.messages as readonly PromptMessage[], created)
@@ -198,6 +212,16 @@ export class AcpAdapter extends LlmAdapter {
       }
       options.signal?.addEventListener('abort', onAbort, { once: true })
 
+      let cleanedUp = false
+      const cleanupTurn = (): void => {
+        if (cleanedUp) return
+        cleanedUp = true
+        turn.finish()
+        unsubscribe()
+        rec.setCancelHandler(null)
+        options.signal?.removeEventListener('abort', onAbort)
+      }
+
       // Run `session/prompt` in background so the recording can span multiple DSH tool-mirror loops.
       void client
         .sessionPrompt({ sessionId: session.acpSessionId, prompt: promptBlocks }, cfg.requestTimeoutMs)
@@ -205,35 +229,47 @@ export class AcpAdapter extends LlmAdapter {
           if (pendingSystemHash) session.appliedSystemHash = pendingSystemHash
           this.deps.pool.reportAccountSuccess(session.accountId, targetModel)
           this.deps.pool.recordTurnUsage(res.usage)
+          // Release active turn slot synchronously BEFORE waking consumers to prevent next-turn race.
+          cleanupTurn()
           rec.finish(res.stopReason, res.usage)
         })
         .catch((err: unknown) => {
           const error = err instanceof Error ? err : new Error(String(err))
           this.deps.pool.reportAccountFailure(session.accountId, targetModel, error)
-          // A timed-out RPC may still be running on the peer. Never reuse that process.
-          if (this.deps.pool.owns(session)) this.deps.pool.invalidate(sessionKey)
+          // Preserve healthy persistent processes on clean JSON-RPC application errors (`AcpRpcError`).
+          // Invalidate on timeout, process crash, transport failure, or dead child.
+          const shouldInvalidate =
+            !client.isRunning || error instanceof AcpTimeoutError || !(error instanceof AcpRpcError)
+          if (shouldInvalidate && this.deps.pool.owns(session)) {
+            this.deps.pool.invalidate(sessionKey)
+          }
+          cleanupTurn()
           rec.fail(error)
         })
         .finally(() => {
-          turn.finish()
-          unsubscribe()
-          rec.setCancelHandler(null)
-          options.signal?.removeEventListener('abort', onAbort)
+          cleanupTurn()
         })
 
-      // Peek first item before yielding so quota/429 errors before any output can seamlessly fail over.
+      // Peek first item before yielding so quota/429 failover and pre-output crash recovery stay seamless.
       const firstItem = await rec.waitFor(0, options.signal)
-      if (
-        firstItem?.kind === 'error' &&
-        isQuotaOrRateLimitError(firstItem.error) &&
-        attempt + 1 < maxAttempts &&
-        !options.signal?.aborted
-      ) {
-        this.deps.log?.(
-          `account "${session.accountId}" hit quota/rate-limit on "${targetModel}", failing over (attempt ${attempt + 2}/${maxAttempts})`,
-        )
-        await this.deps.pool.closeSession(sessionKey)
-        continue
+      if (firstItem?.kind === 'error' && !options.signal?.aborted) {
+        if (isQuotaOrRateLimitError(firstItem.error)) {
+          triedAccounts.add(session.accountId)
+          if (triedAccounts.size < maxAccounts) {
+            this.deps.log?.(
+              `account "${session.accountId}" hit quota/rate-limit on "${targetModel}", failing over (${triedAccounts.size}/${maxAccounts} tried)`,
+            )
+            await this.deps.pool.closeSession(sessionKey)
+            continue
+          }
+        } else if (firstItem.error instanceof AcpProcessExitError && !crashRetried) {
+          crashRetried = true
+          this.deps.log?.(
+            `agy acp process exited before output on "${sessionKey}", recreating session and retrying once: ${firstItem.error.message}`,
+          )
+          await this.deps.pool.closeSession(sessionKey)
+          continue
+        }
       }
 
       yield* this.driveRecording(rec, 0, cutOnTool, isCodeMode, options.signal)
