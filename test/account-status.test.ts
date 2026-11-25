@@ -68,3 +68,52 @@ test('default machine profile is visible before connection, and quota does not o
   assert.equal(pool.getStatus().activeSessions, 0)
   assert.ok(pool.getStatus().accounts[0]?.quota?.groups.length)
 })
+
+test('quotaAwareScheduling stays observational when off, routes to high-headroom account when enabled, and clears weights when disabled', async t => {
+  let cfg = resolveConfig({
+    quotaAwareScheduling: false,
+    accounts: [
+      { id: 'low-acct', homeDir: path.resolve('fake-low'), env: { ...testEnv, QUOTA_FRAC: '0.05' } },
+      { id: 'high-acct', homeDir: path.resolve('fake-high'), env: { ...testEnv, QUOTA_FRAC: '0.92' } },
+    ],
+  })
+  const accountPool = new MultiAccountPool({ accounts: cfg.accounts })
+  const usageScript = `console.log(JSON.stringify({event:'command_result',command:{name:'usage',data:{groups:[{name:'Gemini Models',buckets:[{window:'5h',remaining_fraction:Number(process.env.QUOTA_FRAC)}]}]}}}))`
+
+  const pool = new AcpSessionPool({
+    ...fakeHost,
+    accountProvider: accountPool,
+    getConfig: () => cfg,
+    resolveBin: () => 'mock-agy',
+    onConfigPatch: (patch) => {
+      cfg = { ...cfg, ...patch }
+    },
+    async prepareArgv(argv) {
+      if (argv[1] === '--version') return [process.execPath, '-e', "console.log('agy 1.5.17')"]
+      return [process.execPath, '-e', usageScript]
+    },
+  })
+  t.after(() => pool.dispose())
+
+  await pool.refreshAccountQuota('low-acct')
+  await pool.refreshAccountQuota('high-acct')
+
+  // Default quotaAwareScheduling=false: scheduler has NO quota buckets injected -> picks first candidate `low-acct`
+  assert.equal(pool.getStatus().accounts[0]?.families['gemini-pro'], undefined)
+  const l1 = await accountPool.acquire('s-obs', 'gemini-4-neon')
+  assert.equal(l1.accountId, 'low-acct')
+  l1.release()
+
+  // Turn ON quotaAwareScheduling -> syncs existing samples -> new session prefers `high-acct` (92% > 5%)!
+  await pool.updateConfig({ quotaAwareScheduling: true })
+  assert.equal(pool.getStatus().accounts[0]?.families['gemini-pro']?.fiveHour?.remainingFraction, 0.05)
+  assert.equal(pool.getStatus().accounts[1]?.families['gemini-pro']?.fiveHour?.remainingFraction, 0.92)
+  const l2 = await accountPool.acquire('s-weighted', 'gemini-4-neon')
+  assert.equal(l2.accountId, 'high-acct')
+  l2.release()
+
+  // Turn OFF quotaAwareScheduling -> clears scheduler weights while keeping observational quota display
+  await pool.updateConfig({ quotaAwareScheduling: false })
+  assert.equal(pool.getStatus().accounts[0]?.families['gemini-pro']?.fiveHour, undefined)
+  assert.equal(pool.getStatus().accounts[0]?.quota?.groups[0]?.fiveHour?.remainingFraction, 0.05)
+})

@@ -5,6 +5,7 @@ import {
   activeCooldowns,
   bucketDisplay,
   formatEgressBadge,
+  lowQuotaWarnings,
   nextAccountExpiry,
   requestAccountAction,
   type AccountActionKind,
@@ -45,6 +46,7 @@ export function AccountCard({ account, applyStatus }: { account: AccountHealthSn
 
   const cooldowns = activeCooldowns(account.families, now)
   const { quota, egress } = account
+  const lowWarnings = lowQuotaWarnings(quota, now)
   const egressBadge = formatEgressBadge(egress)
   const egressColor =
     egressBadge.tone === 'success'
@@ -140,6 +142,17 @@ export function AccountCard({ account, applyStatus }: { account: AccountHealthSn
         title: unavailable || undefined, onClick: () => void act('refresh'), 'aria-label': `刷新 ${account.label} 的配额`,
       }, pending === 'refresh' ? '刷新中…' : '刷新配额')),
     unavailable ? h('div', { style: secondary }, unavailable) : null,
+    lowWarnings.length > 0
+      ? h('div', {
+          role: 'alert',
+          style: {
+            fontSize: '12px',
+            fontWeight: 500,
+            color: lowWarnings.some(w => w.exhausted) ? theme.stateError : theme.stateWarn,
+            marginTop: '4px',
+          },
+        }, `低配额预警：${lowWarnings.map(w => `${w.group} · ${w.windowLabel}${w.exhausted ? '已耗尽' : `仅剩 ${bucketDisplay({ remainingFraction: w.remainingFraction }, now)}`}`).join('；')}`)
+      : null,
     quota ? h('div', { style: secondary }, `上次成功更新：${localTime(quota.sampledAt)}`) : null,
     quota?.groups.length ? quota.groups.map(group => h('div', { key: group.name, style: { marginTop: '6px', padding: '6px 10px', borderInlineStart: border } },
       h('div', { style: { fontWeight: 550 } }, group.name),

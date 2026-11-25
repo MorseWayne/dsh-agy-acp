@@ -109,9 +109,11 @@ test('validateConfigPatchInput strictly enforces whitelist, bounds, effort forma
   assert.equal(validateConfigPatchInput({ requestTimeoutMs: 9_000 }).ok, false)
   assert.equal(validateConfigPatchInput({ geoFenceMode: 'invalid-mode' }).ok, false)
   assert.equal(validateConfigPatchInput({ geoFenceMode: true }).ok, false)
+  assert.equal(validateConfigPatchInput({ quotaAwareScheduling: 'yes' }).ok, false)
 
   const ok = validateConfigPatchInput({
     mcpBridge: true,
+    quotaAwareScheduling: true,
     geoFenceMode: 'strict',
     defaultModel: ' gemini-4-neon ',
     defaultEffort: '',
@@ -122,6 +124,7 @@ test('validateConfigPatchInput strictly enforces whitelist, bounds, effort forma
   if (ok.ok) {
     assert.deepEqual(ok.patch, {
       mcpBridge: true,
+      quotaAwareScheduling: true,
       geoFenceMode: 'strict',
       defaultModel: 'gemini-4-neon',
       defaultEffort: '',

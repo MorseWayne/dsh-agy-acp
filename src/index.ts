@@ -12,6 +12,7 @@ import { resolveAgyBin } from './runtime/bin.ts'
 import { MultiAccountPool } from './runtime/account-pool.ts'
 import { ConfigStore } from './runtime/config-store.ts'
 import { CredentialSlotLeaseManager } from './runtime/credential-lease.ts'
+import { formatAgyStatusReport, runAgyDoctor } from './runtime/doctor.ts'
 import { EgressGuard } from './runtime/egress-guard.ts'
 import { hostPermissions, type SessionAgent } from './runtime/host-permissions.ts'
 import { SessionPolicyChangedError } from './runtime/permission-manager.ts'
@@ -247,25 +248,39 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     }
   })
 
-  // 3. Register /agy-acp status command
+  // 3. Register /agy-acp status & doctor command
   const commands = ctx.get('commands') as { register(def: unknown): unknown } | undefined
   commands?.register({
     name: 'agy-acp',
-    description: 'Inspect Antigravity ACP bridge status',
-    async handler() {
-      const s = pool.getStatus()
+    description: '查看 Antigravity ACP 状态概览，或输入 `/agy-acp doctor` 执行环境与出口自检',
+    input: { hint: '[status | doctor]' },
+    async handler(invocation?: { rawInput?: string; signal?: AbortSignal }) {
+      const arg = (invocation?.rawInput ?? '').trim().toLowerCase()
+      if (!arg || arg === 'status') {
+        return {
+          kind: 'success' as const,
+          text: formatAgyStatusReport(pool.getStatus()),
+        }
+      }
+      if (arg === 'doctor') {
+        const outcome = await runAgyDoctor(
+          {
+            pool,
+            resolveBin: () => resolveAgyBin(cfg.agyBin),
+            prepareArgv: permissions.prepareArgv,
+            configFilePath: configStore.filePath,
+            sessionsFilePath: sessionIndex.filePath,
+          },
+          invocation?.signal,
+        )
+        return {
+          kind: 'success' as const,
+          text: outcome.text,
+        }
+      }
       return {
-        kind: 'success' as const,
-        text: [
-          `Antigravity ACP (${s.providerId})`,
-          `Connected: ${s.connected ? 'yes' : 'no'} (${s.agentName ?? 'idle'} ${s.agentVersion ?? ''})`,
-          `Tier: ${s.tierName ?? 'unknown'}`,
-          `Active Sessions: ${s.activeSessions}`,
-          `MCP Bridge: ${s.mcpBridgeActive ? 'active' : 'off'}`,
-          'Permission policy: DSH conversation',
-          `Tokens: in=${s.usageTotals.inputTokens} cached=${s.usageTotals.cachedReadTokens} out=${s.usageTotals.outputTokens} think=${s.usageTotals.reasoningTokens}`,
-          `Models Cached: ${s.models.length}`,
-        ].join('\n'),
+        kind: 'error' as const,
+        text: `未知子命令 "${arg.slice(0, 32)}"。用法：/agy-acp [status | doctor]`,
       }
     },
   })

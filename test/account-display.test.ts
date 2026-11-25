@@ -7,7 +7,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import type { AccountHealthSnapshot, StatusSnapshot } from '../src/common/types.ts'
 import { initialSnapshot, reduceSnapshot, snapshotNotice } from '../src/client/snapshot-state.ts'
 import { AccountCard } from '../src/client/account-card.ts'
-import { activeCooldowns, bucketDisplay, nextAccountExpiry, requestAccountAction, sessionAccountLabel } from '../src/client/account-display.ts'
+import { activeCooldowns, bucketDisplay, lowQuotaWarnings, nextAccountExpiry, requestAccountAction, sessionAccountLabel } from '../src/client/account-display.ts'
 import { SettingsView } from '../src/client/index.ts'
 import { createStatusStore, type EventSourceLike } from '../src/client/status-store.ts'
 
@@ -317,6 +317,7 @@ test('SettingsView renders model select, lastError banner, timeout inputs, conte
   assert.match(html, /已索引可恢复会话 2 个/)
   assert.match(html, /session\/load 已恢复/)
   assert.match(html, /标题：修复鉴权缓存逻辑/)
+  assert.match(html, /配额感知多账号调度（Quota-Aware Scheduling）/)
   assert.match(html, /恢复默认/)
   assert.match(html, /role="progressbar"/)
   assert.match(html, /--dsw-alias-/)
@@ -393,4 +394,25 @@ test('AccountCard renders supported, unsupported, error, and unchecked egress st
     requestAccountAction('refresh', 'default', async () => Response.json({ error: 'blocked' }, { status: 451 })),
     { message: '当前网络出口位于受限地区，已在本地拦截配额查询以防触发风控。' },
   )
+
+  // Low-quota warning helper & AccountCard alert banner
+  const warnings = lowQuotaWarnings(
+    {
+      sampledAt: now,
+      groups: [
+        { name: 'Gemini Models', fiveHour: { remainingFraction: 0.12, resetAt: now + 60_000 }, sevenDay: { remainingFraction: 0.8 } },
+        { name: 'Claude Models', fiveHour: { remainingFraction: 0, resetAt: now - 1 } }, // expired -> ignored
+      ],
+    },
+    now,
+  )
+  assert.deepEqual(warnings, [{ group: 'Gemini Models', windowLabel: '5 小时', remainingFraction: 0.12, exhausted: false }])
+  const lowHtml = markup({
+    ...account,
+    quota: {
+      sampledAt: now,
+      groups: [{ name: 'Gemini Models', fiveHour: { remainingFraction: 0.12, resetAt: Date.now() + 60_000 } }],
+    },
+  })
+  assert.match(lowHtml, /低配额预警：Gemini Models · 5 小时仅剩 12%/)
 })

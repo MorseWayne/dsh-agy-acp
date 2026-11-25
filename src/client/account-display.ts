@@ -1,4 +1,11 @@
-import type { AccountEgressSnapshot, AccountHealthSnapshot, QuotaBucketState, StatusSnapshot } from '../common/types.ts'
+import {
+  LOW_QUOTA_THRESHOLD,
+  type AccountEgressSnapshot,
+  type AccountHealthSnapshot,
+  type AccountQuotaSample,
+  type QuotaBucketState,
+  type StatusSnapshot,
+} from '../common/types.ts'
 
 export function sessionAccountLabel(accountId: string, accounts: Pick<AccountHealthSnapshot, 'id' | 'label'>[]): string {
   const label = accounts.find(account => account.id === accountId)?.label
@@ -51,6 +58,37 @@ export type AccountActionKind = 'refresh' | 'clear' | 'egress'
 export interface EgressBadgeDisplay {
   label: string
   tone: 'success' | 'error' | 'warn' | 'idle'
+}
+
+export interface LowQuotaWarningItem {
+  group: string
+  windowLabel: '5 小时' | '7 天'
+  remainingFraction: number
+  exhausted: boolean
+}
+
+export function lowQuotaWarnings(
+  quota: AccountQuotaSample | undefined,
+  now: number,
+  threshold = LOW_QUOTA_THRESHOLD,
+): LowQuotaWarningItem[] {
+  const out: LowQuotaWarningItem[] = []
+  for (const group of quota?.groups ?? []) {
+    for (const [windowLabel, bucket] of [['5 小时', group.fiveHour], ['7 天', group.sevenDay]] as const) {
+      if (!bucket) continue
+      if (bucket.resetAt != null && bucket.resetAt <= now) continue
+      if (!Number.isFinite(bucket.remainingFraction) || bucket.remainingFraction < 0 || bucket.remainingFraction > threshold) {
+        continue
+      }
+      out.push({
+        group: group.name,
+        windowLabel,
+        remainingFraction: bucket.remainingFraction,
+        exhausted: bucket.remainingFraction <= 0,
+      })
+    }
+  }
+  return out
 }
 
 export function formatEgressBadge(egress: AccountEgressSnapshot | undefined): EgressBadgeDisplay {

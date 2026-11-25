@@ -300,7 +300,7 @@ export class AcpClient {
         fs: { readTextFile: false, writeTextFile: false },
         terminal: false,
       },
-      clientInfo: { name: 'dsh-agy-acp', version: '0.1.0' },
+      clientInfo: { name: 'dsh-agy-acp', version: '0.4.0' },
       ...params,
     }, 15_000)
   }

@@ -1,6 +1,7 @@
 export const PROVIDER_ID = 'antigravity-acp'
 export const MIRROR_TOOL_NAME = 'agy_acp_tool'
 export const WRAPPER_TOOL_NAME = 'run_code'
+export const LOW_QUOTA_THRESHOLD = 0.15
 
 export type ModelFamily = 'gemini-pro' | 'gemini-flash' | 'claude' | 'other'
 
@@ -79,6 +80,7 @@ export interface AccountHealthSnapshot {
 
 export interface PersistedConfigPatch {
   mcpBridge?: boolean
+  quotaAwareScheduling?: boolean
   defaultModel?: string
   defaultEffort?: string
   agyBin?: string
@@ -98,6 +100,8 @@ export interface PluginConfig {
   requestTimeoutMs: number
   /** Attach session-scoped reverse MCP bridge via ACP session/new. */
   mcpBridge: boolean
+  /** Opt-in: feed sampled account quotas into MultiAccountPool scheduler weights (default: false). */
+  quotaAwareScheduling: boolean
   /** Local egress geo-fence protection policy (default: 'block'). */
   geoFenceMode: GeoFenceMode
   /** Optional multi-account pool profiles (Phase 3). */
@@ -170,6 +174,7 @@ export interface StatusSnapshot {
     defaultModel: string
     defaultEffort: string
     mcpBridge: boolean
+    quotaAwareScheduling?: boolean
     sessionIdleTtlMs: number
     requestTimeoutMs: number
     geoFenceMode?: GeoFenceMode
@@ -194,6 +199,12 @@ export interface AccountProvider {
   acquire(sessionKey: string, model: string, excludeAccountIds?: ReadonlySet<string>): Promise<AccountLease>
   reportSuccess?(accountId: string, model: string): void
   reportFailure?(accountId: string, model: string, error: unknown): void
+  updateQuota?(
+    accountId: string,
+    family: ModelFamily,
+    buckets: { fiveHour?: QuotaBucketState; sevenDay?: QuotaBucketState },
+  ): void
+  clearQuotaSamples?(): void
   /** Acquire only this profile's environment, without invoking model selection or changing stickiness. */
   acquireQuotaLease?(accountId: string): Promise<AccountLease & { requiresFileCredentialMode?: boolean }>
   /** Read effective environment for egress probing without mutating lease counters or stickiness. */

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { resolveConfig } from '../src/common/config.ts'
-import { AccountQuotaError, parseQuotaOutput, readAccountQuota } from '../src/runtime/account-quota.ts'
+import { AccountQuotaError, mapQuotaGroupsToFamilies, parseQuotaOutput, readAccountQuota } from '../src/runtime/account-quota.ts'
 import { EgressGuard } from '../src/runtime/egress-guard.ts'
 import { AcpSessionPool } from '../src/runtime/session-pool.ts'
 import { fakeHost } from './fixtures/session-policy.ts'
@@ -59,4 +59,25 @@ test('refreshAccountQuota blocks locally with HTTP 451 and zero subprocess launc
     (err: unknown) => err instanceof AccountQuotaError && err.status === 451 && err.message.includes('HK'),
   )
   assert.equal(launches, 0)
+})
+
+test('mapQuotaGroupsToFamilies prioritizes general/family pools over single-variant Argon exhaustion', () => {
+  // Dedicated Argon at 0% must NOT override general Gemini Models at 80%
+  const mapped1 = mapQuotaGroupsToFamilies([
+    { name: 'Gemini Models', fiveHour: { remainingFraction: 0.8 }, sevenDay: { remainingFraction: 0.7 } },
+    { name: 'Gemini 4 Argon', fiveHour: { remainingFraction: 0 }, sevenDay: { remainingFraction: 0 } },
+  ])
+  assert.equal(mapped1['gemini-pro']?.fiveHour?.remainingFraction, 0.8)
+  assert.equal(mapped1['gemini-flash']?.fiveHour?.remainingFraction, 0.8)
+
+  // Explicit Gemini Flash overrides general Gemini Models for gemini-flash only
+  const mapped2 = mapQuotaGroupsToFamilies([
+    { name: 'Gemini Models', fiveHour: { remainingFraction: 0.3 } },
+    { name: 'Gemini Flash', fiveHour: { remainingFraction: 0.95 } },
+    { name: 'Claude Opus', fiveHour: { remainingFraction: 0 } },
+    { name: 'Claude Sonnet', fiveHour: { remainingFraction: 0.6 } },
+  ])
+  assert.equal(mapped2['gemini-pro']?.fiveHour?.remainingFraction, 0.3)
+  assert.equal(mapped2['gemini-flash']?.fiveHour?.remainingFraction, 0.95)
+  assert.equal(mapped2.claude?.fiveHour?.remainingFraction, 0.6)
 })

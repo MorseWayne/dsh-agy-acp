@@ -217,6 +217,20 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     this.emit('change')
   }
 
+  clearQuotaSamples(): void {
+    let changed = false
+    for (const acc of this.accounts.values()) {
+      for (const state of acc.families.values()) {
+        if (state.fiveHour || state.sevenDay) {
+          state.fiveHour = undefined
+          state.sevenDay = undefined
+          changed = true
+        }
+      }
+    }
+    if (changed) this.emit('change')
+  }
+
   async acquire(
     sessionKey: string,
     model: string,

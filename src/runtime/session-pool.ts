@@ -35,7 +35,7 @@ import {
   type UsageTotals,
 } from '../common/types.ts'
 
-import { AccountQuotaError, readAccountQuota, requireFileCredentialMode } from './account-quota.ts'
+import { AccountQuotaError, mapQuotaGroupsToFamilies, readAccountQuota, requireFileCredentialMode } from './account-quota.ts'
 import { EgressBlockedError, EgressGuard } from './egress-guard.ts'
 import type { SessionIndex } from './session-index.ts'
 import { defaultEffort, sortedEfforts } from '../common/effort.ts'
@@ -388,9 +388,33 @@ export class AcpSessionPool extends EventEmitter {
       const argv = await this.deps.prepareArgv([bin, '-p', '/usage', '--output-format', 'stream-json'], policy, signal)
       const groups = await readAccountQuota(argv, lease.env, cwd, signal)
       signal.throwIfAborted()
-      this.quotaSamples.set(id, { groups, sampledAt: Date.now() })
+      const sample: AccountQuotaSample = { groups, sampledAt: Date.now() }
+      this.quotaSamples.set(id, sample)
+      if (this.deps.getConfig().quotaAwareScheduling) {
+        this.applySampleToScheduler(id, sample)
+      }
       this.emitStatus()
     } finally { lease.release() }
+  }
+
+  private applySampleToScheduler(accountId: string, sample: AccountQuotaSample): void {
+    if (!this.accountProvider.updateQuota) return
+    const mapped = mapQuotaGroupsToFamilies(sample.groups)
+    for (const [family, buckets] of Object.entries(mapped)) {
+      if (buckets) {
+        this.accountProvider.updateQuota(accountId, family as Parameters<NonNullable<AccountProvider['updateQuota']>>[1], buckets)
+      }
+    }
+  }
+
+  syncQuotaSchedulingMode(): void {
+    if (this.deps.getConfig().quotaAwareScheduling) {
+      for (const [id, sample] of this.quotaSamples) {
+        this.applySampleToScheduler(id, sample)
+      }
+    } else {
+      this.accountProvider.clearQuotaSamples?.()
+    }
   }
 
   contextWindowFor(model: string): number | undefined {
@@ -433,6 +457,7 @@ export class AcpSessionPool extends EventEmitter {
   async updateConfig(patch: Partial<PluginConfig>): Promise<void> {
     await this.runConfigOp(async () => {
       await this.deps.onConfigPatch?.(patch)
+      this.syncQuotaSchedulingMode()
       this.emitStatus()
     })
   }
@@ -440,6 +465,7 @@ export class AcpSessionPool extends EventEmitter {
   async resetConfig(): Promise<void> {
     await this.runConfigOp(async () => {
       await this.deps.onConfigReset?.()
+      this.syncQuotaSchedulingMode()
       this.emitStatus()
     })
   }
@@ -483,6 +509,7 @@ export class AcpSessionPool extends EventEmitter {
         defaultModel: cfg.defaultModel,
         defaultEffort: cfg.defaultEffort,
         mcpBridge: cfg.mcpBridge,
+        quotaAwareScheduling: cfg.quotaAwareScheduling,
         sessionIdleTtlMs: cfg.sessionIdleTtlMs,
         requestTimeoutMs: cfg.requestTimeoutMs,
         geoFenceMode: cfg.geoFenceMode,

@@ -120,6 +120,7 @@ function AgyAcpSettingsSection(): unknown {
 
 interface FormBaseline {
   mcpBridge: boolean
+  quotaAwareScheduling: boolean
   geoFenceMode: GeoFenceMode
   defaultModel: string
   defaultEffort: string
@@ -133,6 +134,7 @@ function baselineFromStatus(status: StatusSnapshot): FormBaseline {
   const rawMode = status.config?.geoFenceMode
   return {
     mcpBridge: Boolean(status.config?.mcpBridge),
+    quotaAwareScheduling: Boolean(status.config?.quotaAwareScheduling),
     geoFenceMode: isGeoFenceMode(rawMode) ? rawMode : 'block',
     defaultModel: status.config?.defaultModel ?? '',
     defaultEffort: status.config?.defaultEffort ?? '',
@@ -151,6 +153,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
   const initialBase = status ? baselineFromStatus(status) : null
   const [baseline, setBaseline] = React.useState(initialBase as FormBaseline | null)
   const [mcpBridge, setMcpBridge] = React.useState(initialBase?.mcpBridge ?? false)
+  const [quotaAwareScheduling, setQuotaAwareScheduling] = React.useState(initialBase?.quotaAwareScheduling ?? false)
   const [geoFenceMode, setGeoFenceMode] = React.useState(initialBase?.geoFenceMode ?? ('block' as GeoFenceMode))
   const [defaultModel, setDefaultModel] = React.useState(initialBase?.defaultModel ?? '')
   const [defaultEffort, setDefaultEffort] = React.useState(initialBase?.defaultEffort ?? '')
@@ -162,6 +165,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
   const syncFormTo = React.useCallback((nextBase: FormBaseline) => {
     setBaseline(nextBase)
     setMcpBridge(nextBase.mcpBridge)
+    setQuotaAwareScheduling(nextBase.quotaAwareScheduling)
     setGeoFenceMode(nextBase.geoFenceMode)
     setDefaultModel(nextBase.defaultModel)
     setDefaultEffort(nextBase.defaultEffort)
@@ -180,6 +184,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
     }
     const isCurrentlyClean =
       mcpBridge === baseline.mcpBridge &&
+      quotaAwareScheduling === baseline.quotaAwareScheduling &&
       geoFenceMode === baseline.geoFenceMode &&
       defaultModel === baseline.defaultModel &&
       defaultEffort === baseline.defaultEffort &&
@@ -190,7 +195,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
     if (isCurrentlyClean && JSON.stringify(incoming) !== JSON.stringify(baseline)) {
       syncFormTo(incoming)
     }
-  }, [status, baseline, mcpBridge, geoFenceMode, defaultModel, defaultEffort, agyBin, workspaceRoot, idleMinutes, timeoutSeconds, syncFormTo])
+  }, [status, baseline, mcpBridge, quotaAwareScheduling, geoFenceMode, defaultModel, defaultEffort, agyBin, workspaceRoot, idleMinutes, timeoutSeconds, syncFormTo])
 
   if (!status) {
     return React.createElement(
@@ -237,6 +242,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
   const dirty = Boolean(
     baseline && (
       mcpBridge !== baseline.mcpBridge ||
+      quotaAwareScheduling !== baseline.quotaAwareScheduling ||
       geoFenceMode !== baseline.geoFenceMode ||
       defaultModel !== baseline.defaultModel ||
       defaultEffort !== baseline.defaultEffort ||
@@ -262,6 +268,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
     try {
       const res = await postJson('/plugins/agy-acp/config', {
         mcpBridge,
+        quotaAwareScheduling,
         geoFenceMode,
         defaultModel,
         defaultEffort,
@@ -496,6 +503,40 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
               : null,
           )
         : null,
+
+      // Opt-in quota-aware scheduling toggle
+      React.createElement(
+        'label',
+        {
+          style: {
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            padding: '8px 10px',
+            borderRadius: '8px',
+            border: theme.borderPrimary,
+            backgroundColor: theme.surfaceTile,
+            marginBottom: '12px',
+            cursor: 'pointer',
+          },
+        },
+        React.createElement(
+          'div',
+          null,
+          React.createElement('div', { style: { fontWeight: 500 } }, '配额感知多账号调度（Quota-Aware Scheduling）'),
+          React.createElement(
+            'div',
+            { style: { ...styles.secondaryText, fontSize: '11px' } },
+            '开启后将手动采集的 5h / 7d 配额余量映射至多账号池调度权重，优先分配高余量账号并避开耗尽账号（默认关闭，不后台轮询刷配额）',
+          ),
+        ),
+        React.createElement('input', {
+          type: 'checkbox',
+          checked: quotaAwareScheduling,
+          onChange: (e: { target: { checked: boolean } }) => setQuotaAwareScheduling(e.target.checked),
+          style: { width: '16px', height: '16px', cursor: 'pointer' },
+        }),
+      ),
 
       // Model / effort / paths / timeouts grid
       React.createElement(
