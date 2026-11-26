@@ -2,6 +2,15 @@
 
 All notable changes to `@morsewayne/dsh-agy-acp` are documented in this file.
 
+## [0.7.0] - 2026-11-27
+
+### Added
+- **Reverse MCP Tiered Tool Exposure & User Policy Model**: Introduced `mcp-tool-policy.ts` with 7 supplemental capability groups (`memory_core`, `delivery_skills` eager by default; `documents_office`, `goals_teams_workflow`, `memory_admin`, `media_system`, `other_plugins` on-demand by default) and 5 native-replacement groups (`subagents` replaced by DSH by default; `web_search`, `file_ops`, `shell_jobs`, `planning_schedule` native by default), plus per-tool `eager` / `lazy` / `off` overrides and backwards compatibility with `mcpExposeOverlappingTools`.
+- **On-Demand Reverse MCP Meta-Tool Gateway (`dsh_discover_tools` / `dsh_call_tool`)**: Keeps eager `tools/list` declarations compact (~22–28 KB, well below `agy acp`'s 64 KiB cap) while preserving 100% full tool descriptions and parameter schemas for eager tools and allowing on-demand schema discovery and policy-enforced delegation (reusing DSH approvals and rejecting `off` or recursive calls) for lazy tools.
+- **52 KB Schema Budget Safety Net**: Added `schema-budget.ts` as an automatic fallback fuse that only triggers with a warning if custom eager selections push serialized `tools/list` payloads beyond the safe 52 KB threshold.
+- **Dynamic Host Bridge Routing & Live Tool Catalog**: Updated `prompt-builder.ts` to inject dynamic replacement guidance and a compact on-demand group index into `[Host Bridge Guidance]`, and wired `tools/change` tracking to expose live host tool catalogs (`mcpToolCatalog`) and per-tool byte estimates in `StatusSnapshot`.
+- **Console UI Tool Policy Panel**: Added `mcp-tool-panel.ts` with a live eager-schema byte budget meter, supplemental vs. native-replacement group controls, searchable per-tool overrides, and a one-click action to apply policy changes to active ACP sessions.
+
 ## [0.6.0] - 2026-11-26
 
 ### Added

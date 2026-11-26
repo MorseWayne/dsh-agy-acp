@@ -566,8 +566,10 @@ test('the configuration fieldset locks all edits for both pending writes', () =>
   const html = panelMarkup(panelFixture(), 'live', 'config')
   const form = html.match(/<fieldset[^>]*aria-label="桥接配置"[^>]*>([\s\S]*?)<\/fieldset>/)?.[1]
   assert.ok(form, 'the native group wraps the actual editable fields')
-  assert.equal((form.match(/<(?:input|select)\b/g) ?? []).length, 12)
-  assert.equal((html.match(/<(?:input|select)\b/g) ?? []).length, 12)
+  assert.equal((form.match(/<(?:input|select)\b/g) ?? []).length, 25)
+  assert.equal((html.match(/<(?:input|select)\b/g) ?? []).length, 25)
+  assert.match(form, /aria-label="补充能力分组 Mnemon 核心记忆与文档"/)
+  assert.match(form, /aria-label="替代能力分组 联网搜索"/)
   assert.match(form, /aria-label="自动审查 Provider"/)
   assert.match(form, /aria-label="自动审查模型"/)
   assert.match(form, /aria-label="自动审查推理强度"/)

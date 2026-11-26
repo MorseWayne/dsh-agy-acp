@@ -1,4 +1,5 @@
 import { isGeoFenceMode } from './geo.ts'
+import { compactMcpToolPolicy, validateMcpToolPolicyInput } from './mcp-tool-policy.ts'
 import { PROVIDER_ID, type AccountProfileConfig, type PersistedConfigPatch, type PluginConfig } from './types.ts'
 
 export const SESSION_IDLE_TTL_MIN_MS = 60_000
@@ -15,6 +16,7 @@ const HOST_ONLY_CONFIG_KEYS = new Set(['accounts', 'credentialSlotDir', 'enabled
 const ALLOWED_PERSIST_KEYS = new Set<keyof PersistedConfigPatch>([
   'mcpBridge',
   'mcpExposeOverlappingTools',
+  'mcpToolPolicy',
   'quotaAwareScheduling',
   'defaultModel',
   'defaultEffort',
@@ -151,6 +153,11 @@ export function validateConfigPatchInput(
       }
       patch.geoFenceMode = val
       count++
+    } else if (key === 'mcpToolPolicy') {
+      const parsed = validateMcpToolPolicyInput(val)
+      if (!parsed.ok) return parsed
+      patch.mcpToolPolicy = parsed.value
+      count++
     }
   }
 
@@ -186,6 +193,8 @@ export function resolveConfig(raw: Record<string, unknown> = {}): PluginConfig {
   const rawGeoMode = typeof raw.geoFenceMode === 'string' ? raw.geoFenceMode.trim() : ''
   const rawReviewProvider = typeof raw.autoReviewProvider === 'string' ? raw.autoReviewProvider.trim() : ''
   const rawReviewEffort = typeof raw.autoReviewEffort === 'string' ? raw.autoReviewEffort.trim() : ''
+  const parsedPolicy = raw.mcpToolPolicy !== undefined ? validateMcpToolPolicyInput(raw.mcpToolPolicy) : null
+  const mcpToolPolicy = parsedPolicy?.ok ? compactMcpToolPolicy(parsedPolicy.value) : undefined
   return {
     enabled: parseBool(raw.enabled, true),
     agyBin: typeof raw.agyBin === 'string' ? raw.agyBin.trim() : '',
@@ -199,6 +208,7 @@ export function resolveConfig(raw: Record<string, unknown> = {}): PluginConfig {
     requestTimeoutMs: parseNumber(raw.requestTimeoutMs, 10 * 60_000, REQUEST_TIMEOUT_MIN_MS, REQUEST_TIMEOUT_MAX_MS),
     mcpBridge: parseBool(raw.mcpBridge, false),
     mcpExposeOverlappingTools: parseBool(raw.mcpExposeOverlappingTools, false),
+    ...(mcpToolPolicy ? { mcpToolPolicy } : {}),
     quotaAwareScheduling: parseBool(raw.quotaAwareScheduling, false),
     geoFenceMode: isGeoFenceMode(rawGeoMode) ? rawGeoMode : 'block',
     accounts: parseAccounts(raw.accounts),

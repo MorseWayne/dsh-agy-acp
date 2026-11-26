@@ -21,6 +21,12 @@ import { callUsageToTokenUsage, TranscriptUsageTailer } from '../acp/transcript-
 import { defaultEffort, effortLabel } from '../common/effort.ts'
 import { isGeoUnsupportedError } from '../common/geo.ts'
 import {
+  buildActiveReplacementGuidance,
+  buildLazyToolCatalogGuidance,
+  resolveEffectiveMcpToolPolicy,
+  resolveToolExposure,
+} from '../common/mcp-tool-policy.ts'
+import {
   MIRROR_TOOL_NAME,
   PROVIDER_ID,
   WRAPPER_TOOL_NAME,
@@ -56,6 +62,10 @@ export interface AcpAdapterDeps {
   getConfig: () => PluginConfig
   pool: AcpSessionPool
   runs: AcpRunStore
+  /** Returns whether `agy_acp_tool` is visible to `sessionKey` (used in PTC mode where `options.tools` only lists `run_code`). */
+  canUseMirrorTool?: (sessionKey: string) => boolean
+  /** Returns DSH host tools visible to `sessionKey` (used to build on-demand catalogs and replacement guidance in Code Mode). */
+  listSessionTools?: (sessionKey: string) => Array<{ name: string; description?: string }>
   readImage?: ReadPromptImage
   readFileStream?: ReadPromptFile
   log?: (msg: string) => void
@@ -162,8 +172,15 @@ export class AcpAdapter extends LlmAdapter {
     const isPythonCodeMode =
       isCodeMode && typeof runCodeTool?.description === 'string' && /Execute a Python program/i.test(runCodeTool.description)
     const availableToolNames = options.tools ? new Set(options.tools.map((t) => t.name)) : null
-    const cutOnTool = hasMirrorTool || isCodeMode
-    const driveMode: DriveRecordingMode = { cutOnTool, isCodeMode, isPythonCodeMode, availableToolNames }
+    const canMirrorNativeTools = hasMirrorTool || (isCodeMode && (this.deps.canUseMirrorTool?.(sessionKey) ?? true))
+    const canDelegateMcpTools = Boolean(options.tools?.length)
+    const driveMode: DriveRecordingMode = {
+      canMirrorNativeTools,
+      canDelegateMcpTools,
+      isCodeMode,
+      isPythonCodeMode,
+      availableToolNames,
+    }
 
     // 1. Continuation span: DSH just executed `agy_acp_tool` or a delegated native DSH tool and is resuming the same ACP turn.
     const continuationMessages = options.messages as readonly ContinuationMessage[]
@@ -205,7 +222,6 @@ export class AcpAdapter extends LlmAdapter {
     // 2. Fresh turn over persistent ACP session (with automatic 429/geo failover + 1x pre-output crash recovery).
     const cwd = this.deps.pool.policy(sessionKey).workspaceRoot
     const requestedModel = options.model || cfg.defaultModel || ''
-    const preparedSystem = prepareSystemPrompt(options.system, messages)
     const triedAccounts = new Set<string>()
     let crashRetried = recoveryPolicy !== undefined
     let nextBlockIndex = 0
@@ -288,6 +304,29 @@ export class AcpAdapter extends LlmAdapter {
 
       this.deps.pool.notifyStatusChange()
       const baseBlocks = await buildPromptBlocksWithAttachments(messages, created, undefined, session.promptCapabilities, this.deps.readImage, options.signal, this.deps.readFileStream)
+      let replacementGuidance: string[] | undefined
+      let lazyToolCatalog: string | null = null
+      if (session.hasMcpServers) {
+        const effectivePolicy = resolveEffectiveMcpToolPolicy(cfg.mcpToolPolicy, cfg.mcpExposeOverlappingTools)
+        const sessionHostTools = isCodeMode
+          ? (this.deps.listSessionTools?.(sessionKey) ?? [])
+          : (options.tools ?? []).map((t) => ({ name: t.name, description: t.description }))
+        const scopedAvailableNames = isCodeMode
+          ? (sessionHostTools.length > 0 ? new Set(sessionHostTools.map((t) => t.name)) : null)
+          : availableToolNames
+        replacementGuidance = buildActiveReplacementGuidance(effectivePolicy, scopedAvailableNames)
+        const lazyTools = sessionHostTools.filter(
+          (t) =>
+            t.name !== MIRROR_TOOL_NAME &&
+            t.name !== WRAPPER_TOOL_NAME &&
+            resolveToolExposure(t.name, effectivePolicy).mode === 'lazy',
+        )
+        lazyToolCatalog = buildLazyToolCatalogGuidance(lazyTools)
+      }
+      const preparedSystem = prepareSystemPrompt(options.system, messages, {
+        ...(replacementGuidance !== undefined ? { replacementGuidance } : {}),
+        lazyToolCatalog,
+      })
       let pendingSystemHash: string | null = null
       let promptBlocks = baseBlocks
       if (preparedSystem) {
@@ -307,7 +346,7 @@ export class AcpAdapter extends LlmAdapter {
         this.deps.pool.accountEnvFor(session),
       )
       const rec = this.deps.runs.create(sessionKey, createPreEditLocator(cwd))
-      rec.delegatesMcp = cutOnTool && Boolean(session.hasMcpServers)
+      rec.delegatesMcp = canDelegateMcpTools && Boolean(session.hasMcpServers)
       // agy emits usage_update at the end of a prompt, so seed with the last known occupancy for mirror boundaries.
       if (typeof session.contextUsed === 'number') rec.contextUsed = session.contextUsed
       // Exact per-call usage (cache hits included) comes from agy's transcript; ACP only reports a run total.
@@ -418,7 +457,7 @@ export class AcpAdapter extends LlmAdapter {
           if (err instanceof AcpProcessExitError) {
             const { interruptedBeforeGrant, granted } = turn.permissions
             if (interruptedBeforeGrant) {
-              if (cutOnTool && !crashRetried && !session.hasMcpServers && !cfg.mcpBridge && targetMode !== 'auto' && policy.approval === 'ask') {
+              if (canMirrorNativeTools && !crashRetried && !session.hasMcpServers && !cfg.mcpBridge && targetMode !== 'auto' && policy.approval === 'ask') {
                 rec.allowApprovalRecovery(interruptedBeforeGrant, policyKey(policy))
               }
               error = new Error(`工具审批因 ACP 退出而中断，该请求尚未获准执行。 ${err.message}`, { cause: err })
@@ -581,7 +620,7 @@ export class AcpAdapter extends LlmAdapter {
     yield* this.driveRecording(
       rec,
       0,
-      { cutOnTool: false, isCodeMode: false, isPythonCodeMode: false, availableToolNames: null },
+      { canMirrorNativeTools: false, canDelegateMcpTools: false, isCodeMode: false, isPythonCodeMode: false, availableToolNames: null },
       options.signal,
     )
   }
@@ -594,7 +633,7 @@ export class AcpAdapter extends LlmAdapter {
     blockStart = 0,
     canRetryExit?: () => boolean,
   ): AsyncGenerator<StreamChunk, number | void> {
-    const { cutOnTool, isCodeMode, isPythonCodeMode, availableToolNames } = mode
+    const { canMirrorNativeTools, canDelegateMcpTools, isCodeMode, isPythonCodeMode, availableToolNames } = mode
     let idx = Math.max(startIndex, rec.cursor)
     let blockIdx = blockStart
     let openType: 'text' | 'reasoning' | null = null
@@ -725,7 +764,7 @@ export class AcpAdapter extends LlmAdapter {
         return
       }
 
-      if (cutOnTool && !rec.hasPendingUnemittedMcpCall()) {
+      if (canMirrorNativeTools && !rec.hasPendingUnemittedMcpCall()) {
         const readyDeferred = rec.takeReadyDeferredNativeTools()
         if (readyDeferred.length > 0) {
           const closed = closeOpenBlock()
@@ -786,7 +825,7 @@ export class AcpAdapter extends LlmAdapter {
       }
 
       if (item.kind === 'done') {
-        if (cutOnTool) {
+        if (canMirrorNativeTools) {
           const readyDeferred = rec.takeReadyDeferredNativeTools()
           if (readyDeferred.length > 0) {
             const closed = closeOpenBlock()
@@ -841,7 +880,7 @@ export class AcpAdapter extends LlmAdapter {
           rec.cursor = Math.max(rec.cursor, idx)
           continue
         }
-        if (!cutOnTool) {
+        if (!canDelegateMcpTools) {
           rec.rejectMcpCall(call.itemIndex, new Error('Delegated MCP execution requires an active DSH tool loop'))
           idx++
           rec.cursor = Math.max(rec.cursor, idx)
@@ -917,7 +956,7 @@ export class AcpAdapter extends LlmAdapter {
               }
               // Defer an interleaved unsettled native tool so sibling MCP calls arriving right after can still coalesce.
               const nextMerged = rec.getToolCall(nextId)
-              if (nextMerged && !nextMerged.settled) {
+              if (canMirrorNativeTools && nextMerged && !nextMerged.settled) {
                 rec.deferNativeTool(nextId)
                 idx++
                 continue
@@ -962,7 +1001,7 @@ export class AcpAdapter extends LlmAdapter {
           openAcc += delta
           yield { type: 'text-delta', index: blockIdx, text: delta }
         }
-      } else if (cutOnTool && (u.sessionUpdate === 'tool_call_update' || u.sessionUpdate === 'tool_call')) {
+      } else if (canMirrorNativeTools && (u.sessionUpdate === 'tool_call_update' || u.sessionUpdate === 'tool_call')) {
         const tcUpdate = u as AcpToolCallUpdate
         const toolCallId =
           typeof tcUpdate.toolCallId === 'string' && tcUpdate.toolCallId.trim() !== ''
@@ -1082,7 +1121,8 @@ function isToolReadyToEmit(rec: AcpRunRecording, idx: number, tc: MergedToolCall
 }
 
 interface DriveRecordingMode {
-  readonly cutOnTool: boolean
+  readonly canMirrorNativeTools: boolean
+  readonly canDelegateMcpTools: boolean
   readonly isCodeMode: boolean
   readonly isPythonCodeMode: boolean
   readonly availableToolNames: ReadonlySet<string> | null

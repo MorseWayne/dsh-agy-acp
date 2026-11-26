@@ -7,7 +7,7 @@ import type { GenerateOptions, Message, StreamChunk } from '@deepseek-ai/dsh-llm
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { resolveConfig } from '../src/common/config.ts'
 import { MIRROR_TOOL_NAME, PROVIDER_ID, WRAPPER_TOOL_NAME } from '../src/common/types.ts'
-import { ReverseMcpBridge } from '../src/mcp/server.ts'
+import { OVERLAPPING_NATIVE_DSH_TOOLS, ReverseMcpBridge } from '../src/mcp/server.ts'
 import { AcpAdapter, collectContinuationToolResults, detectContinuation } from '../src/provider/adapter.ts'
 import { defineAgyAcpMirrorTool } from '../src/provider/mirror-tool.ts'
 import { AcpRunStore, encodeMirrorCallId } from '../src/provider/run-store.ts'
@@ -25,7 +25,7 @@ async function collectChunks(iterable: AsyncIterable<StreamChunk>): Promise<Stre
   return chunks
 }
 
-function createDelegationHarness() {
+function createDelegationHarness(opts?: { canUseMirrorTool?: (sessionKey: string) => boolean }) {
   const cfg = resolveConfig({
     enabled: true,
     mcpBridge: true,
@@ -55,7 +55,7 @@ function createDelegationHarness() {
       bridges.delete(key)
       if (b) void b.dispose()
     },
-    async getMcpServers(key, opts) {
+    async getMcpServers(key, mcpOpts) {
       const bridge = new ReverseMcpBridge({
         listTools: () => dshTools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.parameters })),
         callTool: async (name, args, signal) => {
@@ -68,7 +68,13 @@ function createDelegationHarness() {
             args = rest
           }
           const rec = runs.getActiveForOwner(key)
-          assert.ok(rec?.delegatesMcp, 'expected active recording with MCP delegation enabled')
+          if (!rec) throw new Error('No active ACP turn for delegated MCP call')
+          if (!rec.delegatesMcp) {
+            return {
+              content: [{ type: 'text', text: `Error: Tool "${name}" is not available in this DSH step` }],
+              isError: true,
+            }
+          }
           const resumeTimer = pool.pauseTurnTimer(key)
           try {
             return await rec.enqueueMcpCall(name, args, AbortSignal.any([signal, turn]))
@@ -80,12 +86,17 @@ function createDelegationHarness() {
       })
       bridges.set(key, bridge)
       await bridge.start()
-      const spec = bridge.getPreferredMcpServerSpec(Boolean(opts?.preferHttp))
+      const spec = bridge.getPreferredMcpServerSpec(Boolean(mcpOpts?.preferHttp))
       return spec ? [spec] : []
     },
   })
 
-  const adapter = new AcpAdapter({ getConfig: () => cfg, pool, runs })
+  const adapter = new AcpAdapter({
+    getConfig: () => cfg,
+    pool,
+    runs,
+    ...(opts?.canUseMirrorTool ? { canUseMirrorTool: opts.canUseMirrorTool } : {}),
+  })
   const mirrorTool = defineAgyAcpMirrorTool(runs)
   const dispose = async () => {
     pool.dispose()
@@ -394,4 +405,213 @@ test('isDshReverseMcpToolCall and decidePermission allow attached dsh-tools MCP 
     { outcome: { outcome: 'selected', optionId: 'no' } },
   )
   assert.equal(asked, 1)
+})
+
+test('restricted subagent without agy_acp_tool still delegates reverse MCP tools natively without bypassing DSH loop', { timeout: 10_000 }, async (t) => {
+  const harness = createDelegationHarness()
+  t.after(() => harness.dispose())
+
+  // Simulate a restricted subagent (e.g. Mnemon isolated subagent) whose tools.restrict() hides agy_acp_tool
+  // and exposes only scoped/allowlisted DSH tools.
+  const restrictedTools = [harness.dshTools[0]!]
+
+  const span1 = await collectChunks(
+    harness.adapter.stream({
+      provider: PROVIDER_ID,
+      model: 'gemini-4-neon',
+      tools: restrictedTools,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'DELEGATE_MCP_SINGLE' }] } as Message],
+      sessionId: 'sess-restricted-subagent',
+    } as unknown as GenerateOptions),
+  )
+
+  const calls1 = span1
+    .filter((c): c is Extract<StreamChunk, { type: 'block-end' }> => c.type === 'block-end' && c.block.type === 'tool-call')
+    .map((c) => c.block as Extract<typeof c.block, { type: 'tool-call' }>)
+  assert.equal(calls1.length, 1)
+  assert.equal(calls1[0]!.name, 'ops_glob')
+  assert.equal(span1.find((c) => c.type === 'finish')?.reason.kind, 'tool-calls')
+
+  const span2 = await collectChunks(
+    harness.adapter.stream({
+      provider: PROVIDER_ID,
+      model: 'gemini-4-neon',
+      tools: restrictedTools,
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'DELEGATE_MCP_SINGLE' }] },
+        { role: 'assistant', content: calls1 },
+        { role: 'tool', toolCallId: calls1[0]!.id, content: [{ type: 'text', text: 'restricted-ok' }], isError: false },
+      ],
+      sessionId: 'sess-restricted-subagent',
+    } as unknown as GenerateOptions),
+  )
+  assert.equal(span2.filter((c) => c.type === 'text-delta').map((c) => c.text).join(''), 'MCP_RESULT:OK:restricted-ok')
+  assert.equal(span2.find((c) => c.type === 'finish')?.reason.kind, 'stop')
+
+  // No-tool step (`tools: []`) disables delegation and returns an explicit tool error rather than invoking tools.execute
+  const noToolSpan = await collectChunks(
+    harness.adapter.stream({
+      provider: PROVIDER_ID,
+      model: 'gemini-4-neon',
+      tools: [],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'DELEGATE_MCP_SINGLE' }] } as Message],
+      sessionId: 'sess-restricted-subagent',
+    } as unknown as GenerateOptions),
+  )
+  assert.equal(noToolSpan.filter((c) => c.type === 'block-end' && c.block.type === 'tool-call').length, 0)
+  assert.match(
+    noToolSpan.filter((c) => c.type === 'text-delta').map((c) => c.text).join(''),
+    /MCP_RESULT:ERR:Error: Tool "ops_glob" is not available in this DSH step/,
+  )
+  assert.equal(noToolSpan.find((c) => c.type === 'finish')?.reason.kind, 'stop')
+})
+
+test('restricted PTC subagent delegates MCP via run_code without emitting unavailable agy_acp_tool mirror calls', { timeout: 10_000 }, async (t) => {
+  const harness = createDelegationHarness({ canUseMirrorTool: () => false })
+  t.after(() => harness.dispose())
+
+  const tsRunCodeSchema = {
+    name: WRAPPER_TOOL_NAME,
+    description: 'Execute a TypeScript program against the available tools.',
+    parameters: { type: 'object', properties: { code: { type: 'string' }, description: { type: 'string' } } },
+  }
+
+  const span1 = await collectChunks(
+    harness.adapter.stream({
+      provider: PROVIDER_ID,
+      model: 'gemini-4-neon',
+      tools: [tsRunCodeSchema],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'DELEGATE_MCP_MIXED' }] } as Message],
+      sessionId: 'sess-restricted-ptc',
+    } as unknown as GenerateOptions),
+  )
+
+  const calls1 = span1
+    .filter((c): c is Extract<StreamChunk, { type: 'block-end' }> => c.type === 'block-end' && c.block.type === 'tool-call')
+    .map((c) => c.block as Extract<typeof c.block, { type: 'tool-call' }>)
+  assert.equal(calls1.length, 1)
+  assert.equal(calls1[0]!.name, WRAPPER_TOOL_NAME)
+  const ptcArgs = JSON.parse(calls1[0]!.arguments) as { code: string; description: string }
+  assert.match(ptcArgs.code, /tools\["ops_glob"\]/)
+  assert.doesNotMatch(ptcArgs.code, /agy_acp_tool/)
+
+  const span2 = await collectChunks(
+    harness.adapter.stream({
+      provider: PROVIDER_ID,
+      model: 'gemini-4-neon',
+      tools: [tsRunCodeSchema],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'DELEGATE_MCP_MIXED' }] },
+        { role: 'assistant', content: calls1 },
+        { role: 'tool', toolCallId: calls1[0]!.id, content: [{ type: 'text', text: 'ptc-ok' }], isError: false },
+      ],
+      sessionId: 'sess-restricted-ptc',
+    } as unknown as GenerateOptions),
+  )
+
+  // Native `read_file` must NOT be mirrored into `run_code` calling `agy_acp_tool` since mirror tool is hidden
+  const calls2 = span2.filter((c) => c.type === 'block-end' && c.block.type === 'tool-call')
+  assert.equal(calls2.length, 0)
+  assert.equal(span2.filter((c) => c.type === 'text-delta').map((c) => c.text).join(''), 'MIXED_DONE:ptc-ok')
+  assert.equal(span2.find((c) => c.type === 'finish')?.reason.kind, 'stop')
+})
+
+test('ReverseMcpBridge filters overlapping local basic tools while preserving DSH subagent/routing tools', { timeout: 10_000 }, async (t) => {
+  const routingTools = [
+    'subagent',
+    'subagent_fork',
+    'list_agents',
+    'wait_agent',
+    'send_message',
+    'list_subagent_models',
+  ]
+  for (const name of routingTools) {
+    assert.equal(OVERLAPPING_NATIVE_DSH_TOOLS.has(name), false, `${name} must not be filtered as overlapping`)
+  }
+  for (const basic of ['read', 'write', 'edit', 'bash', 'glob', 'grep', 'web_search', 'todo_write', 'ask_user_question', 'job_output', 'job_list', 'job_kill']) {
+    assert.equal(OVERLAPPING_NATIVE_DSH_TOOLS.has(basic), true, `${basic} should remain filtered by default`)
+  }
+
+  const allTools = [
+    ...[...OVERLAPPING_NATIVE_DSH_TOOLS],
+    MIRROR_TOOL_NAME,
+    WRAPPER_TOOL_NAME,
+    ...routingTools,
+    'mnemon_recall',
+    'team_route_delegate',
+  ]
+  const bridge = new ReverseMcpBridge({
+    excludeOverlappingNativeTools: true,
+    listTools: () => allTools.map((name) => ({ name })),
+    callTool: async (name, args) => ({
+      content: [{ type: 'text', text: `called:${name}:${JSON.stringify(args)}` }],
+      isError: false,
+    }),
+  })
+  await bridge.start()
+  t.after(() => bridge.dispose())
+
+  const spec = bridge.getHttpMcpServerSpec()!
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...Object.fromEntries((spec.headers ?? []).map((h) => [h.name, h.value])),
+  }
+  const rpc = async (id: number, method: string, params?: Record<string, unknown>) => {
+    const res = await fetch(spec.url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+    })
+    return (await res.json()) as { result?: Record<string, unknown> }
+  }
+
+  const listed = await rpc(1, 'tools/list')
+  const names = ((listed.result?.tools as Array<{ name: string }>) ?? []).map((t) => t.name)
+  assert.deepEqual(names, [...routingTools, 'mnemon_recall', 'team_route_delegate'])
+
+  const subagentCall = await rpc(2, 'tools/call', {
+    name: 'subagent',
+    arguments: { provider: 'aisub2api', model: 'gpt-6.2-astra', prompt: 'design check' },
+  })
+  assert.equal(subagentCall.result?.isError, false)
+  assert.match(String((subagentCall.result?.content as Array<{ text: string }>)?.[0]?.text ?? ''), /called:subagent:/)
+
+  const blockedBasic = await rpc(3, 'tools/call', { name: 'bash', arguments: { command: 'pwd' } })
+  assert.equal(blockedBasic.result?.isError, true)
+})
+
+test('AcpAdapter injects subagent MCP bridge guidance only when reverse MCP bridge and subagent tool are active', { timeout: 10_000 }, async (t) => {
+  const harness = createDelegationHarness()
+  t.after(() => harness.dispose())
+
+  const mirrorSchema = { name: MIRROR_TOOL_NAME, description: '', parameters: { type: 'object', properties: {} } }
+  const subagentSchema = { name: 'subagent', description: 'Spawn DSH subagent', parameters: { type: 'object', properties: {} } }
+
+  // 1. Standard mode with subagent tool available + mcpBridge enabled -> guidance mentions mcp_dsh-tools_subagent
+  const withSubagent = await collectChunks(
+    harness.adapter.stream({
+      provider: PROVIDER_ID,
+      model: 'gemini-4-neon',
+      system: 'Task-category model routing is configured.',
+      tools: [mirrorSchema, subagentSchema, ...harness.dshTools],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'ECHO_SYSTEM subagent-on' }] } as Message],
+      sessionId: 'sess-subagent-guidance-on',
+    } as unknown as GenerateOptions),
+  )
+  const textOn = withSubagent.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+  assert.match(textOn, /mcp_dsh-tools_subagent/)
+
+  // 2. Standard mode restricted subagent without `subagent` tool -> guidance omits mcp_dsh-tools_subagent
+  const withoutSubagent = await collectChunks(
+    harness.adapter.stream({
+      provider: PROVIDER_ID,
+      model: 'gemini-4-neon',
+      system: 'Restricted child prompt.',
+      tools: [harness.dshTools[0]!],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'ECHO_SYSTEM subagent-off' }] } as Message],
+      sessionId: 'sess-subagent-guidance-off',
+    } as unknown as GenerateOptions),
+  )
+  const textOff = withoutSubagent.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+  assert.equal(textOff.includes('mcp_dsh-tools_subagent'), false)
 })

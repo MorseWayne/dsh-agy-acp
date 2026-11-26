@@ -46,11 +46,23 @@ export interface PromptBuildCapabilities {
   embeddedContext?: boolean
 }
 
+export interface PrepareSystemPromptOptions {
+  /** Legacy flag: when true and `replacementGuidance` is omitted, injects DSH subagent routing guidance. */
+  hasBridgedSubagentTools?: boolean
+  /** Dynamic replacement guidance lines generated from active `'replace'` groups in `mcpToolPolicy`. */
+  replacementGuidance?: readonly string[]
+  /** Compact catalog of on-demand DSH tools exposed via `dsh_discover_tools` / `dsh_call_tool`. */
+  lazyToolCatalog?: string | null
+}
+
 const SYSTEM_BRIDGE_GUIDANCE = [
   '[Host Bridge Guidance]',
   'Follow the host system instructions, user rules, and language/style preferences above.',
   `When executing actions, use only the tools actually available in this environment; do not invent unavailable tool names or mention internal mirror tools such as ${MIRROR_TOOL_NAME}.`,
 ].join('\n')
+
+const SUBAGENT_BRIDGE_GUIDANCE =
+  'When host instructions (such as task-category model routing or Agent Teams) direct you to delegate or coordinate via `subagent`, `subagent_fork`, `list_agents`, `wait_agent`, `send_message`, or `list_subagent_models`, call the bridged DSH `dsh-tools` MCP tool (for example `mcp_dsh-tools_subagent`) instead of Antigravity\'s native `invoke_subagent`, so host routing policies and cross-provider models take effect.'
 
 export function extractSystemPrompt(
   system: string | undefined,
@@ -74,10 +86,26 @@ export function extractSystemPrompt(
 export function prepareSystemPrompt(
   system?: string,
   messages?: readonly PromptMessage[],
+  opts?: PrepareSystemPromptOptions,
 ): PreparedSystemPrompt | null {
   const merged = extractSystemPrompt(system, messages)
   if (!merged) return null
-  const append = `${merged}\n\n${SYSTEM_BRIDGE_GUIDANCE}`
+  const extraLines: string[] = []
+  if (opts?.replacementGuidance !== undefined) {
+    for (const line of opts.replacementGuidance) {
+      const trimmed = line.trim()
+      if (trimmed) extraLines.push(trimmed)
+    }
+  } else if (opts?.hasBridgedSubagentTools) {
+    extraLines.push(SUBAGENT_BRIDGE_GUIDANCE)
+  }
+  if (opts?.lazyToolCatalog?.trim()) {
+    extraLines.push(opts.lazyToolCatalog.trim())
+  }
+  const guidance = extraLines.length > 0
+    ? `${SYSTEM_BRIDGE_GUIDANCE}\n${extraLines.join('\n')}`
+    : SYSTEM_BRIDGE_GUIDANCE
+  const append = `${merged}\n\n${guidance}`
   const hash = createHash('sha256').update(append).digest('hex')
   return { append, hash }
 }

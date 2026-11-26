@@ -5,17 +5,30 @@ import type { AddressInfo } from 'node:net'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { AcpHttpMcpServerSpec, AcpMcpServerSpec, AcpStdioMcpServerSpec } from '../acp/protocol.ts'
+import {
+  classifyDshTool,
+  DSH_CALL_TOOL_NAME,
+  DSH_DISCOVER_TOOLS_NAME,
+  firstLineSummary,
+  resolveEffectiveMcpToolPolicy,
+  resolveToolExposure,
+  type EffectiveMcpToolPolicy,
+  type McpToolPolicyConfig,
+} from '../common/mcp-tool-policy.ts'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import { MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME } from '../common/types.ts'
+import {
+  compactToolsForAgyBudget,
+  DEFAULT_MAX_EAGER_SCHEMA_BYTES,
+  normalizeBridgeTool,
+  type BridgeToolSchema,
+  type NormalizedBridgeTool,
+} from './schema-budget.ts'
+
+export type { BridgeToolSchema } from './schema-budget.ts'
 
 export const DEFAULT_MCP_CALL_TIMEOUT_MS = 60_000
 export const DEFAULT_MCP_MAX_CONCURRENT_CALLS = 8
-
-export interface BridgeToolSchema {
-  name: string
-  description?: string
-  inputSchema?: Record<string, unknown>
-}
 
 export interface BridgeToolResult {
   content: Array<{ type: 'text'; text: string }>
@@ -38,24 +51,97 @@ export interface ReverseMcpBridgeOptions {
   blockedTools?: readonly string[]
   /** When true, hide DSH base tools that duplicate Antigravity's native tools to save prompt tokens. */
   excludeOverlappingNativeTools?: boolean
+  /**
+   * Progressive-disclosure & supplement/replace tool routing policy.
+   * When provided, tools are partitioned into lossless eager tools, on-demand gateway tools
+   * (`dsh_discover_tools` / `dsh_call_tool`), and disabled (`off`) tools; `schema-budget`
+   * becomes a last-resort safety net rather than normal-path truncation.
+   */
+  toolPolicy?: McpToolPolicyConfig | EffectiveMcpToolPolicy
+  /** Legacy compatibility flag paired with `toolPolicy` (maps unset overlapping groups to `'replace'`). */
+  legacyExposeOverlappingTools?: boolean
   serverName?: string
   bridgeScriptPath?: string
   /** Per-tool-call execution timeout in ms (default: 60_000). */
   callTimeoutMs?: number | (() => number)
   /** Maximum concurrent in-flight tool calls on this session bridge (default: 8). */
   maxConcurrentCalls?: number
+  /** Maximum estimated ACP eager MCP declaration bytes before compacting verbose descriptions (default: 52_000; 0/Infinity disables). */
+  maxEstimatedSchemaBytes?: number
   /** Optional callback fired when call metrics or errors change. */
   onActivity?: () => void
   log?: (msg: string) => void
 }
 
 const DEFAULT_BLOCKED_TOOLS = new Set<string>([MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME])
+const META_GATEWAY_TOOLS: readonly NormalizedBridgeTool[] = [
+  {
+    name: DSH_DISCOVER_TOOLS_NAME,
+    description:
+      'Inspect full descriptions and JSON input schemas for on-demand DSH host tools before calling them via dsh_call_tool. Pass exact tool names to fetch full schemas, or pass a keyword query (or omit both) to search/list available on-demand tools.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        names: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Exact DSH tool names to retrieve full descriptions and JSON input schemas for.',
+        },
+        query: {
+          type: 'string',
+          description: 'Optional keyword filter across tool names, descriptions, and capability groups.',
+        },
+        includeSchemas: {
+          type: 'boolean',
+          description: 'Include full inputSchema for broader query matches (up to 10 tools per call).',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: DSH_CALL_TOOL_NAME,
+    description:
+      'Invoke an on-demand DSH host tool by exact name and JSON arguments. Call dsh_discover_tools first when you need its full parameter schema.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Exact name of the DSH host tool to invoke (e.g. "workflow", "office_convert", "codex_image_generate").',
+        },
+        arguments: {
+          type: 'object',
+          description: 'JSON arguments object matching the target tool inputSchema.',
+          additionalProperties: true,
+        },
+      },
+      required: ['name'],
+      additionalProperties: false,
+    },
+  },
+]
+
+function isEffectivePolicy(
+  p: McpToolPolicyConfig | EffectiveMcpToolPolicy,
+): p is EffectiveMcpToolPolicy {
+  return (
+    typeof (p as EffectiveMcpToolPolicy).groups === 'object' &&
+    typeof (p as EffectiveMcpToolPolicy).replace === 'object' &&
+    typeof (p as EffectiveMcpToolPolicy).overrides === 'object' &&
+    'memory_core' in (p as EffectiveMcpToolPolicy).groups &&
+    'subagents' in (p as EffectiveMcpToolPolicy).replace
+  )
+}
 
 /**
- * DSH host tools whose capabilities already exist natively in Antigravity (`agy acp`).
+ * DSH host tools whose local capabilities already exist natively in Antigravity (`agy acp`).
  * Filtering them out by default saves ~6-10K prompt tokens per session, avoids tool-choice
  * splitting (e.g. `mcp_dsh-tools_glob` scanning `node_modules`), and preserves DSH-unique
- * extensions (`mnemon_*`, `team_task_*`, `goal`, `office_*`, `present`, `web_fetch`, etc.).
+ * extensions (`mnemon_*`, `team_task_*`, `goal`, `office_*`, `present`, `web_fetch`, etc.)
+ * as well as DSH multi-agent orchestration tools (`subagent`, `subagent_fork`, `list_agents`,
+ * `wait_agent`, `send_message`, `list_subagent_models`) required for cross-provider task
+ * routing and host Agent Teams (which Antigravity's native `invoke_subagent` cannot perform).
  */
 export const OVERLAPPING_NATIVE_DSH_TOOLS: ReadonlySet<string> = new Set([
   'read',
@@ -67,12 +153,6 @@ export const OVERLAPPING_NATIVE_DSH_TOOLS: ReadonlySet<string> = new Set([
   'web_search',
   'todo_write',
   'ask_user_question',
-  'subagent',
-  'subagent_fork',
-  'list_agents',
-  'wait_agent',
-  'send_message',
-  'list_subagent_models',
   'job_output',
   'job_list',
   'job_kill',
@@ -125,9 +205,11 @@ export class ReverseMcpBridge {
   private server: Server | null = null
   private readonly token: string
   private readonly blocked: Set<string>
+  private readonly effectivePolicy: EffectiveMcpToolPolicy | null
   private readonly serverName: string
   private readonly bridgeScriptPath: string
   private readonly maxConcurrentCalls: number
+  private readonly maxEstimatedSchemaBytes: number
   private readonly activeCallControllers = new Set<AbortController>()
   private url: string | null = null
   private activeTransport: 'http' | 'stdio' = 'stdio'
@@ -140,14 +222,20 @@ export class ReverseMcpBridge {
 
   constructor(private readonly opts: ReverseMcpBridgeOptions) {
     this.token = randomBytes(32).toString('hex')
+    this.effectivePolicy = opts.toolPolicy
+      ? isEffectivePolicy(opts.toolPolicy)
+        ? opts.toolPolicy
+        : resolveEffectiveMcpToolPolicy(opts.toolPolicy, opts.legacyExposeOverlappingTools)
+      : null
     this.blocked = new Set([
       ...DEFAULT_BLOCKED_TOOLS,
-      ...(opts.excludeOverlappingNativeTools ? OVERLAPPING_NATIVE_DSH_TOOLS : []),
+      ...(!this.effectivePolicy && opts.excludeOverlappingNativeTools ? OVERLAPPING_NATIVE_DSH_TOOLS : []),
       ...(opts.blockedTools ?? []),
     ])
     this.serverName = opts.serverName ?? 'dsh-tools'
     this.bridgeScriptPath = opts.bridgeScriptPath ?? resolveDefaultBridgeScriptPath()
     this.maxConcurrentCalls = Math.max(1, opts.maxConcurrentCalls ?? DEFAULT_MCP_MAX_CONCURRENT_CALLS)
+    this.maxEstimatedSchemaBytes = opts.maxEstimatedSchemaBytes ?? DEFAULT_MAX_EAGER_SCHEMA_BYTES
   }
 
   get isRunning(): boolean {
@@ -344,15 +432,15 @@ export class ReverseMcpBridge {
     }
 
     if (method === 'tools/list') {
-      const all = await this.opts.listTools()
-      const filtered = all
-        .filter((t) => !this.blocked.has(t.name))
-        .map((t) => ({
-          name: t.name,
-          description: t.description ?? '',
-          inputSchema: t.inputSchema ?? { type: 'object', properties: {} },
-        }))
-      return { tools: filtered }
+      const { eager, lazy } = await this.partitionHostTools()
+      const exposed = lazy.length > 0 ? [...eager, ...META_GATEWAY_TOOLS] : eager
+      const budgeted = compactToolsForAgyBudget(exposed, this.maxEstimatedSchemaBytes)
+      if (budgeted.compacted) {
+        this.opts.log?.(
+          `[warn] compacted reverse MCP schemas for ${budgeted.tools.length} tools (${budgeted.originalEstimatedBytes} -> ${budgeted.finalEstimatedBytes} est. bytes); consider moving low-frequency groups to lazy`,
+        )
+      }
+      return { tools: budgeted.tools }
     }
 
     if (method === 'tools/call') {
@@ -360,86 +448,247 @@ export class ReverseMcpBridge {
       if (!name) {
         throw Object.assign(new Error('Missing tool name'), { code: -32602 })
       }
-      if (this.blocked.has(name)) {
-        return {
-          content: [{ type: 'text', text: `Tool "${name}" is blocked by reverse MCP bridge to prevent recursion.` }],
-          isError: true,
-        }
-      }
-      if (this.inFlightCalls >= this.maxConcurrentCalls) {
-        this.totalCalls++
-        this.failedCalls++
-        this.lastToolName = name
-        this.lastCallAt = Date.now()
-        this.lastError = sanitizeDiagnosticText(
-          `工具 "${name}" 被拒绝：反向 MCP 并发调用已达上限（${this.maxConcurrentCalls}）`,
-          160,
-        )
-        this.opts.onActivity?.()
-        throw Object.assign(
-          new Error(`Reverse MCP bridge concurrency limit (${this.maxConcurrentCalls}) exceeded`),
-          { code: -32005 },
-        )
-      }
-
-      const args =
+      const rawArgs =
         params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments)
           ? (params.arguments as Record<string, unknown>)
           : {}
 
-      const timeoutMs = this.resolveCallTimeoutMs()
-      const callAc = new AbortController()
-      this.activeCallControllers.add(callAc)
-      const combinedSignal = AbortSignal.any([signal, callAc.signal])
-
-      this.inFlightCalls++
-      this.totalCalls++
-      this.lastToolName = name
-      this.lastCallAt = Date.now()
-      this.opts.onActivity?.()
-
-      let timer: ReturnType<typeof setTimeout> | undefined
-      try {
-        const result = await Promise.race([
-          this.opts.callTool(name, args, combinedSignal),
-          new Promise<never>((_resolve, reject) => {
-            timer = setTimeout(() => {
-              const timeoutErr = Object.assign(
-                new Error(`Reverse MCP tool "${name}" timed out after ${timeoutMs}ms`),
-                { code: -32001 },
-              )
-              callAc.abort(timeoutErr)
-              reject(timeoutErr)
-            }, timeoutMs)
-            timer.unref?.()
-          }),
-        ])
-        if (result.isError) {
-          this.failedCalls++
-          const text = result.content.map(c => c.text).join(' ')
-          this.lastError = sanitizeDiagnosticText(`工具 "${name}" 返回错误：${text}`, 160)
-        } else {
-          this.lastError = null
-        }
-        return result
-      } catch (err) {
-        this.failedCalls++
-        const code = (err as { code?: number }).code ?? -32603
-        const rawMsg = err instanceof Error ? err.message : String(err)
-        const safeMsg = sanitizeDiagnosticText(rawMsg, 180) || '反向 MCP 工具调用失败'
-        this.lastError =
-          code === -32001
-            ? sanitizeDiagnosticText(`工具 "${name}" 调用超时（>${timeoutMs}ms）`, 160)
-            : sanitizeDiagnosticText(`工具 "${name}" 调用异常：${safeMsg}`, 160)
-        throw Object.assign(new Error(safeMsg), { code })
-      } finally {
-        if (timer) clearTimeout(timer)
-        this.activeCallControllers.delete(callAc)
-        this.inFlightCalls = Math.max(0, this.inFlightCalls - 1)
-        this.opts.onActivity?.()
+      if (this.effectivePolicy && name === DSH_DISCOVER_TOOLS_NAME) {
+        return await this.handleDiscoverTools(rawArgs)
       }
+
+      if (this.effectivePolicy && name === DSH_CALL_TOOL_NAME) {
+        const targetName = typeof rawArgs.name === 'string' ? rawArgs.name.trim() : ''
+        if (!targetName) {
+          return {
+            content: [{ type: 'text', text: 'Error: dsh_call_tool requires a non-empty string "name".' }],
+            isError: true,
+          }
+        }
+        if (targetName === DSH_CALL_TOOL_NAME || targetName === DSH_DISCOVER_TOOLS_NAME) {
+          return {
+            content: [{ type: 'text', text: `Error: Cannot invoke meta-gateway tool "${targetName}" recursively.` }],
+            isError: true,
+          }
+        }
+        const nestedArgs = rawArgs.arguments
+        if (nestedArgs !== undefined && (typeof nestedArgs !== 'object' || nestedArgs === null || Array.isArray(nestedArgs))) {
+          return {
+            content: [{ type: 'text', text: 'Error: dsh_call_tool "arguments" must be a JSON object.' }],
+            isError: true,
+          }
+        }
+        return await this.invokeHostTool(targetName, (nestedArgs as Record<string, unknown> | undefined) ?? {}, signal)
+      }
+
+      return await this.invokeHostTool(name, rawArgs, signal)
     }
 
     throw Object.assign(new Error(`Method not found: ${method}`), { code: -32601 })
+  }
+
+  private async partitionHostTools(): Promise<{
+    eager: NormalizedBridgeTool[]
+    lazy: NormalizedBridgeTool[]
+    off: NormalizedBridgeTool[]
+  }> {
+    const all = await this.opts.listTools()
+    const normalized = all
+      .filter((t) => !this.blocked.has(t.name) && t.name !== DSH_DISCOVER_TOOLS_NAME && t.name !== DSH_CALL_TOOL_NAME)
+      .map(normalizeBridgeTool)
+
+    if (!this.effectivePolicy) {
+      return { eager: normalized, lazy: [], off: [] }
+    }
+
+    const eager: NormalizedBridgeTool[] = []
+    const lazy: NormalizedBridgeTool[] = []
+    const off: NormalizedBridgeTool[] = []
+    for (const tool of normalized) {
+      const { mode } = resolveToolExposure(tool.name, this.effectivePolicy)
+      if (mode === 'eager') eager.push(tool)
+      else if (mode === 'lazy') lazy.push(tool)
+      else off.push(tool)
+    }
+    return { eager, lazy, off }
+  }
+
+  private async handleDiscoverTools(args: Record<string, unknown>): Promise<BridgeToolResult> {
+    const { eager, lazy } = await this.partitionHostTools()
+    const lazyByName = new Map(lazy.map((t) => [t.name, t]))
+    const eagerByName = new Map(eager.map((t) => [t.name, t]))
+
+    const rawNames = Array.isArray(args.names)
+      ? args.names.filter((v): v is string => typeof v === 'string' && v.trim() !== '').map((v) => v.trim())
+      : []
+
+    if (rawNames.length > 0) {
+      const found: Array<Record<string, unknown>> = []
+      const notFound: string[] = []
+      for (const reqName of rawNames.slice(0, 12)) {
+        const lazyTool = lazyByName.get(reqName)
+        if (lazyTool) {
+          found.push({
+            name: lazyTool.name,
+            group: classifyDshTool(lazyTool.name).label,
+            mode: 'on-demand',
+            invokeVia: `mcp_dsh-tools_${DSH_CALL_TOOL_NAME}`,
+            description: lazyTool.description,
+            inputSchema: lazyTool.inputSchema,
+          })
+          continue
+        }
+        const eagerTool = eagerByName.get(reqName)
+        if (eagerTool) {
+          found.push({
+            name: eagerTool.name,
+            group: classifyDshTool(eagerTool.name).label,
+            mode: 'eager',
+            invokeVia: `mcp_dsh-tools_${eagerTool.name}`,
+            description: eagerTool.description,
+            inputSchema: eagerTool.inputSchema,
+          })
+          continue
+        }
+        notFound.push(reqName)
+      }
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ tools: found, ...(notFound.length ? { notFound } : {}) }, null, 2) }],
+        isError: false,
+      }
+    }
+
+    const query = typeof args.query === 'string' ? args.query.trim().toLowerCase() : ''
+    const tokens = query ? query.split(/\s+/).filter(Boolean) : []
+    const includeSchemas = args.includeSchemas === true
+
+    const matched = lazy.filter((tool) => {
+      if (tokens.length === 0) return true
+      const group = classifyDshTool(tool.name)
+      const haystack = `${tool.name} ${tool.description} ${group.id} ${group.label}`.toLowerCase()
+      return tokens.every((tok) => haystack.includes(tok))
+    })
+
+    const attachFullSchemas = matched.length <= 5 || includeSchemas
+    const capped = attachFullSchemas ? matched.slice(0, 10) : matched
+    const payload = {
+      totalOnDemand: lazy.length,
+      matched: matched.length,
+      invokeVia: `mcp_dsh-tools_${DSH_CALL_TOOL_NAME}`,
+      tools: capped.map((tool) => {
+        const group = classifyDshTool(tool.name)
+        return attachFullSchemas
+          ? {
+              name: tool.name,
+              group: group.label,
+              description: tool.description,
+              inputSchema: tool.inputSchema,
+            }
+          : {
+              name: tool.name,
+              group: group.label,
+              summary: firstLineSummary(tool.description, 120),
+            }
+      }),
+      ...(!attachFullSchemas
+        ? { hint: `Pass names: [...] to mcp_dsh-tools_${DSH_DISCOVER_TOOLS_NAME} to fetch full schemas before calling.` }
+        : matched.length > capped.length
+          ? { truncated: true, hint: 'Narrow your query or pass specific tool names to inspect remaining schemas.' }
+          : {}),
+    }
+
+    return {
+      content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+      isError: false,
+    }
+  }
+
+  private async invokeHostTool(
+    name: string,
+    args: Record<string, unknown>,
+    signal: AbortSignal,
+  ): Promise<BridgeToolResult> {
+    if (this.blocked.has(name)) {
+      return {
+        content: [{ type: 'text', text: `Tool "${name}" is blocked by reverse MCP bridge to prevent recursion.` }],
+        isError: true,
+      }
+    }
+    if (this.effectivePolicy) {
+      const { mode } = resolveToolExposure(name, this.effectivePolicy)
+      if (mode === 'off') {
+        return {
+          content: [{ type: 'text', text: `Tool "${name}" is disabled by the user's reverse MCP tool policy.` }],
+          isError: true,
+        }
+      }
+    }
+    if (this.inFlightCalls >= this.maxConcurrentCalls) {
+      this.totalCalls++
+      this.failedCalls++
+      this.lastToolName = name
+      this.lastCallAt = Date.now()
+      this.lastError = sanitizeDiagnosticText(
+        `工具 "${name}" 被拒绝：反向 MCP 并发调用已达上限（${this.maxConcurrentCalls}）`,
+        160,
+      )
+      this.opts.onActivity?.()
+      throw Object.assign(
+        new Error(`Reverse MCP bridge concurrency limit (${this.maxConcurrentCalls}) exceeded`),
+        { code: -32005 },
+      )
+    }
+
+    const timeoutMs = this.resolveCallTimeoutMs()
+    const callAc = new AbortController()
+    this.activeCallControllers.add(callAc)
+    const combinedSignal = AbortSignal.any([signal, callAc.signal])
+
+    this.inFlightCalls++
+    this.totalCalls++
+    this.lastToolName = name
+    this.lastCallAt = Date.now()
+    this.opts.onActivity?.()
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const result = await Promise.race([
+        this.opts.callTool(name, args, combinedSignal),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            const timeoutErr = Object.assign(
+              new Error(`Reverse MCP tool "${name}" timed out after ${timeoutMs}ms`),
+              { code: -32001 },
+            )
+            callAc.abort(timeoutErr)
+            reject(timeoutErr)
+          }, timeoutMs)
+          timer.unref?.()
+        }),
+      ])
+      if (result.isError) {
+        this.failedCalls++
+        const text = result.content.map(c => c.text).join(' ')
+        this.lastError = sanitizeDiagnosticText(`工具 "${name}" 返回错误：${text}`, 160)
+      } else {
+        this.lastError = null
+      }
+      return result
+    } catch (err) {
+      this.failedCalls++
+      const code = (err as { code?: number }).code ?? -32603
+      const rawMsg = err instanceof Error ? err.message : String(err)
+      const safeMsg = sanitizeDiagnosticText(rawMsg, 180) || '反向 MCP 工具调用失败'
+      this.lastError =
+        code === -32001
+          ? sanitizeDiagnosticText(`工具 "${name}" 调用超时（>${timeoutMs}ms）`, 160)
+          : sanitizeDiagnosticText(`工具 "${name}" 调用异常：${safeMsg}`, 160)
+      throw Object.assign(new Error(safeMsg), { code })
+    } finally {
+      if (timer) clearTimeout(timer)
+      this.activeCallControllers.delete(callAc)
+      this.inFlightCalls = Math.max(0, this.inFlightCalls - 1)
+      this.opts.onActivity?.()
+    }
   }
 }

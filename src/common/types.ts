@@ -1,3 +1,5 @@
+import type { McpToolPolicyConfig, ToolExposureMode, ToolGroupId } from './mcp-tool-policy.ts'
+
 export const PROVIDER_ID = 'antigravity-acp'
 export const MIRROR_TOOL_NAME = 'agy_acp_tool'
 export const WRAPPER_TOOL_NAME = 'run_code'
@@ -82,6 +84,7 @@ export interface AccountHealthSnapshot {
 export interface PersistedConfigPatch {
   mcpBridge?: boolean
   mcpExposeOverlappingTools?: boolean
+  mcpToolPolicy?: McpToolPolicyConfig
   quotaAwareScheduling?: boolean
   defaultModel?: string
   defaultEffort?: string
@@ -111,8 +114,10 @@ export interface PluginConfig {
   requestTimeoutMs: number
   /** Attach session-scoped reverse MCP bridge via ACP session/new. */
   mcpBridge: boolean
-  /** Expose DSH base tools that overlap with Antigravity native tools over reverse MCP (default: false). */
+  /** Legacy switch: expose DSH base tools that overlap with Antigravity native tools over reverse MCP (default: false). */
   mcpExposeOverlappingTools?: boolean
+  /** Fine-grained reverse MCP tool routing policy (supplement groups, native replacements, per-tool overrides). */
+  mcpToolPolicy?: McpToolPolicyConfig
   /** Opt-in: feed sampled account quotas into MultiAccountPool scheduler weights (default: false). */
   quotaAwareScheduling: boolean
   /** Local egress geo-fence protection policy (default: 'block'). */
@@ -152,6 +157,28 @@ export interface SessionSummary {
   contextUsed: number | null
   contextSize: number
   lastActiveAt: number
+}
+
+export interface McpToolCatalogEntry {
+  name: string
+  groupId: ToolGroupId
+  kind: 'supplement' | 'replace'
+  description: string
+  estimatedBytes: number
+  effectiveMode: ToolExposureMode
+  replacedNative: boolean
+  overridden: boolean
+}
+
+export interface McpToolCatalogSnapshot {
+  tools: McpToolCatalogEntry[]
+  eagerCount: number
+  lazyCount: number
+  offCount: number
+  estimatedEagerBytes: number
+  budgetBytes: number
+  willCompact: boolean
+  source: 'live' | 'empty'
 }
 
 export interface McpBridgeSnapshot {
@@ -197,6 +224,7 @@ export interface StatusSnapshot {
   sessions: SessionSummary[]
   mcpBridgeActive: boolean
   mcpBridge?: McpBridgeSnapshot
+  mcpToolCatalog?: McpToolCatalogSnapshot
   usageTotals: UsageTotals
   accounts: AccountHealthSnapshot[]
   models: AcpModelOption[]
@@ -211,6 +239,7 @@ export interface StatusSnapshot {
     autoReviewEffort?: string
     mcpBridge: boolean
     mcpExposeOverlappingTools?: boolean
+    mcpToolPolicy?: McpToolPolicyConfig
     quotaAwareScheduling?: boolean
     sessionIdleTtlMs: number
     requestTimeoutMs: number

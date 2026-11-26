@@ -35,6 +35,7 @@ import {
   type AccountQuotaSample,
   type AcpModelOption,
   type McpBridgeSnapshot,
+  type McpToolCatalogSnapshot,
   type PluginConfig,
   type ReviewProviderOption,
   type SessionSummary,
@@ -155,6 +156,7 @@ export interface SessionPoolDeps {
   onPermission?: (req: RequestPermissionParams, key: string, signal: AbortSignal, launchPolicy: SessionPolicy, opts?: DecidePermissionOptions) => Promise<RequestPermissionResult>
   isMcpBridgeActive?: () => boolean
   getMcpBridgeSnapshot?: () => McpBridgeSnapshot
+  getMcpToolCatalog?: () => McpToolCatalogSnapshot | undefined
   listReviewProviders?: () => ReviewProviderOption[]
   onConfigPatch?: (patch: Partial<PluginConfig>) => void | Promise<void>
   onConfigReset?: () => void | Promise<void>
@@ -537,6 +539,7 @@ export class AcpSessionPool extends EventEmitter {
     }))
     const connected = Array.from(this.clients.values()).some((c) => c.isRunning)
     const mcpBridge = this.deps.getMcpBridgeSnapshot?.()
+    const mcpToolCatalog = this.deps.getMcpToolCatalog?.()
     const capabilities: AcpCapabilitiesSnapshot | undefined = this.initResult
       ? {
           resumeSession: supportsSessionResume(this.initResult),
@@ -561,6 +564,7 @@ export class AcpSessionPool extends EventEmitter {
       sessions,
       mcpBridgeActive: this.deps.isMcpBridgeActive?.() ?? false,
       ...(mcpBridge ? { mcpBridge } : {}),
+      ...(mcpToolCatalog ? { mcpToolCatalog } : {}),
       usageTotals: { ...this.usageTotals },
       accounts: this.getAccountHealthSnapshots(),
       models: this.cachedModels.filter(m => !m.variantOf),
@@ -575,6 +579,7 @@ export class AcpSessionPool extends EventEmitter {
         autoReviewEffort: cfg.autoReviewEffort,
         mcpBridge: cfg.mcpBridge,
         mcpExposeOverlappingTools: cfg.mcpExposeOverlappingTools,
+        ...(cfg.mcpToolPolicy ? { mcpToolPolicy: cfg.mcpToolPolicy } : {}),
         quotaAwareScheduling: cfg.quotaAwareScheduling,
         sessionIdleTtlMs: cfg.sessionIdleTtlMs,
         requestTimeoutMs: cfg.requestTimeoutMs,

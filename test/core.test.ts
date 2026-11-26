@@ -316,6 +316,14 @@ test('buildPromptBlocks stops trailingUsers at tool messages and builds budget-a
   assert.ok(sys)
   assert.match(sys.append, /Always respond in Chinese\./)
   assert.match(sys.append, /Host Bridge Guidance/)
+  assert.equal(sys.append.includes('mcp_dsh-tools_subagent'), false)
+
+  const sysWithBridge = prepareSystemPrompt('Always respond in Chinese.', undefined, { hasBridgedSubagentTools: true })
+  assert.ok(sysWithBridge)
+  assert.match(sysWithBridge.append, /mcp_dsh-tools_subagent/)
+  assert.match(sysWithBridge.append, /invoke_subagent/)
+  assert.notEqual(sysWithBridge.hash, sys.hash)
+
   assert.equal(prepareSystemPrompt('   '), null)
 })
 

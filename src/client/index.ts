@@ -11,9 +11,20 @@ import {
 } from '../common/config.ts'
 import { effortLabel, sortedEfforts } from '../common/effort.ts'
 import { isGeoFenceMode } from '../common/geo.ts'
+import {
+  compactMcpToolPolicy,
+  resolveEffectiveMcpToolPolicy,
+  type EffectiveMcpToolPolicy,
+  type ReplaceGroupId,
+  type ReplaceGroupMode,
+  type SupplementGroupId,
+  type SupplementGroupMode,
+  type ToolExposureMode,
+} from '../common/mcp-tool-policy.ts'
 import { PROVIDER_ID, type GeoFenceMode, type SessionSummary, type StatusSnapshot } from '../common/types.ts'
 import { AccountCard } from './account-card.ts'
 import { sessionAccountLabel } from './account-display.ts'
+import { McpToolPolicyPanel } from './mcp-tool-panel.ts'
 import { actualTransport, accountAttention, capabilityLabel, recoveryCapability, sessionRecovery } from './runtime-display.ts'
 import { snapshotNotice, type SnapshotState } from './snapshot-state.ts'
 import { fetchReviewModels, postJson, resetSessions, type ReviewModelOption, type SessionResetTarget } from './panel-actions.ts'
@@ -93,6 +104,7 @@ function AgyAcpSettingsSection(): unknown {
 
 interface FormBaseline {
   mcpBridge: boolean
+  mcpToolPolicy: EffectiveMcpToolPolicy
   quotaAwareScheduling: boolean
   geoFenceMode: GeoFenceMode
   defaultModel: string
@@ -111,6 +123,7 @@ function baselineFromStatus(status: StatusSnapshot): FormBaseline {
   const rawReviewProvider = status.config?.autoReviewProvider ?? ''
   return {
     mcpBridge: Boolean(status.config?.mcpBridge),
+    mcpToolPolicy: resolveEffectiveMcpToolPolicy(status.config?.mcpToolPolicy, status.config?.mcpExposeOverlappingTools),
     quotaAwareScheduling: Boolean(status.config?.quotaAwareScheduling),
     geoFenceMode: isGeoFenceMode(rawMode) ? rawMode : 'block',
     defaultModel: status.config?.defaultModel ?? '',
@@ -152,6 +165,10 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
   const initialBase = status ? baselineFromStatus(status) : null
   const [baseline, setBaseline] = React.useState(initialBase as FormBaseline | null)
   const [mcpBridge, setMcpBridge] = React.useState(initialBase?.mcpBridge ?? false)
+  const [mcpToolPolicy, setMcpToolPolicy] = React.useState(
+    initialBase?.mcpToolPolicy ?? resolveEffectiveMcpToolPolicy(),
+  )
+  const [needsSessionResetHint, setNeedsSessionResetHint] = React.useState(false)
   const [quotaAwareScheduling, setQuotaAwareScheduling] = React.useState(initialBase?.quotaAwareScheduling ?? false)
   const [geoFenceMode, setGeoFenceMode] = React.useState(initialBase?.geoFenceMode ?? ('block' as GeoFenceMode))
   const [defaultModel, setDefaultModel] = React.useState(initialBase?.defaultModel ?? '')
@@ -171,6 +188,7 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
   const syncFormTo = React.useCallback((nextBase: FormBaseline) => {
     setBaseline(nextBase)
     setMcpBridge(nextBase.mcpBridge)
+    setMcpToolPolicy(nextBase.mcpToolPolicy)
     setQuotaAwareScheduling(nextBase.quotaAwareScheduling)
     setGeoFenceMode(nextBase.geoFenceMode)
     setDefaultModel(nextBase.defaultModel)
@@ -193,6 +211,7 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
     }
     const isCurrentlyClean =
       mcpBridge === baseline.mcpBridge &&
+      JSON.stringify(mcpToolPolicy) === JSON.stringify(baseline.mcpToolPolicy) &&
       quotaAwareScheduling === baseline.quotaAwareScheduling &&
       geoFenceMode === baseline.geoFenceMode &&
       defaultModel === baseline.defaultModel &&
@@ -207,7 +226,7 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
     if (isCurrentlyClean && JSON.stringify(incoming) !== JSON.stringify(baseline)) {
       syncFormTo(incoming)
     }
-  }, [status, baseline, mcpBridge, quotaAwareScheduling, geoFenceMode, defaultModel, defaultEffort, autoReviewProvider, autoReviewModel, autoReviewEffort, agyBin, workspaceRoot, idleMinutes, timeoutSeconds, syncFormTo])
+  }, [status, baseline, mcpBridge, mcpToolPolicy, quotaAwareScheduling, geoFenceMode, defaultModel, defaultEffort, autoReviewProvider, autoReviewModel, autoReviewEffort, agyBin, workspaceRoot, idleMinutes, timeoutSeconds, syncFormTo])
 
   const trimmedReviewProvider = autoReviewProvider.trim()
   const isExternalReviewProvider = trimmedReviewProvider !== '' && trimmedReviewProvider !== PROVIDER_ID
@@ -303,9 +322,16 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
             ? '当前选择的自动审查推理强度不适用于所选审查模型'
             : ''
 
-  const dirty = Boolean(
+  const mcpPolicyChanged = Boolean(
     baseline && (
       mcpBridge !== baseline.mcpBridge ||
+      JSON.stringify(mcpToolPolicy) !== JSON.stringify(baseline.mcpToolPolicy)
+    ),
+  )
+
+  const dirty = Boolean(
+    baseline && (
+      mcpPolicyChanged ||
       quotaAwareScheduling !== baseline.quotaAwareScheduling ||
       geoFenceMode !== baseline.geoFenceMode ||
       defaultModel !== baseline.defaultModel ||
@@ -320,6 +346,42 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
     ),
   )
 
+  const handleChangeGroup = (groupId: SupplementGroupId, mode: SupplementGroupMode): void => {
+    setSavedMsg('')
+    setMcpToolPolicy((prev: EffectiveMcpToolPolicy) => ({
+      ...prev,
+      groups: { ...prev.groups, [groupId]: mode },
+    }))
+  }
+
+  const handleChangeReplace = (groupId: ReplaceGroupId, mode: ReplaceGroupMode): void => {
+    setSavedMsg('')
+    setMcpToolPolicy((prev: EffectiveMcpToolPolicy) => ({
+      ...prev,
+      replace: { ...prev.replace, [groupId]: mode },
+    }))
+  }
+
+  const handleChangeOverride = (toolName: string, mode: ToolExposureMode | ''): void => {
+    setSavedMsg('')
+    setMcpToolPolicy((prev: EffectiveMcpToolPolicy) => {
+      const nextOverrides = { ...prev.overrides }
+      if (!mode) delete nextOverrides[toolName]
+      else nextOverrides[toolName] = mode
+      return { ...prev, overrides: nextOverrides }
+    })
+  }
+
+  const handleClearOverrides = (): void => {
+    setSavedMsg('')
+    setMcpToolPolicy((prev: EffectiveMcpToolPolicy) => ({ ...prev, overrides: {} }))
+  }
+
+  const handleResetPolicyDefaults = (): void => {
+    setSavedMsg('')
+    setMcpToolPolicy(resolveEffectiveMcpToolPolicy())
+  }
+
   const totals = status.usageTotals ?? {
     inputTokens: 0,
     outputTokens: 0,
@@ -330,11 +392,14 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
 
   const handleSaveConfig = async (): Promise<void> => {
     if (validationError) return
+    const hadMcpChanges = mcpPolicyChanged
     setOperation('save')
     setSavedMsg('')
     try {
       const res = await postJson('/plugins/agy-acp/config', {
         mcpBridge,
+        mcpExposeOverlappingTools: false,
+        mcpToolPolicy: compactMcpToolPolicy(mcpToolPolicy) ?? {},
         quotaAwareScheduling,
         geoFenceMode,
         defaultModel,
@@ -350,7 +415,13 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
       if (res.ok && res.status) {
         applyStatus(res.status)
         syncFormTo(baselineFromStatus(res.status))
-        setSavedMsg('已保存并持久化到本机配置')
+        const activeCount = res.status.sessions?.length ?? 0
+        setNeedsSessionResetHint(Boolean(hadMcpChanges && activeCount > 0))
+        setSavedMsg(
+          hadMcpChanges && activeCount > 0
+            ? '已保存并持久化；新对话立即生效，已有活跃会话可点击右侧按钮重置连接以刷新工具表'
+            : '已保存并持久化到本机配置',
+        )
       } else {
         setSavedMsg(res.error || '保存失败，请重试')
       }
@@ -362,6 +433,7 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
   const handleResetConfig = async (): Promise<void> => {
     setOperation('resetConfig')
     setSavedMsg('')
+    setNeedsSessionResetHint(false)
     try {
       const res = await postJson('/plugins/agy-acp/config/reset', {})
       if (res.ok && res.status) {
@@ -569,6 +641,18 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
           style: { width: '16px', height: '16px', cursor: 'pointer' },
         }),
       ),
+
+      // Reverse MCP supplement/replace tool policy panel
+      React.createElement(McpToolPolicyPanel, {
+        enabled: mcpBridge,
+        policy: mcpToolPolicy,
+        catalog: status.mcpToolCatalog,
+        onChangeGroup: handleChangeGroup,
+        onChangeReplace: handleChangeReplace,
+        onChangeOverride: handleChangeOverride,
+        onClearOverrides: handleClearOverrides,
+        onResetPolicyDefaults: handleResetPolicyDefaults,
+      }),
 
       // Opt-in quota-aware scheduling toggle
       React.createElement(
@@ -946,6 +1030,21 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
             ? React.createElement('span', { style: { fontSize: '12px', color: theme.stateWarn } }, '有未保存的修改')
             : null,
         savedMsg ? React.createElement('span', { role: 'status', style: styles.secondaryText }, savedMsg) : null,
+        needsSessionResetHint && sessions.length > 0
+          ? React.createElement(
+              'button',
+              {
+                type: 'button',
+                disabled: busy,
+                onClick: () => {
+                  setNeedsSessionResetHint(false)
+                  void handleResetSessions({ kind: 'all' })
+                },
+                style: styles.ghostButton,
+              },
+              '立即应用到活跃会话（重置连接）',
+            )
+          : null,
       ),
     ),
 

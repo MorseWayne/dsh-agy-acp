@@ -1,10 +1,26 @@
-import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { ReasoningEffortId, type ToolCallId } from '@deepseek-ai/dsh-llm/brand'
-import type { PreToolDecision, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
 import { resolveConfig } from './common/config.ts'
-import { MIRROR_TOOL_NAME, PROVIDER_ID, type McpBridgeSnapshot, type ReviewProviderOption } from './common/types.ts'
+import {
+  DEFAULT_MAX_EAGER_SCHEMA_BYTES,
+  DSH_CALL_TOOL_NAME,
+  DSH_DISCOVER_TOOLS_NAME,
+  estimateToolSchemaBytes,
+  firstLineSummary,
+  META_GATEWAY_ESTIMATED_BYTES,
+  resolveEffectiveMcpToolPolicy,
+  resolveToolExposure,
+} from './common/mcp-tool-policy.ts'
+import {
+  MIRROR_TOOL_NAME,
+  PROVIDER_ID,
+  WRAPPER_TOOL_NAME,
+  type McpBridgeSnapshot,
+  type McpToolCatalogEntry,
+  type McpToolCatalogSnapshot,
+  type ReviewProviderOption,
+} from './common/types.ts'
 import { ReverseMcpBridge } from './mcp/server.ts'
 import { AcpAdapter, resolveAutoReviewRedirectOptions } from './provider/adapter.ts'
 import { defineAgyAcpMirrorTool } from './provider/mirror-tool.ts'
@@ -27,11 +43,7 @@ export const inject = ['llm', 'commands', 'agents', 'permissionPresets', 'approv
 
 interface DshToolsServiceLike {
   register(t: unknown): (() => void) | void
-  schemas?(agent: SessionAgent): Array<{ name: string; description?: string; parameters?: Record<string, unknown> }>
-  execute?(input: {
-    calls: Array<{ type: 'tool-call'; id: ToolCallId; name: string; arguments: unknown }>
-    agent: SessionAgent; signal: AbortSignal
-  }): Promise<{ results: Array<{ result: ToolExecutionResult }> }>
+  schemas?(agent?: SessionAgent): Array<{ name: string; description?: string; parameters?: Record<string, unknown> }>
 }
 
 interface DshLlmServiceLike {
@@ -118,6 +130,79 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     }
   }
 
+  function collectMcpToolCatalog(): McpToolCatalogSnapshot {
+    const rawSchemas: Array<{ name: string; description?: string; parameters?: Record<string, unknown> }> = []
+    if (bridgeTools?.schemas) {
+      try {
+        rawSchemas.push(...bridgeTools.schemas())
+      } catch {
+        // Fallback: if the host requires a scope, try any active bridge session owner.
+        for (const key of bridges.keys()) {
+          try {
+            rawSchemas.push(...bridgeTools.schemas(permissions.agent(key)))
+            break
+          } catch {
+            // try next session
+          }
+        }
+      }
+    }
+
+    const effectivePolicy = resolveEffectiveMcpToolPolicy(cfg.mcpToolPolicy, cfg.mcpExposeOverlappingTools)
+    const entries: McpToolCatalogEntry[] = []
+    let eagerCount = 0
+    let lazyCount = 0
+    let offCount = 0
+    let estimatedEagerBytes = 0
+
+    for (const t of rawSchemas) {
+      if (
+        !t?.name ||
+        t.name === MIRROR_TOOL_NAME ||
+        t.name === WRAPPER_TOOL_NAME ||
+        t.name === DSH_DISCOVER_TOOLS_NAME ||
+        t.name === DSH_CALL_TOOL_NAME
+      ) {
+        continue
+      }
+      const { mode, group, replacedNative, overridden } = resolveToolExposure(t.name, effectivePolicy)
+      const bytes = estimateToolSchemaBytes({ name: t.name, description: t.description, inputSchema: t.parameters })
+      if (mode === 'eager') {
+        eagerCount++
+        estimatedEagerBytes += bytes
+      } else if (mode === 'lazy') {
+        lazyCount++
+      } else {
+        offCount++
+      }
+      entries.push({
+        name: t.name,
+        groupId: group.id,
+        kind: group.kind,
+        description: firstLineSummary(t.description, 100),
+        estimatedBytes: bytes,
+        effectiveMode: mode,
+        replacedNative,
+        overridden,
+      })
+    }
+
+    if (lazyCount > 0) {
+      estimatedEagerBytes += META_GATEWAY_ESTIMATED_BYTES
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    return {
+      tools: entries,
+      eagerCount,
+      lazyCount,
+      offCount,
+      estimatedEagerBytes,
+      budgetBytes: DEFAULT_MAX_EAGER_SCHEMA_BYTES,
+      willCompact: estimatedEagerBytes > DEFAULT_MAX_EAGER_SCHEMA_BYTES,
+      source: entries.length > 0 ? 'live' : 'empty',
+    }
+  }
+
   const slotManager = cfg.credentialSlotDir
     ? new CredentialSlotLeaseManager({ slotDir: cfg.credentialSlotDir })
     : undefined
@@ -156,6 +241,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     ...permissions,
     isMcpBridgeActive: () => bridges.size > 0,
     getMcpBridgeSnapshot: collectMcpBridgeSnapshot,
+    getMcpToolCatalog: collectMcpToolCatalog,
     listReviewProviders,
     hasPersistedConfig: () => configStore.hasPersistedOverrides,
     onConfigPatch: patch => {
@@ -193,7 +279,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     onSessionClosed: releaseBridge,
     async getMcpServers(key, opts) {
       const tools = bridgeTools
-      if (!cfg.mcpBridge || !tools?.schemas || !tools.execute) return []
+      if (!cfg.mcpBridge || !tools?.schemas) return []
       const owner = permissions.agent(key)
       const authority = (): AbortSignal => {
         const signal = pool.activeSignal(key)
@@ -201,7 +287,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         return signal
       }
       const bridge = new ReverseMcpBridge({
-        excludeOverlappingNativeTools: !cfg.mcpExposeOverlappingTools,
+        toolPolicy: resolveEffectiveMcpToolPolicy(cfg.mcpToolPolicy, cfg.mcpExposeOverlappingTools),
         listTools: () => tools.schemas!(owner).map(t => ({ name: t.name, description: t.description, inputSchema: t.parameters })),
         callTool: async (name, args, signal) => {
           const turn = authority()
@@ -214,19 +300,21 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
           }
           const combinedSignal = AbortSignal.any([signal, turn])
           const activeRec = runs.getActiveForOwner(key)
-          if (activeRec?.delegatesMcp) {
-            const resumeTimer = pool.pauseTurnTimer(key)
-            try {
-              return await activeRec.enqueueMcpCall(name, args, combinedSignal)
-            } finally {
-              resumeTimer()
+          if (!activeRec) {
+            throw new Error('No active ACP turn for delegated MCP call')
+          }
+          if (!activeRec.delegatesMcp) {
+            return {
+              content: [{ type: 'text', text: `Error: Tool "${name}" is not available in this DSH step` }],
+              isError: true,
             }
           }
-          const batch = await tools.execute!({ agent: owner, signal: combinedSignal,
-            calls: [{ type: 'tool-call', id: `mcp:${randomUUID()}` as ToolCallId, name, arguments: args }] })
-          const result = batch.results[0]?.result
-          if (!result) throw new Error('No DSH tool result')
-          return { content: [{ type: 'text', text: result.content.map(b => b.type === 'text' ? b.text : JSON.stringify(b)).join('\n') }], isError: result.isError }
+          const resumeTimer = pool.pauseTurnTimer(key)
+          try {
+            return await activeRec.enqueueMcpCall(name, args, combinedSignal)
+          } finally {
+            resumeTimer()
+          }
         },
         callTimeoutMs: () => Math.min(Math.max(cfg.requestTimeoutMs, 120_000), 600_000),
         onActivity: () => pool.notifyStatusChange(),
@@ -266,6 +354,22 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     getConfig: () => cfg,
     pool,
     runs,
+    canUseMirrorTool: (sessionKey) => {
+      if (!bridgeTools?.schemas) return false
+      try {
+        return bridgeTools.schemas(permissions.agent(sessionKey)).some(t => t.name === MIRROR_TOOL_NAME)
+      } catch {
+        return false
+      }
+    },
+    listSessionTools: (sessionKey) => {
+      if (!bridgeTools?.schemas) return []
+      try {
+        return bridgeTools.schemas(permissions.agent(sessionKey)).map(t => ({ name: t.name, description: t.description }))
+      } catch {
+        return []
+      }
+    },
     log,
   })
 
@@ -315,9 +419,18 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     )
 
     bridgeTools = tools
+    const unlistenChange = sub.on(
+      'tools/change' as never,
+      (() => {
+        pool.notifyStatusChange()
+      }) as never,
+      { global: true },
+    )
+    pool.notifyStatusChange()
     return () => {
       bridgeTools = undefined
       for (const key of bridges.keys()) releaseBridge(key)
+      if (typeof unlistenChange === 'function') unlistenChange()
       if (typeof unlisten === 'function') unlisten()
       if (typeof disposeTool === 'function') disposeTool()
     }
