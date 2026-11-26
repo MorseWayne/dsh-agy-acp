@@ -2,6 +2,16 @@
 
 All notable changes to `@morsewayne/dsh-agy-acp` are documented in this file.
 
+## [0.6.0] - 2026-11-26
+
+### Added
+- **Native Reverse MCP Tool Delegation**: Delegated `dsh-tools` reverse MCP calls directly into DSH's native tool execution loop (native tool cards, DSH approvals, dynamic `ops_discover_tools` discovery, and multi-step continuation), with `AcpClient.pauseSessionTimer()` keeping the ACP prompt alive while awaiting long-running tools or human approval.
+- **Configurable Auto Review Model & Cross-Provider Routing**: Added `autoReviewProvider`, `autoReviewModel`, and `autoReviewEffort` settings with Console UI controls and `GET /plugins/agy-acp/review-models?provider=...`. Supports forwarding DSH `purpose: 'auto-review'` requests via the `llm/stream` hook to any registered DSH provider/model (bypassing `agy acp` cold starts), or running on a selected Antigravity model with automatic lowest-effort downgrade when unspecified.
+
+### Fixed
+- **Generalized Continuation Step-Context Handling**: Replaced the hardcoded step-context allowlist in `detectContinuation` / `collectContinuationToolResults` with `isStepContextUserMessage`, ensuring system-injected step context from tools using `deferContext` never interrupts active reverse-MCP continuations.
+- **Strict Reverse MCP Permission Identification**: Expanded `isDshReverseMcpToolCall` to recognize direct and `call_mcp_tool` reverse MCP frames while rejecting shell/edit/delete/move spoofing.
+
 ## [0.5.0] - 2026-11-26
 
 ### Added

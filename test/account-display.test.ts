@@ -566,8 +566,11 @@ test('the configuration fieldset locks all edits for both pending writes', () =>
   const html = panelMarkup(panelFixture(), 'live', 'config')
   const form = html.match(/<fieldset[^>]*aria-label="桥接配置"[^>]*>([\s\S]*?)<\/fieldset>/)?.[1]
   assert.ok(form, 'the native group wraps the actual editable fields')
-  assert.equal((form.match(/<(?:input|select)\b/g) ?? []).length, 9)
-  assert.equal((html.match(/<(?:input|select)\b/g) ?? []).length, 9)
+  assert.equal((form.match(/<(?:input|select)\b/g) ?? []).length, 12)
+  assert.equal((html.match(/<(?:input|select)\b/g) ?? []).length, 12)
+  assert.match(form, /aria-label="自动审查 Provider"/)
+  assert.match(form, /aria-label="自动审查模型"/)
+  assert.match(form, /aria-label="自动审查推理强度"/)
   for (const operation of ['save', 'resetConfig', null, 'resetSessions'] as const) {
     const group = renderToStaticMarkup(React.createElement(ConfigFieldset, { operation, hidden: false, onEdit() {} }, React.createElement('input')))
     if (operation === 'save' || operation === 'resetConfig') assert.match(group, /<fieldset[^>]*disabled=""[^>]*aria-busy="true"/)

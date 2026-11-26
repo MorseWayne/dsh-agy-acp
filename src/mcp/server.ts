@@ -335,7 +335,7 @@ export class ReverseMcpBridge {
         protocolVersion: ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'].includes(String(params.protocolVersion))
           ? params.protocolVersion : '2025-06-18',
         capabilities: { tools: {} },
-        serverInfo: { name: this.serverName, version: '0.5.0' },
+        serverInfo: { name: this.serverName, version: '0.6.0' },
       }
     }
 

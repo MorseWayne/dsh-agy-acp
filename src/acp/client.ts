@@ -376,6 +376,24 @@ export class AcpClient {
     entry.timer.unref?.()
   }
 
+  /** Pause the inactivity watchdog on an active prompt (e.g. while a delegated DSH tool/approval runs). */
+  pauseSessionTimer(sessionId: string): () => void {
+    const owners = [...this.pending.values()].filter(
+      entry => entry.method === 'session/prompt' && entry.sessionId === sessionId && !entry.cancelling,
+    )
+    const owner = owners.length === 1 ? owners[0] : undefined
+    if (!owner) return () => {}
+    owner.pausedCount++
+    this.armPendingTimer(owner)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      owner.pausedCount = Math.max(0, owner.pausedCount - 1)
+      if (this.pending.get(owner.id) === owner) this.armPendingTimer(owner)
+    }
+  }
+
   private touchSessionTimers(sessionId: string, update: SessionUpdatePayload): void {
     if (!PROMPT_ACTIVITY_UPDATES.has(update.sessionUpdate)) return
     for (const entry of this.pending.values()) {
@@ -409,7 +427,7 @@ export class AcpClient {
         fs: { readTextFile: false, writeTextFile: false },
         terminal: false,
       },
-      clientInfo: this.opts.clientInfo ?? { name: 'dsh-agy-acp', version: '0.5.0' },
+      clientInfo: this.opts.clientInfo ?? { name: 'dsh-agy-acp', version: '0.6.0' },
       ...params,
     }, 15_000)
   }

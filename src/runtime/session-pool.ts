@@ -1,4 +1,4 @@
-import { cancelled, canFinishConfinedTurn, policyKey, SessionPolicyChangedError, type SessionPolicy, type FilePolicy } from './permission-manager.ts'
+import { cancelled, canFinishConfinedTurn, policyKey, SessionPolicyChangedError, type DecidePermissionOptions, type SessionPolicy, type FilePolicy } from './permission-manager.ts'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -36,6 +36,7 @@ import {
   type AcpModelOption,
   type McpBridgeSnapshot,
   type PluginConfig,
+  type ReviewProviderOption,
   type SessionSummary,
   type StatusSnapshot,
   type UsageTotals,
@@ -95,6 +96,8 @@ export interface AuxiliaryPromptParams {
   sessionKey?: string
   model?: string
   effort?: string
+  /** When true and `effort` is not specified, pick the model's lowest available `thought_level`. */
+  preferLowestEffort?: boolean
   systemPromptAppend: string
   systemFallbackBlock: PromptContentBlock
   prompt: PromptContentBlock[]
@@ -149,9 +152,10 @@ export interface SessionPoolDeps {
   resolveBin: () => string | null
   readPolicy: (key: string) => SessionPolicy
   prepareArgv: (argv: string[], policy: FilePolicy, signal?: AbortSignal) => Promise<string[]>
-  onPermission?: (req: RequestPermissionParams, key: string, signal: AbortSignal, launchPolicy: SessionPolicy) => Promise<RequestPermissionResult>
+  onPermission?: (req: RequestPermissionParams, key: string, signal: AbortSignal, launchPolicy: SessionPolicy, opts?: DecidePermissionOptions) => Promise<RequestPermissionResult>
   isMcpBridgeActive?: () => boolean
   getMcpBridgeSnapshot?: () => McpBridgeSnapshot
+  listReviewProviders?: () => ReviewProviderOption[]
   onConfigPatch?: (patch: Partial<PluginConfig>) => void | Promise<void>
   onConfigReset?: () => void | Promise<void>
   hasPersistedConfig?: () => boolean
@@ -560,11 +564,15 @@ export class AcpSessionPool extends EventEmitter {
       usageTotals: { ...this.usageTotals },
       accounts: this.getAccountHealthSnapshots(),
       models: this.cachedModels.filter(m => !m.variantOf),
+      ...(this.deps.listReviewProviders ? { reviewProviders: this.deps.listReviewProviders() } : {}),
       config: {
         agyBin: cfg.agyBin,
         workspaceRoot: cfg.workspaceRoot,
         defaultModel: cfg.defaultModel,
         defaultEffort: cfg.defaultEffort,
+        autoReviewProvider: cfg.autoReviewProvider,
+        autoReviewModel: cfg.autoReviewModel,
+        autoReviewEffort: cfg.autoReviewEffort,
         mcpBridge: cfg.mcpBridge,
         mcpExposeOverlappingTools: cfg.mcpExposeOverlappingTools,
         quotaAwareScheduling: cfg.quotaAwareScheduling,
@@ -679,6 +687,14 @@ export class AcpSessionPool extends EventEmitter {
     const signal = this.active.get(key)?.controller.signal
     if (!signal || signal.aborted || this.policies.get(key) !== policyKey(this.policy(key))) return undefined
     return signal
+  }
+
+  /** Pause the active ACP prompt inactivity timer while a delegated DSH tool call or approval runs. */
+  pauseTurnTimer(key: string): () => void {
+    const client = this.clients.get(key)
+    const session = this.sessions.get(key)
+    if (!client || !session || !this.active.has(key)) return () => {}
+    return client.pauseSessionTimer(session.acpSessionId)
   }
 
   beginPrompt(session: ManagedAcpSession, signal?: AbortSignal) {
@@ -802,7 +818,8 @@ export class AcpSessionPool extends EventEmitter {
         permissions.requests++
         permissions.pending.add(id)
         try {
-          const result = await this.deps.onPermission?.(req, key, signal, policy) ?? cancelled()
+          const hasReverseMcpBridge = Boolean(this.sessions.get(key)?.hasMcpServers)
+          const result = await this.deps.onPermission?.(req, key, signal, policy, { hasReverseMcpBridge }) ?? cancelled()
           if (signal.aborted) return cancelled()
           const { outcome } = result
           if (outcome.outcome === 'selected' && req.options.some(o =>
@@ -1120,13 +1137,20 @@ export class AcpSessionPool extends EventEmitter {
           }
         }
 
-        if (params.effort) {
-          const thoughtOpt = selectOption(configOptions, 'thought_level')
-          if (thoughtOpt && values(thoughtOpt).some(o => o.value === params.effort) && thoughtOpt.currentValue !== params.effort) {
+        const thoughtOpt = selectOption(configOptions, 'thought_level')
+        if (thoughtOpt) {
+          const availableEfforts = sortedEfforts(values(thoughtOpt).map(o => o.value))
+          const targetEffort =
+            params.effort && availableEfforts.includes(params.effort)
+              ? params.effort
+              : params.preferLowestEffort
+                ? availableEfforts[0]
+                : undefined
+          if (targetEffort && thoughtOpt.currentValue !== targetEffort) {
             const eRes = await client.sessionSetConfigOption({
               sessionId: acpSessionId,
               configId: thoughtOpt.id,
-              value: params.effort,
+              value: targetEffort,
             })
             if (eRes.configOptions) configOptions = eRes.configOptions
           }

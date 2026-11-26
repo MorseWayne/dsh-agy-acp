@@ -1,5 +1,5 @@
 import { isGeoFenceMode } from './geo.ts'
-import type { AccountProfileConfig, PersistedConfigPatch, PluginConfig } from './types.ts'
+import { PROVIDER_ID, type AccountProfileConfig, type PersistedConfigPatch, type PluginConfig } from './types.ts'
 
 export const SESSION_IDLE_TTL_MIN_MS = 60_000
 export const SESSION_IDLE_TTL_MAX_MS = 86_400_000
@@ -9,6 +9,7 @@ export const MAX_CONFIG_STRING_LEN = 2048
 
 const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/
 const EFFORT_ID_RE = /^[a-zA-Z0-9._-]{1,64}$/
+const PROVIDER_ID_RE = /^[a-zA-Z0-9._:/-]{1,128}$/
 
 const HOST_ONLY_CONFIG_KEYS = new Set(['accounts', 'credentialSlotDir', 'enabled'])
 const ALLOWED_PERSIST_KEYS = new Set<keyof PersistedConfigPatch>([
@@ -17,6 +18,9 @@ const ALLOWED_PERSIST_KEYS = new Set<keyof PersistedConfigPatch>([
   'quotaAwareScheduling',
   'defaultModel',
   'defaultEffort',
+  'autoReviewProvider',
+  'autoReviewModel',
+  'autoReviewEffort',
   'agyBin',
   'workspaceRoot',
   'sessionIdleTtlMs',
@@ -102,18 +106,26 @@ export function validateConfigPatchInput(
       if (typeof val !== 'boolean') return { ok: false, error: `${key} 必须为布尔值` }
       patch[key] = val
       count++
-    } else if (key === 'agyBin' || key === 'workspaceRoot' || key === 'defaultModel') {
+    } else if (key === 'agyBin' || key === 'workspaceRoot' || key === 'defaultModel' || key === 'autoReviewModel') {
       const checked = validateSafeString(val, key)
       if (!checked.ok) return checked
       patch[key] = checked.value
       count++
-    } else if (key === 'defaultEffort') {
-      const checked = validateSafeString(val, 'defaultEffort')
+    } else if (key === 'autoReviewProvider') {
+      const checked = validateSafeString(val, 'autoReviewProvider')
+      if (!checked.ok) return checked
+      if (checked.value !== '' && !PROVIDER_ID_RE.test(checked.value)) {
+        return { ok: false, error: 'autoReviewProvider 格式无效，仅允许字母、数字及 . _ : / - 字符' }
+      }
+      patch.autoReviewProvider = checked.value
+      count++
+    } else if (key === 'defaultEffort' || key === 'autoReviewEffort') {
+      const checked = validateSafeString(val, key)
       if (!checked.ok) return checked
       if (checked.value !== '' && !EFFORT_ID_RE.test(checked.value)) {
-        return { ok: false, error: 'defaultEffort 格式无效，仅允许字母、数字、点、下划线或短横线' }
+        return { ok: false, error: `${key} 格式无效，仅允许字母、数字、点、下划线或短横线` }
       }
-      patch.defaultEffort = checked.value
+      patch[key] = checked.value
       count++
     } else if (key === 'sessionIdleTtlMs') {
       if (typeof val !== 'number' || !Number.isSafeInteger(val) || val < SESSION_IDLE_TTL_MIN_MS || val > SESSION_IDLE_TTL_MAX_MS) {
@@ -145,6 +157,15 @@ export function validateConfigPatchInput(
   if (count === 0) {
     return { ok: false, error: '未提供可更新的配置项' }
   }
+  if (
+    patch.autoReviewProvider !== undefined &&
+    patch.autoReviewProvider !== '' &&
+    patch.autoReviewProvider !== PROVIDER_ID &&
+    patch.autoReviewModel !== undefined &&
+    patch.autoReviewModel === ''
+  ) {
+    return { ok: false, error: '选择外部自动审查 Provider 时请同时指定审查模型' }
+  }
   return { ok: true, patch }
 }
 
@@ -163,12 +184,17 @@ export function sanitizePersistedConfigObject(raw: Record<string, unknown>): Per
 
 export function resolveConfig(raw: Record<string, unknown> = {}): PluginConfig {
   const rawGeoMode = typeof raw.geoFenceMode === 'string' ? raw.geoFenceMode.trim() : ''
+  const rawReviewProvider = typeof raw.autoReviewProvider === 'string' ? raw.autoReviewProvider.trim() : ''
+  const rawReviewEffort = typeof raw.autoReviewEffort === 'string' ? raw.autoReviewEffort.trim() : ''
   return {
     enabled: parseBool(raw.enabled, true),
     agyBin: typeof raw.agyBin === 'string' ? raw.agyBin.trim() : '',
     workspaceRoot: typeof raw.workspaceRoot === 'string' ? raw.workspaceRoot.trim() : '',
     defaultModel: typeof raw.defaultModel === 'string' ? raw.defaultModel.trim() : '',
     defaultEffort: typeof raw.defaultEffort === 'string' ? raw.defaultEffort.trim() : '',
+    autoReviewProvider: PROVIDER_ID_RE.test(rawReviewProvider) ? rawReviewProvider : '',
+    autoReviewModel: typeof raw.autoReviewModel === 'string' ? raw.autoReviewModel.trim() : '',
+    autoReviewEffort: EFFORT_ID_RE.test(rawReviewEffort) ? rawReviewEffort : '',
     sessionIdleTtlMs: parseNumber(raw.sessionIdleTtlMs, 30 * 60_000, SESSION_IDLE_TTL_MIN_MS, SESSION_IDLE_TTL_MAX_MS),
     requestTimeoutMs: parseNumber(raw.requestTimeoutMs, 10 * 60_000, REQUEST_TIMEOUT_MIN_MS, REQUEST_TIMEOUT_MAX_MS),
     mcpBridge: parseBool(raw.mcpBridge, false),

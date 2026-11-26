@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { boundTailText, copyBoundedText, sanitizeToolPayload } from '../acp/payload-bounds.ts'
 import type { AcpToolCallContentEntry, AcpToolCallUpdate, AcpUsage, SessionUpdatePayload } from '../acp/protocol.ts'
 import { mergeCallUsage, type CallUsage, type CallUsageSource } from '../acp/transcript-usage.ts'
+import { isDshReverseMcpToolCall } from '../runtime/permission-manager.ts'
 
 export interface NormalizedLocation {
   path: string
@@ -29,8 +30,25 @@ export interface ToolCompletionResult {
   runError?: string
 }
 
+export interface DelegatedMcpResult {
+  content: Array<{ type: 'text'; text: string }>
+  isError?: boolean
+}
+
+export interface PendingMcpCall {
+  readonly itemIndex: number
+  readonly name: string
+  readonly args: Record<string, unknown>
+  emitted: boolean
+  settled: boolean
+  resolve: (result: DelegatedMcpResult) => void
+  reject: (err: Error) => void
+  cleanupAbort?: () => void
+}
+
 export type RunItem =
   | { kind: 'update'; update: SessionUpdatePayload }
+  | { kind: 'mcp-call'; call: PendingMcpCall }
   | { kind: 'done'; stopReason: string; usage?: AcpUsage }
   | { kind: 'error'; error: Error }
 
@@ -82,6 +100,9 @@ export class AcpRunRecording {
   private readonly preEditCalls = new Set<string>()
   private readonly stepToToolCallId = new Map<number, string>()
   private readonly emittedToolCallIds = new Set<string>()
+  private readonly mcpCalls = new Map<number, PendingMcpCall>()
+  private readonly suppressedMcpToolCallIds = new Set<string>()
+  private readonly deferredNativeToolIds = new Set<string>()
   private waiters: Array<() => void> = []
   private recovery?: { toolId: string; policy: string }
   private cancelled = false
@@ -89,13 +110,25 @@ export class AcpRunRecording {
   private runError?: string
   private cancelHandler: (() => void) | null = null
 
+  /** True when this recording delegates `dsh-tools` reverse MCP calls as native DSH tool steps. */
+  delegatesMcp = false
+  /** Monotonic next-to-consume index into `items`, preserved across deferred native tool spans. */
+  cursor = 0
+
   private released = false
   constructor(id?: string, readonly owner?: string, private readonly preEdit?: (tc: AcpToolCallUpdate) => NormalizedLocation[] | undefined) {
     this.id = id ?? randomUUID().slice(0, 12)
   }
 
   /** Explicitly release only after the adapter consumes (or abandons) the final span. */
-  releaseRecording(): void { this.released = true }
+  releaseRecording(): void {
+    this.released = true
+    this.failAllPendingMcpCalls(new Error('ACP recording released before delegated MCP call resolved'))
+  }
+
+  get isReleased(): boolean { return this.released }
+
+  get isCancelled(): boolean { return this.cancelled }
 
   get canEvict(): boolean { return this.settled && this.released && !this.waiters.length }
 
@@ -107,8 +140,9 @@ export class AcpRunRecording {
     this.cancelHandler = fn
   }
 
-  requestCancel(): void {
+  requestCancel(reason?: Error): void {
     this.cancelled = true
+    this.failAllPendingMcpCalls(reason ?? new Error('ACP turn cancelled before delegated MCP call resolved'))
     this.cancelHandler?.()
   }
 
@@ -139,6 +173,131 @@ export class AcpRunRecording {
       return id ? this.toolCalls.get(id) : undefined
     }
     return this.toolCalls.get(key)
+  }
+
+  isSuppressedMcpTool(toolCallId: string): boolean {
+    return this.suppressedMcpToolCallIds.has(toolCallId)
+  }
+
+  hasUnsettledSuppressedMcpTool(): boolean {
+    if (this.settled) return false
+    for (const id of this.suppressedMcpToolCallIds) {
+      if (!this.toolCalls.get(id)?.settled) return true
+    }
+    for (const call of this.mcpCalls.values()) {
+      if (!call.settled) return true
+    }
+    return false
+  }
+
+  hasPendingUnemittedMcpCall(): boolean {
+    if (this.settled) return false
+    for (const call of this.mcpCalls.values()) {
+      if (!call.emitted && !call.settled) return true
+    }
+    return false
+  }
+
+  deferNativeTool(toolCallId: string): void {
+    if (!this.emittedToolCallIds.has(toolCallId) && !this.suppressedMcpToolCallIds.has(toolCallId)) {
+      this.deferredNativeToolIds.add(toolCallId)
+    }
+  }
+
+  takeReadyDeferredNativeTools(): MergedToolCall[] {
+    if (this.deferredNativeToolIds.size === 0) return []
+    const mcpBusy = this.hasUnsettledSuppressedMcpTool()
+    const ready: MergedToolCall[] = []
+    for (const id of [...this.deferredNativeToolIds]) {
+      if (this.emittedToolCallIds.has(id) || this.suppressedMcpToolCallIds.has(id)) {
+        this.deferredNativeToolIds.delete(id)
+        continue
+      }
+      const merged = this.toolCalls.get(id)
+      if (!merged) {
+        this.deferredNativeToolIds.delete(id)
+        continue
+      }
+      if (!mcpBusy || merged.settled) {
+        this.deferredNativeToolIds.delete(id)
+        ready.push(merged)
+      }
+    }
+    return ready
+  }
+
+  enqueueMcpCall(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<DelegatedMcpResult> {
+    if (this.settled || this.cancelled || this.released) {
+      return Promise.reject(new Error('ACP turn is no longer active for delegated MCP call'))
+    }
+    if (signal?.aborted) {
+      const reason = signal.reason instanceof Error ? signal.reason : new Error('Delegated MCP call aborted')
+      return Promise.reject(reason)
+    }
+    this.sawThoughtOrTool = true
+    this.flushUsage()
+    const itemIndex = this.items.length
+    return new Promise<DelegatedMcpResult>((resolve, reject) => {
+      const call: PendingMcpCall = {
+        itemIndex,
+        name,
+        args,
+        emitted: false,
+        settled: false,
+        resolve,
+        reject,
+      }
+      if (signal) {
+        const onAbort = (): void => {
+          if (call.settled) return
+          call.settled = true
+          call.cleanupAbort = undefined
+          const reason = signal.reason instanceof Error ? signal.reason : new Error('Delegated MCP call aborted')
+          call.reject(reason)
+          this.wakeAll()
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+        call.cleanupAbort = () => signal.removeEventListener('abort', onAbort)
+      }
+      this.mcpCalls.set(itemIndex, call)
+      this.items.push({ kind: 'mcp-call', call })
+      this.wakeAll()
+    })
+  }
+
+  resolveMcpCall(itemIndex: number, result: DelegatedMcpResult): boolean {
+    const call = this.mcpCalls.get(itemIndex)
+    if (!call || call.settled) return false
+    call.settled = true
+    call.cleanupAbort?.()
+    call.cleanupAbort = undefined
+    call.resolve(result)
+    this.wakeAll()
+    return true
+  }
+
+  rejectMcpCall(itemIndex: number, error: Error): boolean {
+    const call = this.mcpCalls.get(itemIndex)
+    if (!call || call.settled) return false
+    call.settled = true
+    call.cleanupAbort?.()
+    call.cleanupAbort = undefined
+    call.reject(error)
+    this.wakeAll()
+    return true
+  }
+
+  failAllPendingMcpCalls(error: Error): void {
+    let changed = false
+    for (const call of this.mcpCalls.values()) {
+      if (call.settled) continue
+      call.settled = true
+      call.cleanupAbort?.()
+      call.cleanupAbort = undefined
+      call.reject(error)
+      changed = true
+    }
+    if (changed) this.wakeAll()
   }
 
   /** Latest `usage_update.used` seen during this run: the real live context occupancy. */
@@ -202,6 +361,12 @@ export class AcpRunRecording {
       priorEmittedCount++
       if (!this.toolCalls.get(id)?.settled) return false
     }
+    for (const call of this.mcpCalls.values()) {
+      const id = `mcp:${call.itemIndex}`
+      if (!call.emitted || currentBatchToolCallIds.has(id)) continue
+      priorEmittedCount++
+      if (!call.settled) return false
+    }
     return priorEmittedCount > 0
   }
 
@@ -222,6 +387,9 @@ export class AcpRunRecording {
     this.compacted = true
     this.items.length = 0
     this.toolResults.clear()
+    this.mcpCalls.clear()
+    this.suppressedMcpToolCallIds.clear()
+    this.deferredNativeToolIds.clear()
     this.usageSource = null
     this.pendingUsage = null
     this.inlineMessageAcc = ''
@@ -321,6 +489,10 @@ export class AcpRunRecording {
         this.toolResults.set(merged.step, snapshot)
         this.toolResults.set(idx, snapshot)
       }
+      if (this.delegatesMcp && isDshReverseMcpToolCall(merged)) {
+        this.suppressedMcpToolCallIds.add(toolCallId)
+        this.deferredNativeToolIds.delete(toolCallId)
+      }
     }
 
     this.items.push({ kind: 'update', update: storedUpdate })
@@ -331,6 +503,7 @@ export class AcpRunRecording {
   finish(stopReason: string, usage?: AcpUsage): void {
     if (this.settled) return
     this.settled = true
+    this.failAllPendingMcpCalls(new Error('ACP turn finished before delegated MCP call resolved'))
     this.items.push({ kind: 'done', stopReason, usage })
     this.wakeAll()
   }
@@ -339,6 +512,7 @@ export class AcpRunRecording {
     if (this.settled) return
     this.settled = true
     this.runError = error.message
+    this.failAllPendingMcpCalls(error)
     this.items.push({ kind: 'error', error })
     this.wakeAll()
   }
@@ -449,17 +623,22 @@ const MAX_FULL_SETTLED_RUNS = 8
 
 export class AcpRunStore {
   private readonly runs = new Map<string, AcpRunRecording>()
+  private readonly latestByOwner = new Map<string, AcpRunRecording>()
   private readonly superseded = new WeakSet<AcpRunRecording>()
 
   create(owner?: string, preEdit?: (tc: AcpToolCallUpdate) => NormalizedLocation[] | undefined): AcpRunRecording {
     const rec = new AcpRunRecording(undefined, owner, preEdit)
     for (const run of this.runs.values()) if (run.owner === owner) this.superseded.add(run)
     this.runs.set(rec.id, rec)
+    if (owner) this.latestByOwner.set(owner, rec)
     // The cap applies to eligible history only: waking a waiter or finishing the
     // ACP producer does not mean DSH has consumed the remaining continuation.
     const history = [...this.runs.values()].filter(run => run.canEvict)
     for (const old of history.slice(0, Math.max(0, history.length - MAX_FULL_SETTLED_RUNS))) old.compactSettled()
-    for (const old of history.slice(0, Math.max(0, this.runs.size - MAX_RETAINED_RUNS))) this.runs.delete(old.id)
+    for (const old of history.slice(0, Math.max(0, this.runs.size - MAX_RETAINED_RUNS))) {
+      this.runs.delete(old.id)
+      if (old.owner && this.latestByOwner.get(old.owner) === old) this.latestByOwner.delete(old.owner)
+    }
     return rec
   }
 
@@ -467,12 +646,25 @@ export class AcpRunStore {
     return this.runs.get(runId)
   }
 
+  getActiveForOwner(owner: string): AcpRunRecording | undefined {
+    const rec = this.latestByOwner.get(owner)
+    if (!rec || rec.isSettled || rec.isReleased || rec.isCancelled) return undefined
+    return rec
+  }
+
+  cancelActiveForOwner(owner: string, reason?: Error): void {
+    const rec = this.getActiveForOwner(owner)
+    if (rec) rec.requestCancel(reason)
+  }
+
   isLatestForOwner(run: AcpRunRecording): boolean {
     return this.runs.get(run.id) === run && !this.superseded.has(run)
   }
 
   forget(runId: string): void {
+    const old = this.runs.get(runId)
     this.runs.delete(runId)
+    if (old?.owner && this.latestByOwner.get(old.owner) === old) this.latestByOwner.delete(old.owner)
   }
 }
 

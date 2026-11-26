@@ -1,5 +1,5 @@
 import type { RequestPermissionParams } from '../acp/protocol.ts'
-import { decidePermission, type FilePolicy, type SessionPolicy } from './permission-manager.ts'
+import { decidePermission, type DecidePermissionOptions, type FilePolicy, type SessionPolicy } from './permission-manager.ts'
 
 // Structural service contracts keep the bundle independent of the host package copies.
 export interface SessionAgent { session: { id: string } }
@@ -38,7 +38,7 @@ export function hostPermissions(host: PermissionHost, questions?: () => Question
       if (!confined?.argv.length || confined.enforcement !== 'full') throw new Error(`Cannot enforce DSH ${file.mode} for Antigravity; refusing unconfined startup`)
       return confined.argv
     },
-    onPermission(req: RequestPermissionParams, key: string, signal: AbortSignal, launchPolicy?: SessionPolicy) {
+    onPermission(req: RequestPermissionParams, key: string, signal: AbortSignal, launchPolicy?: SessionPolicy, opts?: DecidePermissionOptions) {
       const deadline = AbortSignal.any([signal, AbortSignal.timeout(5 * 60_000)])
       return decidePermission(req, () => readPolicy(key), reason => host.approval.request({
         agent: agent(key), toolName: `agy:${req.toolCall.name ?? req.toolCall.kind ?? 'tool'}`, reason, signal: deadline,
@@ -54,7 +54,7 @@ export function hostPermissions(host: PermissionHost, questions?: () => Question
         if (!answer || reply?.answers.length !== 1 || answer.id !== id || answer.custom ||
             answer.selected.length !== 1 || owner !== agent(key)) return undefined
         return options[labels.indexOf(answer.selected[0]!)]?.optionId
-      })
+      }, opts)
     },
   }
 }

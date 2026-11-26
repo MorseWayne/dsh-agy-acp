@@ -30,6 +30,49 @@ export async function postJson(url: string, body: Record<string, unknown>, reque
   }
 }
 
+export interface ReviewModelOption {
+  id: string
+  name: string
+}
+
+export interface FetchReviewModelsResult {
+  ok: boolean
+  models: ReviewModelOption[]
+  error?: string
+}
+
+export async function fetchReviewModels(provider: string, request = fetch): Promise<FetchReviewModelsResult> {
+  try {
+    const res = await request(`/plugins/agy-acp/review-models?provider=${encodeURIComponent(provider)}`)
+    let data: { models?: unknown; error?: string } = {}
+    try {
+      data = (await res.json()) as { models?: unknown; error?: string }
+    } catch {
+      // ignore non-JSON body
+    }
+    if (!res.ok) {
+      return {
+        ok: false,
+        models: [],
+        error: typeof data.error === 'string' && data.error.trim() ? data.error.trim() : '获取模型列表失败，可手动输入模型 ID',
+      }
+    }
+    const models = Array.isArray(data.models)
+      ? data.models.filter(
+          (m): m is ReviewModelOption =>
+            Boolean(m) &&
+            typeof m === 'object' &&
+            typeof (m as { id?: unknown }).id === 'string' &&
+            (m as { id: string }).id.trim().length > 0 &&
+            typeof (m as { name?: unknown }).name === 'string',
+        )
+      : []
+    return { ok: true, models }
+  } catch {
+    return { ok: false, models: [], error: '获取模型列表失败，可手动输入模型 ID' }
+  }
+}
+
 export type SessionResetTarget = { kind: 'one'; sessionKey: string } | { kind: 'all' }
 
 /** The legacy empty-body wire command is reserved for the explicit all-sessions confirmation. */

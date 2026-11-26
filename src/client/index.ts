@@ -11,12 +11,12 @@ import {
 } from '../common/config.ts'
 import { effortLabel, sortedEfforts } from '../common/effort.ts'
 import { isGeoFenceMode } from '../common/geo.ts'
-import type { GeoFenceMode, SessionSummary, StatusSnapshot } from '../common/types.ts'
+import { PROVIDER_ID, type GeoFenceMode, type SessionSummary, type StatusSnapshot } from '../common/types.ts'
 import { AccountCard } from './account-card.ts'
 import { sessionAccountLabel } from './account-display.ts'
 import { actualTransport, accountAttention, capabilityLabel, recoveryCapability, sessionRecovery } from './runtime-display.ts'
 import { snapshotNotice, type SnapshotState } from './snapshot-state.ts'
-import { postJson, resetSessions, type SessionResetTarget } from './panel-actions.ts'
+import { fetchReviewModels, postJson, resetSessions, type ReviewModelOption, type SessionResetTarget } from './panel-actions.ts'
 import { getSharedStatusStore } from './status-store.ts'
 import { styles, theme } from './theme.ts'
 
@@ -97,6 +97,9 @@ interface FormBaseline {
   geoFenceMode: GeoFenceMode
   defaultModel: string
   defaultEffort: string
+  autoReviewProvider: string
+  autoReviewModel: string
+  autoReviewEffort: string
   agyBin: string
   workspaceRoot: string
   idleMinutes: string
@@ -105,12 +108,16 @@ interface FormBaseline {
 
 function baselineFromStatus(status: StatusSnapshot): FormBaseline {
   const rawMode = status.config?.geoFenceMode
+  const rawReviewProvider = status.config?.autoReviewProvider ?? ''
   return {
     mcpBridge: Boolean(status.config?.mcpBridge),
     quotaAwareScheduling: Boolean(status.config?.quotaAwareScheduling),
     geoFenceMode: isGeoFenceMode(rawMode) ? rawMode : 'block',
     defaultModel: status.config?.defaultModel ?? '',
     defaultEffort: status.config?.defaultEffort ?? '',
+    autoReviewProvider: rawReviewProvider === PROVIDER_ID ? '' : rawReviewProvider,
+    autoReviewModel: status.config?.autoReviewModel ?? '',
+    autoReviewEffort: status.config?.autoReviewEffort ?? '',
     agyBin: status.config?.agyBin ?? '',
     workspaceRoot: status.config?.workspaceRoot ?? '',
     idleMinutes: String(clampIdleMinutes(status.config?.sessionIdleTtlMs)),
@@ -149,6 +156,13 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
   const [geoFenceMode, setGeoFenceMode] = React.useState(initialBase?.geoFenceMode ?? ('block' as GeoFenceMode))
   const [defaultModel, setDefaultModel] = React.useState(initialBase?.defaultModel ?? '')
   const [defaultEffort, setDefaultEffort] = React.useState(initialBase?.defaultEffort ?? '')
+  const [autoReviewProvider, setAutoReviewProvider] = React.useState(initialBase?.autoReviewProvider ?? '')
+  const [autoReviewModel, setAutoReviewModel] = React.useState(initialBase?.autoReviewModel ?? '')
+  const [autoReviewEffort, setAutoReviewEffort] = React.useState(initialBase?.autoReviewEffort ?? '')
+  const [manualReviewModel, setManualReviewModel] = React.useState(false)
+  const [externalReviewModels, setExternalReviewModels]: [ReviewModelOption[], (v: ReviewModelOption[]) => void] = React.useState([])
+  const [loadingReviewModels, setLoadingReviewModels] = React.useState(false)
+  const [reviewModelsError, setReviewModelsError] = React.useState('')
   const [agyBin, setAgyBin] = React.useState(initialBase?.agyBin ?? '')
   const [workspaceRoot, setWorkspaceRoot] = React.useState(initialBase?.workspaceRoot ?? '')
   const [idleMinutes, setIdleMinutes] = React.useState(initialBase?.idleMinutes ?? '30')
@@ -161,6 +175,9 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
     setGeoFenceMode(nextBase.geoFenceMode)
     setDefaultModel(nextBase.defaultModel)
     setDefaultEffort(nextBase.defaultEffort)
+    setAutoReviewProvider(nextBase.autoReviewProvider)
+    setAutoReviewModel(nextBase.autoReviewModel)
+    setAutoReviewEffort(nextBase.autoReviewEffort)
     setAgyBin(nextBase.agyBin)
     setWorkspaceRoot(nextBase.workspaceRoot)
     setIdleMinutes(nextBase.idleMinutes)
@@ -180,6 +197,9 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
       geoFenceMode === baseline.geoFenceMode &&
       defaultModel === baseline.defaultModel &&
       defaultEffort === baseline.defaultEffort &&
+      autoReviewProvider === baseline.autoReviewProvider &&
+      autoReviewModel === baseline.autoReviewModel &&
+      autoReviewEffort === baseline.autoReviewEffort &&
       agyBin === baseline.agyBin &&
       workspaceRoot === baseline.workspaceRoot &&
       idleMinutes === baseline.idleMinutes &&
@@ -187,7 +207,32 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
     if (isCurrentlyClean && JSON.stringify(incoming) !== JSON.stringify(baseline)) {
       syncFormTo(incoming)
     }
-  }, [status, baseline, mcpBridge, quotaAwareScheduling, geoFenceMode, defaultModel, defaultEffort, agyBin, workspaceRoot, idleMinutes, timeoutSeconds, syncFormTo])
+  }, [status, baseline, mcpBridge, quotaAwareScheduling, geoFenceMode, defaultModel, defaultEffort, autoReviewProvider, autoReviewModel, autoReviewEffort, agyBin, workspaceRoot, idleMinutes, timeoutSeconds, syncFormTo])
+
+  const trimmedReviewProvider = autoReviewProvider.trim()
+  const isExternalReviewProvider = trimmedReviewProvider !== '' && trimmedReviewProvider !== PROVIDER_ID
+
+  React.useEffect(() => {
+    if (!isExternalReviewProvider) {
+      setExternalReviewModels([])
+      setLoadingReviewModels(false)
+      setReviewModelsError('')
+      setManualReviewModel(false)
+      return
+    }
+    let cancelled = false
+    setLoadingReviewModels(true)
+    setReviewModelsError('')
+    void fetchReviewModels(trimmedReviewProvider).then((res) => {
+      if (cancelled) return
+      setLoadingReviewModels(false)
+      setExternalReviewModels(res.models)
+      setReviewModelsError(res.ok ? '' : (res.error ?? '获取模型列表失败，可手动输入模型 ID'))
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [isExternalReviewProvider, trimmedReviewProvider])
 
   if (!status) {
     return React.createElement(
@@ -210,6 +255,28 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
   const knownEfforts = !!selected || (!trimmedModel && models.length > 0)
   const incompatible = knownEfforts && defaultEffort !== '' && !effortChoices.includes(defaultEffort)
 
+  const reviewProviders = (status.reviewProviders ?? []).filter(p => p.id !== PROVIDER_ID)
+  const customReviewProviderNotInList =
+    isExternalReviewProvider && !reviewProviders.some(p => p.id === trimmedReviewProvider)
+  const trimmedReviewModel = autoReviewModel.trim()
+  const selectedInternalReviewModel = !isExternalReviewProvider
+    ? models.find(m => m.value === trimmedReviewModel)
+    : undefined
+  const customInternalReviewModelNotInCatalog =
+    !isExternalReviewProvider && trimmedReviewModel !== '' && models.length > 0 && !selectedInternalReviewModel
+  const customExternalReviewModelNotInList =
+    isExternalReviewProvider &&
+    trimmedReviewModel !== '' &&
+    externalReviewModels.length > 0 &&
+    !externalReviewModels.some(m => m.id === trimmedReviewModel)
+  const reviewEffortChoices = !isExternalReviewProvider
+    ? (selectedInternalReviewModel?.efforts ?? sortedEfforts(models.flatMap(m => m.efforts)))
+    : []
+  const knownReviewEfforts = !isExternalReviewProvider && (!!selectedInternalReviewModel || (!trimmedReviewModel && models.length > 0))
+  const incompatibleReviewEffort =
+    knownReviewEfforts && autoReviewEffort !== '' && !reviewEffortChoices.includes(autoReviewEffort)
+  const externalReviewModelMissing = isExternalReviewProvider && trimmedReviewModel === ''
+
   const parsedIdleMin = Number(idleMinutes)
   const idleValid =
     idleMinutes.trim() !== '' &&
@@ -230,7 +297,11 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
       ? `单次请求超时须为 ${REQUEST_TIMEOUT_MIN_MS / 1_000}–${REQUEST_TIMEOUT_MAX_MS / 1_000} 之间的整数秒`
       : incompatible
         ? '当前选择的推理强度不适用于所选模型'
-        : ''
+        : externalReviewModelMissing
+          ? '选择外部自动审查 Provider 时请同时指定审查模型'
+          : incompatibleReviewEffort
+            ? '当前选择的自动审查推理强度不适用于所选审查模型'
+            : ''
 
   const dirty = Boolean(
     baseline && (
@@ -239,6 +310,9 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
       geoFenceMode !== baseline.geoFenceMode ||
       defaultModel !== baseline.defaultModel ||
       defaultEffort !== baseline.defaultEffort ||
+      autoReviewProvider !== baseline.autoReviewProvider ||
+      autoReviewModel !== baseline.autoReviewModel ||
+      autoReviewEffort !== baseline.autoReviewEffort ||
       agyBin !== baseline.agyBin ||
       workspaceRoot !== baseline.workspaceRoot ||
       idleMinutes !== baseline.idleMinutes ||
@@ -265,6 +339,9 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
         geoFenceMode,
         defaultModel,
         defaultEffort,
+        autoReviewProvider,
+        autoReviewModel,
+        autoReviewEffort,
         agyBin,
         workspaceRoot,
         sessionIdleTtlMs: parsedIdleMin * 60_000,
@@ -670,6 +747,171 @@ export function SettingsView({ status, stream, failed, applyStatus, initialPanel
               React.createElement('option', { value: 'strict' }, '严格模式（受限与未知均拦截）'),
               React.createElement('option', { value: 'warn' }, '仅告警不拦截'),
               React.createElement('option', { value: 'off' }, '关闭'),
+            ),
+          ),
+        ),
+      ),
+
+      // Auto review routing section
+      React.createElement(
+        'div',
+        {
+          style: {
+            padding: '10px 12px',
+            borderRadius: '8px',
+            border: theme.borderPrimary,
+            backgroundColor: theme.surfaceTile,
+            marginBottom: '12px',
+          },
+        },
+        React.createElement('div', { style: { fontWeight: 500, marginBottom: '2px' } }, '自动审查模型（DSH Auto Review）'),
+        React.createElement(
+          'div',
+          { style: { ...styles.secondaryText, fontSize: '11px', marginBottom: '10px' } },
+          '在 Auto 权限模式下控制工具审查使用的模型。留空默认跟随当前对话主模型（ACP 内部审查默认自动选用最低推理档位以提速）；选择其他 DSH Provider 可直连其 API，省去 agy 进程冷启动。',
+        ),
+        React.createElement(
+          'div',
+          { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 200px), 1fr))', gap: '10px' } },
+          React.createElement(
+            'div',
+            null,
+            React.createElement(
+              'label',
+              null,
+              React.createElement('div', { style: { ...styles.secondaryText, marginBottom: '4px' } }, '审查 Provider'),
+              React.createElement(
+                'select',
+                {
+                  'aria-label': '自动审查 Provider',
+                  value: autoReviewProvider,
+                  onChange: (e: { target: { value: string } }) => {
+                    const next = e.target.value
+                    setAutoReviewProvider(next)
+                    setAutoReviewModel('')
+                    setAutoReviewEffort('')
+                    setManualReviewModel(false)
+                  },
+                  style: styles.input,
+                },
+                React.createElement('option', { value: '' }, '当前插件（Antigravity ACP）'),
+                customReviewProviderNotInList
+                  ? React.createElement('option', { value: autoReviewProvider }, `${autoReviewProvider}（已存，当前未注册）`)
+                  : null,
+                ...reviewProviders.map(p =>
+                  React.createElement('option', { key: p.id, value: p.id }, p.name === p.id ? p.id : `${p.name} (${p.id})`),
+                ),
+              ),
+            ),
+          ),
+          React.createElement(
+            'div',
+            null,
+            React.createElement(
+              'label',
+              null,
+              React.createElement(
+                'div',
+                { style: { ...styles.secondaryText, marginBottom: '4px', display: 'flex', justifyContent: 'space-between', gap: '6px' } },
+                React.createElement('span', null, isExternalReviewProvider ? '审查模型（必填）' : '审查模型（留空跟随主模型）'),
+                isExternalReviewProvider && externalReviewModels.length > 0
+                  ? React.createElement(
+                      'button',
+                      {
+                        type: 'button',
+                        onClick: () => setManualReviewModel((v: boolean) => !v),
+                        style: { background: 'none', border: 'none', padding: 0, color: theme.brandPrimary, cursor: 'pointer', fontSize: '11px' },
+                      },
+                      manualReviewModel ? '返回下拉选择' : '手动输入',
+                    )
+                  : null,
+              ),
+              !isExternalReviewProvider
+                ? (models.length > 0
+                    ? React.createElement(
+                        'select',
+                        {
+                          'aria-label': '自动审查模型',
+                          value: autoReviewModel,
+                          onChange: (e: { target: { value: string } }) => setAutoReviewModel(e.target.value),
+                          style: styles.input,
+                        },
+                        React.createElement('option', { value: '' }, '跟随当前对话主模型'),
+                        customInternalReviewModelNotInCatalog
+                          ? React.createElement('option', { value: autoReviewModel }, `${autoReviewModel}（当前已存，不在目录中）`)
+                          : null,
+                        ...models.map(m =>
+                          React.createElement('option', { key: m.value, value: m.value }, m.name === m.value ? m.value : `${m.name} (${m.value})`),
+                        ),
+                      )
+                    : React.createElement('input', {
+                        type: 'text',
+                        'aria-label': '自动审查模型',
+                        value: autoReviewModel,
+                        placeholder: '留空跟随主模型，或填如 gemini-3-flash',
+                        onChange: (e: { target: { value: string } }) => setAutoReviewModel(e.target.value),
+                        style: styles.input,
+                      }))
+                : (!manualReviewModel && externalReviewModels.length > 0
+                    ? React.createElement(
+                        'select',
+                        {
+                          'aria-label': '自动审查模型',
+                          value: autoReviewModel,
+                          onChange: (e: { target: { value: string } }) => setAutoReviewModel(e.target.value),
+                          style: styles.input,
+                        },
+                        React.createElement('option', { value: '' }, '请选择审查模型…'),
+                        customExternalReviewModelNotInList
+                          ? React.createElement('option', { value: autoReviewModel }, `${autoReviewModel}（当前已存）`)
+                          : null,
+                        ...externalReviewModels.map(m =>
+                          React.createElement('option', { key: m.id, value: m.id }, m.name === m.id ? m.id : `${m.name} (${m.id})`),
+                        ),
+                      )
+                    : React.createElement('input', {
+                        type: 'text',
+                        'aria-label': '自动审查模型',
+                        value: autoReviewModel,
+                        placeholder: loadingReviewModels ? '正在加载模型列表…' : '输入目标 Provider 的模型 ID',
+                        onChange: (e: { target: { value: string } }) => setAutoReviewModel(e.target.value),
+                        style: styles.input,
+                      })),
+            ),
+            reviewModelsError
+              ? React.createElement('div', { style: { fontSize: '11px', color: theme.stateWarn, marginTop: '4px' } }, reviewModelsError)
+              : null,
+          ),
+          React.createElement(
+            'div',
+            null,
+            React.createElement(
+              'label',
+              null,
+              React.createElement('div', { style: { ...styles.secondaryText, marginBottom: '4px' } }, '审查推理强度'),
+              !isExternalReviewProvider && knownReviewEfforts
+                ? React.createElement(
+                    'select',
+                    {
+                      'aria-label': '自动审查推理强度',
+                      value: autoReviewEffort,
+                      onChange: (e: { target: { value: string } }) => setAutoReviewEffort(e.target.value),
+                      style: styles.input,
+                    },
+                    React.createElement('option', { value: '' }, '自动（最低档位，推荐）'),
+                    incompatibleReviewEffort
+                      ? React.createElement('option', { value: autoReviewEffort, disabled: true }, `${autoReviewEffort}（不适用于当前选择）`)
+                      : null,
+                    ...reviewEffortChoices.map(id => React.createElement('option', { key: id, value: id }, effortLabel(id))),
+                  )
+                : React.createElement('input', {
+                    type: 'text',
+                    'aria-label': '自动审查推理强度',
+                    value: autoReviewEffort,
+                    placeholder: isExternalReviewProvider ? '留空不覆盖（可填 low / minimal）' : '留空自动使用最低档位',
+                    onChange: (e: { target: { value: string } }) => setAutoReviewEffort(e.target.value),
+                    style: styles.input,
+                  }),
             ),
           ),
         ),

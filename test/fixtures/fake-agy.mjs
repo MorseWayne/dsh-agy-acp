@@ -117,6 +117,7 @@ async function handleRequest(id, method, params) {
         agentInfo: { name: 'fake-agy-acp', version: '1.5.17-test' },
         agentCapabilities: {
           ...(supportsLoad ? { loadSession: true, sessionCapabilities: { load: {} } } : {}),
+          mcpCapabilities: { http: true },
           promptCapabilities: { image: true, embeddedContext: true },
           ...(supportsAppend ? { _meta: { antigravity: { tier: true, systemPrompt: { append: true } } } } : {}),
         },
@@ -162,7 +163,8 @@ async function handleRequest(id, method, params) {
         ],
       },
     ]
-    sessions.set(sessionId, { turns: 0, configOptions, systemAppend })
+    const mcpServers = Array.isArray(params?.mcpServers) ? params.mcpServers : []
+    sessions.set(sessionId, { turns: 0, configOptions, systemAppend, mcpServers })
     saveDiskSession(sessionId, { turns: 0, configOptions, systemAppend })
     send({
       jsonrpc: '2.0',
@@ -286,6 +288,130 @@ async function handleRequest(id, method, params) {
       .filter((b) => b.type === 'text')
       .map((b) => b.text)
       .join('\n')
+
+    if (promptText.includes('DELEGATE_MCP_SINGLE') || promptText.includes('DELEGATE_MCP_PARALLEL') || promptText.includes('DELEGATE_MCP_MIXED')) {
+      const httpMcp = (sess.mcpServers ?? []).find((s) => s && s.type === 'http' && typeof s.url === 'string')
+      if (!httpMcp) {
+        send({ jsonrpc: '2.0', id, error: { code: -32000, message: 'No HTTP MCP server attached' } })
+        return
+      }
+      const headers = { 'Content-Type': 'application/json' }
+      for (const h of httpMcp.headers ?? []) {
+        if (h && typeof h.name === 'string' && typeof h.value === 'string') headers[h.name] = h.value
+      }
+      const callMcp = async (rpcId, toolName, args) => {
+        const res = await fetch(httpMcp.url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: rpcId,
+            method: 'tools/call',
+            params: { name: toolName, arguments: args },
+          }),
+        })
+        return await res.json()
+      }
+
+      if (promptText.includes('DELEGATE_MCP_SINGLE')) {
+        sendUpdate(sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'Checking via DSH tool...' },
+        })
+        sendUpdate(sessionId, {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'mcp_tc_1',
+          name: 'mcp_dsh-tools_ops_glob',
+          title: 'Run mcp_dsh-tools_ops_glob',
+          kind: 'other',
+          status: 'in_progress',
+          rawInput: { pattern: ['src/**/*.ts'] },
+        })
+        const resp = await callMcp(1, 'ops_glob', { pattern: ['src/**/*.ts'], toolSummary: 'List TS files' })
+        const text = resp?.result?.content?.map((c) => c.text).join('\n') ?? resp?.error?.message ?? 'missing'
+        const isErr = Boolean(resp?.result?.isError || resp?.error)
+        sendUpdate(sessionId, {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'mcp_tc_1',
+          status: isErr ? 'failed' : 'completed',
+          content: [{ type: 'content', content: { type: 'text', text } }],
+        })
+        sendUpdate(sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `MCP_RESULT:${isErr ? 'ERR:' : 'OK:'}${text}` },
+        })
+        send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn', usage: { inputTokens: 120, outputTokens: 30, totalTokens: 150 } } })
+        return
+      }
+
+      if (promptText.includes('DELEGATE_MCP_PARALLEL')) {
+        sendUpdate(sessionId, {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'mcp_p1',
+          name: 'mcp_dsh-tools_ops_glob',
+          kind: 'other',
+          status: 'in_progress',
+          rawInput: { pattern: ['a.ts'] },
+        })
+        sendUpdate(sessionId, {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'mcp_p2',
+          name: 'mcp_dsh-tools_mnemon_recall',
+          kind: 'other',
+          status: 'in_progress',
+          rawInput: { query: 'prefs' },
+        })
+        const [r1, r2] = await Promise.all([
+          callMcp(1, 'ops_glob', { pattern: ['a.ts'] }),
+          callMcp(2, 'mnemon_recall', { query: 'prefs' }),
+        ])
+        const t1 = r1?.result?.content?.map((c) => c.text).join('\n') ?? ''
+        const t2 = r2?.result?.content?.map((c) => c.text).join('\n') ?? ''
+        sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'mcp_p1', status: 'completed' })
+        sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'mcp_p2', status: 'completed' })
+        sendUpdate(sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `PARALLEL:${t1}|${t2}` },
+        })
+        send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } })
+        return
+      }
+
+      // DELEGATE_MCP_MIXED: emits an unsettled MCP tool AND an unsettled native tool together,
+      // then runs MCP FIRST before running/completing the native tool (serial agy executor case).
+      sendUpdate(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'mcp_mix_1',
+        name: 'mcp_dsh-tools_ops_glob',
+        kind: 'other',
+        status: 'in_progress',
+        rawInput: { pattern: ['src/*.ts'] },
+      })
+      sendUpdate(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'native_mix_2',
+        name: 'read_file',
+        kind: 'read',
+        status: 'in_progress',
+        rawInput: { Path: 'src/index.ts' },
+      })
+      const mcpRes = await callMcp(1, 'ops_glob', { pattern: ['src/*.ts'] })
+      const mcpText = mcpRes?.result?.content?.map((c) => c.text).join('\n') ?? ''
+      sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'mcp_mix_1', status: 'completed' })
+      // Only AFTER MCP completes does the native tool complete (would deadlock if mirror ran in same or earlier step!)
+      sendUpdate(sessionId, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'native_mix_2',
+        status: 'completed',
+        content: [{ type: 'content', content: { type: 'text', text: 'export const ok = true' } }],
+      })
+      sendUpdate(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `MIXED_DONE:${mcpText}` },
+      })
+      send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } })
+      return
+    }
 
     if (promptText.includes('EMIT_DYNAMIC_UPDATES')) {
       for (const opt of sess.configOptions) {

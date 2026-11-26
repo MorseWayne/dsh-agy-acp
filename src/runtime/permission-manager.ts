@@ -1,6 +1,6 @@
 import { realpathSync } from 'node:fs'
 import path from 'node:path'
-import type { PermissionOption, RequestPermissionParams, RequestPermissionResult } from '../acp/protocol.ts'
+import type { AcpToolCallUpdate, PermissionOption, RequestPermissionParams, RequestPermissionResult } from '../acp/protocol.ts'
 
 /** Native Antigravity user questions share `session/request_permission`, identified by `interaction_` id prefix. */
 export function isInteractionQuestion(req: RequestPermissionParams): boolean {
@@ -20,19 +20,34 @@ export function extractSecurityWarning(option: PermissionOption): string | undef
   return text ? (text.length > 512 ? `${text.slice(0, 509)}...` : text) : undefined
 }
 
-const DIRECT_DSH_MCP_TITLE_RE = /^Run mcp_dsh-tools_(?<tool>[A-Za-z0-9_-]+)\??$/
-const PROXIED_MCP_TITLE_RE = /^MCP Tool (?<tool>[A-Za-z0-9_-]+)\??$/
+const DIRECT_DSH_MCP_NAME_RE = /^mcp_dsh-tools_[A-Za-z0-9_.:-]+$/
+const DIRECT_DSH_MCP_TITLE_RE = /^(?:Run\s+)?mcp_dsh-tools_(?<tool>[A-Za-z0-9_.:-]+)\??$/
+const PROXIED_MCP_TITLE_RE = /^MCP Tool (?<tool>[A-Za-z0-9_.:-]+)\??$/
+const NON_MCP_TOOL_KINDS = new Set(['execute', 'edit', 'delete', 'move'])
 
-/** Strictly identifies requests targeting this plugin's own `dsh-tools` reverse MCP server. */
-export function isDshReverseMcpRequest(req: RequestPermissionParams): boolean {
-  const title = req.toolCall.title?.trim() ?? ''
-  const rawInput = asRecord(req.toolCall.rawInput) ?? asRecord(req.toolCall.args)
+/** Strictly identifies ACP tool frames targeting this plugin's own `dsh-tools` reverse MCP server. */
+export function isDshReverseMcpToolCall(
+  tc: Pick<AcpToolCallUpdate, 'name' | 'title' | 'kind' | 'rawInput' | 'args'>,
+): boolean {
+  if (tc.kind && NON_MCP_TOOL_KINDS.has(tc.kind)) return false
+  const rawInput = asRecord(tc.rawInput) ?? asRecord(tc.args)
+  if (typeof rawInput?.CommandLine === 'string') return false
+  const name = tc.name?.trim() ?? ''
+  if (name && DIRECT_DSH_MCP_NAME_RE.test(name)) return true
+  if (name === 'call_mcp_tool') {
+    return rawInput?.ServerName === 'dsh-tools'
+  }
+  const title = tc.title?.trim() ?? ''
   const proxiedTool = PROXIED_MCP_TITLE_RE.exec(title)?.groups?.tool
   if (proxiedTool) {
     return rawInput?.ServerName === 'dsh-tools' && rawInput?.ToolName === proxiedTool
   }
-  if (typeof rawInput?.CommandLine === 'string') return false
   return DIRECT_DSH_MCP_TITLE_RE.test(title)
+}
+
+/** Strictly identifies requests targeting this plugin's own `dsh-tools` reverse MCP server. */
+export function isDshReverseMcpRequest(req: RequestPermissionParams): boolean {
+  return isDshReverseMcpToolCall(req.toolCall)
 }
 
 export interface FilePolicy {
@@ -738,17 +753,30 @@ export function formatApprovalReason(req: RequestPermissionParams): string {
   return lines.join('\n')
 }
 
-function disposition(p: SessionPolicy, req: RequestPermissionParams): 'allow' | 'ask' | 'deny' {
+export interface DecidePermissionOptions {
+  /** True only when this plugin attached its own `dsh-tools` reverse MCP bridge to the ACP session. */
+  hasReverseMcpBridge?: boolean
+}
+
+function disposition(
+  p: SessionPolicy,
+  req: RequestPermissionParams,
+  opts?: DecidePermissionOptions,
+): 'allow' | 'ask' | 'deny' {
+  // Reverse MCP calls to this plugin's own attached `dsh-tools` server are delegated back into
+  // DSH's native tool-call pipeline, which enforces the live preset, auto-review, sandbox policy,
+  // guards, and approval chain. Auto-allowing at the ACP layer avoids redundant double-approval
+  // and lets read-only/auto DSH tools pass through to DSH's own enforcement.
+  if (opts?.hasReverseMcpBridge === true && isDshReverseMcpRequest(req)) {
+    return 'allow'
+  }
   const kind = req.toolCall.kind
   if (p.preset === 'auto') return 'ask' // native ACP calls do not pass through tools/pre-execute
   if (kind === 'read' || kind === 'search') return 'allow'
   if (p.mode === 'read-only') return 'deny'
   if (p.mode === 'danger-full-access' && p.preset === 'danger-full-access' && p.approval === 'never') return 'allow'
   if (p.mode === 'workspace-write' && p.preset === 'workspace-write') {
-    // Reverse MCP calls to this plugin's own `dsh-tools` server are executed by DSH's `tools.execute()`,
-    // which enforces DSH's own pre-execute hooks, file sandbox, and approval chain. Auto-allowing at the
-    // ACP layer prevents redundant double-approval prompts without weakening host security authority.
-    if (isDshReverseMcpRequest(req)) {
+    if (opts?.hasReverseMcpBridge !== false && isDshReverseMcpRequest(req)) {
       return 'allow'
     }
     if (kind === 'edit' || kind === 'delete' || kind === 'move') {
@@ -780,6 +808,7 @@ export async function decidePermission(
   signal: AbortSignal,
   launchPolicy?: SessionPolicy,
   choose?: (req: RequestPermissionParams) => Promise<string | undefined>,
+  opts?: DecidePermissionOptions,
 ): Promise<RequestPermissionResult> {
   try {
     const p = readPolicy()
@@ -805,8 +834,8 @@ export async function decidePermission(
     const reject = req.options.find(o => o.kind === 'reject_once')
     const denied = (): RequestPermissionResult => reject ? { outcome: { outcome: 'selected', optionId: reject.optionId } } : cancelled()
     if (!allow) return denied()
-    const action = disposition(p, req)
-    const launchAction = launchPolicy ? disposition(launchPolicy, req) : action
+    const action = disposition(p, req, opts)
+    const launchAction = launchPolicy ? disposition(launchPolicy, req, opts) : action
     if (action === 'deny' || launchAction === 'deny') return denied()
     if (action === 'ask' || launchAction === 'ask') {
       if (p.approval !== 'ask' || (launchAction === 'ask' && launchPolicy?.approval === 'never')) return denied()

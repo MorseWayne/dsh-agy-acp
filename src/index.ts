@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
-import type { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
+import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { ReasoningEffortId, type ToolCallId } from '@deepseek-ai/dsh-llm/brand'
 import type { PreToolDecision, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import { resolveConfig } from './common/config.ts'
-import { MIRROR_TOOL_NAME, PROVIDER_ID, type McpBridgeSnapshot } from './common/types.ts'
+import { MIRROR_TOOL_NAME, PROVIDER_ID, type McpBridgeSnapshot, type ReviewProviderOption } from './common/types.ts'
 import { ReverseMcpBridge } from './mcp/server.ts'
-import { AcpAdapter } from './provider/adapter.ts'
+import { AcpAdapter, resolveAutoReviewRedirectOptions } from './provider/adapter.ts'
 import { defineAgyAcpMirrorTool } from './provider/mirror-tool.ts'
 import type { ReadPromptFile, ReadPromptImage } from './provider/prompt-builder.ts'
 import { AcpRunStore } from './provider/run-store.ts'
@@ -31,6 +32,13 @@ interface DshToolsServiceLike {
     calls: Array<{ type: 'tool-call'; id: ToolCallId; name: string; arguments: unknown }>
     agent: SessionAgent; signal: AbortSignal
   }): Promise<{ results: Array<{ result: ToolExecutionResult }> }>
+}
+
+interface DshLlmServiceLike {
+  registerAdapter(providers: string[], a: unknown): unknown
+  listProviders?(): LlmProviderInfo[]
+  listModels?(provider: string): Promise<LlmModelInfo[]>
+  stream?(options: GenerateOptions): AsyncIterable<StreamChunk>
 }
 
 export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): void {
@@ -122,6 +130,19 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         })
       : undefined
 
+  const llm = ctx.get('llm') as DshLlmServiceLike | undefined
+  const listReviewProviders = (): ReviewProviderOption[] => {
+    const raw = llm?.listProviders?.() ?? []
+    const seen = new Set<string>()
+    const out: ReviewProviderOption[] = []
+    for (const p of raw) {
+      if (!p || typeof p.id !== 'string' || !p.id.trim() || seen.has(p.id)) continue
+      seen.add(p.id)
+      out.push({ id: p.id, name: typeof p.name === 'string' && p.name.trim() ? p.name.trim() : p.id })
+    }
+    return out
+  }
+
   const runs = new AcpRunStore()
   const egressGuard = new EgressGuard({ log })
   const sessionIndex = new SessionIndex({ log })
@@ -135,6 +156,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     ...permissions,
     isMcpBridgeActive: () => bridges.size > 0,
     getMcpBridgeSnapshot: collectMcpBridgeSnapshot,
+    listReviewProviders,
     hasPersistedConfig: () => configStore.hasPersistedOverrides,
     onConfigPatch: patch => {
       configStore.savePatch(patch)
@@ -190,13 +212,23 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
             const { toolSummary: _, ...actualArgs } = args
             args = actualArgs
           }
-          const batch = await tools.execute!({ agent: owner, signal: AbortSignal.any([signal, turn]),
+          const combinedSignal = AbortSignal.any([signal, turn])
+          const activeRec = runs.getActiveForOwner(key)
+          if (activeRec?.delegatesMcp) {
+            const resumeTimer = pool.pauseTurnTimer(key)
+            try {
+              return await activeRec.enqueueMcpCall(name, args, combinedSignal)
+            } finally {
+              resumeTimer()
+            }
+          }
+          const batch = await tools.execute!({ agent: owner, signal: combinedSignal,
             calls: [{ type: 'tool-call', id: `mcp:${randomUUID()}` as ToolCallId, name, arguments: args }] })
           const result = batch.results[0]?.result
           if (!result) throw new Error('No DSH tool result')
           return { content: [{ type: 'text', text: result.content.map(b => b.type === 'text' ? b.text : JSON.stringify(b)).join('\n') }], isError: result.isError }
         },
-        callTimeoutMs: () => Math.min(cfg.requestTimeoutMs, 120_000),
+        callTimeoutMs: () => Math.min(Math.max(cfg.requestTimeoutMs, 120_000), 600_000),
         onActivity: () => pool.notifyStatusChange(),
         log,
       })
@@ -213,6 +245,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   ctx.on('session/event' as never, ((session: { id: string }, event: { type: string }) => {
     if (event.type === 'working-directory/change') pool.invalidate(session.id, new SessionPolicyChangedError())
     else if (boundaryEvents.has(event.type)) pool.policyChanged(session.id)
+    else if (event.type === 'turn/end') runs.cancelActiveForOwner(session.id, new Error('DSH turn ended'))
   }) as never, { global: true })
   ctx.on('session/disposed' as never, ((session: { id: string }) => pool.evictSession(session.id)) as never, { global: true })
   multiAccountPool?.on('change', () => {
@@ -243,12 +276,24 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     (ctx.emit as (event: 'llm/models-updated', provider: string) => void)('llm/models-updated', PROVIDER_ID)
   })
 
-  // 1. Register LLM provider route
+  // 1. Register LLM provider route & optional cross-provider auto-review redirect
   if (cfg.enabled) {
-    const llm = ctx.get('llm') as { registerAdapter(providers: string[], a: unknown): unknown } | undefined
     if (llm) {
       llm.registerAdapter([PROVIDER_ID], adapter)
       log(`registered provider route: ${PROVIDER_ID}`)
+      if (typeof llm.stream === 'function') {
+        ctx.on(
+          'llm/stream' as never,
+          ((options: GenerateOptions, next: () => AsyncIterable<StreamChunk>): AsyncIterable<StreamChunk> => {
+            const redirected = resolveAutoReviewRedirectOptions(options, cfg)
+            if (redirected) {
+              return llm.stream!(redirected)
+            }
+            return next()
+          }) as never,
+          { global: true },
+        )
+      }
       // A menu may already hold a catalog from before this plugin was reloaded.
       // Prime the actual read-only ACP catalog (no prompt, MCP or fabricated model IDs).
       void pool.refreshModels().catch(() => { /* status and bounded retry are owned by the pool */ })
@@ -319,7 +364,18 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   ctx.inject(['webServer'], (sub) => {
     const webServer = sub.get('webServer') as WebServerLike | undefined
     if (!webServer) return
-    return registerAcpRoutes(webServer, pool)
+    return registerAcpRoutes(webServer, pool, {
+      listReviewModels: async (provider: string) => {
+        const providers = listReviewProviders()
+        if (!providers.some(p => p.id === provider)) return null
+        if (provider === PROVIDER_ID) {
+          return pool.getStatus().models.map(m => ({ id: m.value, name: m.name }))
+        }
+        if (typeof llm?.listModels !== 'function') return []
+        const list = await llm.listModels(provider)
+        return list.map(m => ({ id: m.id, name: m.name || m.id }))
+      },
+    })
   })
 
   // 5. Cleanup on plugin unload

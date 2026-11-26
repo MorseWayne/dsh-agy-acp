@@ -85,6 +85,9 @@ export interface PersistedConfigPatch {
   quotaAwareScheduling?: boolean
   defaultModel?: string
   defaultEffort?: string
+  autoReviewProvider?: string
+  autoReviewModel?: string
+  autoReviewEffort?: string
   agyBin?: string
   workspaceRoot?: string
   sessionIdleTtlMs?: number
@@ -98,6 +101,12 @@ export interface PluginConfig {
   workspaceRoot: string
   defaultModel: string
   defaultEffort: string
+  /** Optional LLM provider ID for DSH Auto review (empty or `antigravity-acp` uses ACP). */
+  autoReviewProvider: string
+  /** Optional model ID for DSH Auto review (empty follows the active conversation model). */
+  autoReviewModel: string
+  /** Optional reasoning effort for DSH Auto review (empty auto-selects lowest effort on ACP). */
+  autoReviewEffort: string
   sessionIdleTtlMs: number
   requestTimeoutMs: number
   /** Attach session-scoped reverse MCP bridge via ACP session/new. */
@@ -112,6 +121,11 @@ export interface PluginConfig {
   accounts: AccountProfileConfig[]
   /** Optional shared directory for cross-process credential slot leases. */
   credentialSlotDir: string
+}
+
+export interface ReviewProviderOption {
+  id: string
+  name: string
 }
 
 export interface AcpModelOption {
@@ -186,11 +200,15 @@ export interface StatusSnapshot {
   usageTotals: UsageTotals
   accounts: AccountHealthSnapshot[]
   models: AcpModelOption[]
+  reviewProviders?: ReviewProviderOption[]
   config: {
     agyBin: string
     workspaceRoot: string
     defaultModel: string
     defaultEffort: string
+    autoReviewProvider?: string
+    autoReviewModel?: string
+    autoReviewEffort?: string
     mcpBridge: boolean
     mcpExposeOverlappingTools?: boolean
     quotaAwareScheduling?: boolean

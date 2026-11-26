@@ -1,8 +1,17 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { validateConfigPatchInput } from '../common/config.ts'
-import type { StatusSnapshot } from '../common/types.ts'
+import { PROVIDER_ID, type StatusSnapshot } from '../common/types.ts'
 import { AccountQuotaError } from '../runtime/account-quota.ts'
 import { EgressCheckError, type AcpSessionPool } from '../runtime/session-pool.ts'
+
+export interface ReviewModelChoice {
+  id: string
+  name: string
+}
+
+export interface AcpRoutesOptions {
+  listReviewModels?: (provider: string) => Promise<ReviewModelChoice[] | null>
+}
 
 export interface ExactRouteSpec {
   kind: 'exact'
@@ -101,6 +110,7 @@ function readJsonBody(req: IncomingMessage, maxBytes = 64 * 1024): Promise<Recor
 export function registerAcpRoutes(
   webServer: WebServerLike,
   pool: AcpSessionPool,
+  opts?: AcpRoutesOptions,
 ): () => void {
   const disposers: Array<() => void> = []
   const sseClients = new Set<ServerResponse>()
@@ -148,6 +158,36 @@ export function registerAcpRoutes(
     sendJson(res, 200, pool.getStatus())
   })
 
+  addRoute('GET', '/plugins/agy-acp/review-models', async (req, res) => {
+    let provider = ''
+    try {
+      const parsed = new URL(req.url ?? '/plugins/agy-acp/review-models', 'http://127.0.0.1')
+      provider = (parsed.searchParams.get('provider') ?? '').trim()
+    } catch {
+      sendJson(res, 400, { error: '无效的查询参数' })
+      return
+    }
+    if (!provider || provider === PROVIDER_ID) {
+      const models = pool.getStatus().models.map(m => ({ id: m.value, name: m.name }))
+      sendJson(res, 200, { ok: true, provider: PROVIDER_ID, models })
+      return
+    }
+    if (!opts?.listReviewModels) {
+      sendJson(res, 200, { ok: true, provider, models: [] })
+      return
+    }
+    try {
+      const models = await opts.listReviewModels(provider)
+      if (!models) {
+        sendJson(res, 404, { error: `未找到已注册的 Provider "${provider}"` })
+        return
+      }
+      sendJson(res, 200, { ok: true, provider, models })
+    } catch {
+      sendJson(res, 502, { error: `获取 Provider "${provider}" 模型列表失败，可手动输入模型 ID` })
+    }
+  })
+
   addRoute('GET', '/plugins/agy-acp/events', (req, res) => {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
@@ -186,6 +226,14 @@ export function registerAcpRoutes(
     const validated = validateConfigPatchInput(body)
     if (!validated.ok) {
       sendJson(res, 400, { error: validated.error })
+      return
+    }
+
+    const currentCfg = pool.getStatus().config
+    const effectiveReviewProvider = validated.patch.autoReviewProvider ?? currentCfg.autoReviewProvider ?? ''
+    const effectiveReviewModel = validated.patch.autoReviewModel ?? currentCfg.autoReviewModel ?? ''
+    if (effectiveReviewProvider && effectiveReviewProvider !== PROVIDER_ID && !effectiveReviewModel) {
+      sendJson(res, 400, { error: '选择外部自动审查 Provider 时请同时指定审查模型' })
       return
     }
 

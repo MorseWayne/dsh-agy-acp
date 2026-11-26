@@ -47,7 +47,9 @@ import {
   encodeMirrorCallId,
   normalizeLocations,
   type AcpRunStore,
+  type DelegatedMcpResult,
   type MergedToolCall,
+  type PendingMcpCall,
 } from './run-store.ts'
 
 export interface AcpAdapterDeps {
@@ -57,6 +59,28 @@ export interface AcpAdapterDeps {
   readImage?: ReadPromptImage
   readFileStream?: ReadPromptFile
   log?: (msg: string) => void
+}
+
+export function resolveAutoReviewRedirectOptions(
+  options: GenerateOptions,
+  cfg: Pick<PluginConfig, 'enabled' | 'autoReviewProvider' | 'autoReviewModel' | 'autoReviewEffort'>,
+): GenerateOptions | null {
+  const purpose: string | undefined = options.purpose
+  if (!cfg.enabled || options.provider !== PROVIDER_ID || purpose !== 'auto-review') {
+    return null
+  }
+  const reviewProvider = cfg.autoReviewProvider.trim()
+  const reviewModel = cfg.autoReviewModel.trim()
+  if (!reviewProvider || reviewProvider === PROVIDER_ID || !reviewModel) {
+    return null
+  }
+  const reviewEffort = cfg.autoReviewEffort.trim()
+  return {
+    ...options,
+    provider: reviewProvider,
+    model: reviewModel,
+    ...(reviewEffort ? { reasoningEffort: ReasoningEffortId(reviewEffort) } : {}),
+  }
 }
 
 export class AcpAdapter extends LlmAdapter {
@@ -133,11 +157,17 @@ export class AcpAdapter extends LlmAdapter {
     }
 
     const hasMirrorTool = Boolean(options.tools?.some((t) => t.name === MIRROR_TOOL_NAME))
-    const isCodeMode = Boolean(options.tools?.some((t) => t.name === WRAPPER_TOOL_NAME)) && !hasMirrorTool
+    const runCodeTool = options.tools?.find((t) => t.name === WRAPPER_TOOL_NAME)
+    const isCodeMode = Boolean(runCodeTool) && !hasMirrorTool
+    const isPythonCodeMode =
+      isCodeMode && typeof runCodeTool?.description === 'string' && /Execute a Python program/i.test(runCodeTool.description)
+    const availableToolNames = options.tools ? new Set(options.tools.map((t) => t.name)) : null
     const cutOnTool = hasMirrorTool || isCodeMode
+    const driveMode: DriveRecordingMode = { cutOnTool, isCodeMode, isPythonCodeMode, availableToolNames }
 
-    // 1. Continuation span: DSH just executed `agy_acp_tool` and is resuming the same ACP turn.
-    const continuation = detectContinuation(options.messages as readonly ContinuationMessage[])
+    // 1. Continuation span: DSH just executed `agy_acp_tool` or a delegated native DSH tool and is resuming the same ACP turn.
+    const continuationMessages = options.messages as readonly ContinuationMessage[]
+    const continuation = detectContinuation(continuationMessages)
     let messages = options.messages as readonly PromptMessage[]
     let recoveryPolicy: string | undefined
     if (continuation) {
@@ -155,10 +185,15 @@ export class AcpAdapter extends LlmAdapter {
           messages = messages.slice(0, callIndex)
           this.deps.log?.(`recreating ACP session "${sessionKey}" after interrupted approval (retry 1/1)`)
         } else {
+          // Feed any delegated reverse-MCP tool results back to the waiting ACP bridge before resuming the stream.
+          for (const entry of collectContinuationToolResults(continuationMessages, rec.id)) {
+            rec.resolveMcpCall(entry.itemIndex, entry.result)
+          }
+          const resumeIndex = Math.max(continuation.itemIndex + 1, rec.cursor)
           const onContAbort = () => rec.requestCancel()
           options.signal?.addEventListener('abort', onContAbort, { once: true })
           try {
-            yield* this.driveRecording(rec, continuation.itemIndex + 1, cutOnTool, isCodeMode, options.signal)
+            yield* this.driveRecording(rec, resumeIndex, driveMode, options.signal)
           } finally {
             options.signal?.removeEventListener('abort', onContAbort)
           }
@@ -272,6 +307,7 @@ export class AcpAdapter extends LlmAdapter {
         this.deps.pool.accountEnvFor(session),
       )
       const rec = this.deps.runs.create(sessionKey, createPreEditLocator(cwd))
+      rec.delegatesMcp = cutOnTool && Boolean(session.hasMcpServers)
       // agy emits usage_update at the end of a prompt, so seed with the last known occupancy for mirror boundaries.
       if (typeof session.contextUsed === 'number') rec.contextUsed = session.contextUsed
       // Exact per-call usage (cache hits included) comes from agy's transcript; ACP only reports a run total.
@@ -461,7 +497,7 @@ export class AcpAdapter extends LlmAdapter {
         }
       }
 
-      const resumeAt = yield* this.driveRecording(rec, 0, cutOnTool, isCodeMode, options.signal, nextBlockIndex, () =>
+      const resumeAt = yield* this.driveRecording(rec, 0, driveMode, options.signal, nextBlockIndex, () =>
         !crashRetried && !options.signal?.aborted && !turn.permissions.requests &&
         !session.hasMcpServers && targetMode !== 'auto' && this.deps.runs.isLatestForOwner(rec) &&
         rec.items.every(item => item.kind === 'error' || (item.kind === 'update' &&
@@ -498,11 +534,21 @@ export class AcpAdapter extends LlmAdapter {
     rec.setCancelHandler(() => ac.abort())
     const combinedSignal = options.signal ? AbortSignal.any([ac.signal, options.signal]) : ac.signal
 
+    const purpose: string | undefined = options.purpose
+    const isAutoReview = purpose === 'auto-review'
+    const useInternalReviewConfig =
+      isAutoReview && (!cfg.autoReviewProvider || cfg.autoReviewProvider === PROVIDER_ID)
+    const configuredReviewModel = useInternalReviewConfig ? cfg.autoReviewModel.trim() : ''
+    const configuredReviewEffort = useInternalReviewConfig ? cfg.autoReviewEffort.trim() : ''
+    const resolvedModel = configuredReviewModel || options.model || cfg.defaultModel || undefined
+    const resolvedEffort = configuredReviewEffort || options.reasoningEffort || undefined
+
     void this.deps.pool
       .runAuxiliaryPrompt({
         sessionKey: options.sessionId,
-        model: options.model || cfg.defaultModel || undefined,
-        effort: options.reasoningEffort,
+        model: resolvedModel,
+        effort: resolvedEffort,
+        preferLowestEffort: isAutoReview && !resolvedEffort,
         systemPromptAppend: append,
         systemFallbackBlock: fallbackBlock,
         prompt,
@@ -532,19 +578,24 @@ export class AcpAdapter extends LlmAdapter {
         options.signal?.removeEventListener('abort', onAbort)
       })
 
-    yield* this.driveRecording(rec, 0, false, false, options.signal)
+    yield* this.driveRecording(
+      rec,
+      0,
+      { cutOnTool: false, isCodeMode: false, isPythonCodeMode: false, availableToolNames: null },
+      options.signal,
+    )
   }
 
   private async *driveRecording(
     rec: AcpRunRecording,
     startIndex: number,
-    cutOnTool: boolean,
-    isCodeMode: boolean,
+    mode: DriveRecordingMode,
     signal?: AbortSignal,
     blockStart = 0,
     canRetryExit?: () => boolean,
   ): AsyncGenerator<StreamChunk, number | void> {
-    let idx = startIndex
+    const { cutOnTool, isCodeMode, isPythonCodeMode, availableToolNames } = mode
+    let idx = Math.max(startIndex, rec.cursor)
     let blockIdx = blockStart
     let openType: 'text' | 'reasoning' | null = null
     let openAcc = ''
@@ -588,7 +639,10 @@ export class AcpAdapter extends LlmAdapter {
 
       const argsJson = isCodeMode
         ? JSON.stringify({
-            code: `await tools[${JSON.stringify(MIRROR_TOOL_NAME)}](${JSON.stringify(mirrorPayload)})`,
+            code: isPythonCodeMode
+              ? `import json\nawait tools[${JSON.stringify(MIRROR_TOOL_NAME)}](json.loads(${JSON.stringify(JSON.stringify(mirrorPayload))}))`
+              : `await tools[${JSON.stringify(MIRROR_TOOL_NAME)}](${JSON.stringify(mirrorPayload)})`,
+            description: tc.title ? `Mirror ${tc.title}` : `Mirror ${tc.name ?? 'tool'}`,
           })
         : JSON.stringify(mirrorPayload)
 
@@ -607,6 +661,58 @@ export class AcpAdapter extends LlmAdapter {
       return [startChunk, endChunk]
     }
 
+    const emitMcpToolChunks = (call: PendingMcpCall): StreamChunk[] => {
+      call.emitted = true
+      const callId = encodeMirrorCallId(rec.id, call.itemIndex) as ToolCallId
+      const toolName = isCodeMode ? WRAPPER_TOOL_NAME : call.name
+      const argsJson = isCodeMode
+        ? JSON.stringify({
+            code: isPythonCodeMode
+              ? `import json\nreturn await tools[${JSON.stringify(call.name)}](json.loads(${JSON.stringify(JSON.stringify(call.args))}))`
+              : `return await tools[${JSON.stringify(call.name)}](${JSON.stringify(call.args)})`,
+            description: `Call ${call.name}`,
+          })
+        : JSON.stringify(call.args)
+
+      const startChunk: StreamChunk = { type: 'block-start', index: blockIdx, blockType: 'tool-call' }
+      const endChunk: StreamChunk = {
+        type: 'block-end',
+        index: blockIdx,
+        block: {
+          type: 'tool-call',
+          id: callId,
+          name: toolName,
+          arguments: argsJson,
+        },
+      }
+      blockIdx++
+      return [startChunk, endChunk]
+    }
+
+    const emitSpanUsage = async function* (
+      emittedBatchIds: ReadonlySet<string>,
+      sawPostToolContent: boolean,
+    ): AsyncGenerator<StreamChunk> {
+      // One DSH step = the agy model calls since the previous step. With the transcript, report their exact
+      // usage; skip the 160ms poll loop on continuation cuts of the same model call that cannot emit a new record.
+      const boundaryRetries = rec.expectsNewCallUsage(emittedBatchIds) ? BOUNDARY_USAGE_RETRIES : 0
+      const spanUsage =
+        sawPostToolContent && rec.hasPendingUsage
+          ? rec.consumeSpanUsage()
+          : await takeSpanUsage(rec, boundaryRetries, signal)
+      if (spanUsage) {
+        yield { type: 'usage', usage: callUsageToTokenUsage(spanUsage) }
+      } else if (!rec.hasUsageSource && rec.contextUsed !== undefined && rec.contextUsed !== rec.lastFallbackContextUsed) {
+        // No transcript: report live context occupancy once per distinct reading so DSH shows context
+        // pressure without repeatedly billing the same full context across mirrored tool spans.
+        const boundaryUsage = mapContextUsage(undefined, rec.contextUsed)
+        if (boundaryUsage) {
+          rec.lastFallbackContextUsed = rec.contextUsed
+          yield { type: 'usage', usage: boundaryUsage }
+        }
+      }
+    }
+
     while (true) {
       if (signal?.aborted) {
         rec.releaseRecording()
@@ -617,6 +723,27 @@ export class AcpAdapter extends LlmAdapter {
           reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'Request aborted by caller' } },
         }
         return
+      }
+
+      if (cutOnTool && !rec.hasPendingUnemittedMcpCall()) {
+        const readyDeferred = rec.takeReadyDeferredNativeTools()
+        if (readyDeferred.length > 0) {
+          const closed = closeOpenBlock()
+          if (closed) yield closed
+          const batch = isCodeMode ? [readyDeferred[0]!] : readyDeferred
+          if (isCodeMode) {
+            for (const rem of readyDeferred.slice(1)) rec.deferNativeTool(rem.toolCallId)
+          }
+          const emittedBatchIds = new Set<string>()
+          for (const tc of batch) {
+            emittedBatchIds.add(tc.toolCallId)
+            for (const c of emitToolChunks(tc, tc.step)) yield c
+          }
+          rec.cursor = Math.max(rec.cursor, idx)
+          yield* emitSpanUsage(emittedBatchIds, false)
+          yield { type: 'finish', reason: { kind: 'tool-calls' } }
+          return
+        }
       }
 
       const item = await rec.waitFor(idx, signal)
@@ -659,6 +786,26 @@ export class AcpAdapter extends LlmAdapter {
       }
 
       if (item.kind === 'done') {
+        if (cutOnTool) {
+          const readyDeferred = rec.takeReadyDeferredNativeTools()
+          if (readyDeferred.length > 0) {
+            const closed = closeOpenBlock()
+            if (closed) yield closed
+            const batch = isCodeMode ? [readyDeferred[0]!] : readyDeferred
+            if (isCodeMode) {
+              for (const rem of readyDeferred.slice(1)) rec.deferNativeTool(rem.toolCallId)
+            }
+            const emittedBatchIds = new Set<string>()
+            for (const tc of batch) {
+              emittedBatchIds.add(tc.toolCallId)
+              for (const c of emitToolChunks(tc, tc.step)) yield c
+            }
+            rec.cursor = Math.max(rec.cursor, idx)
+            yield* emitSpanUsage(emittedBatchIds, true)
+            yield { type: 'finish', reason: { kind: 'tool-calls' } }
+            return
+          }
+        }
         const closed = closeOpenBlock()
         if (closed) yield closed
         const priorUsageCount = rec.consumedSpanUsageCount
@@ -681,8 +828,110 @@ export class AcpAdapter extends LlmAdapter {
           const usage = mapContextUsage(item.usage, rec.contextUsed)
           if (usage) yield { type: 'usage', usage }
         }
+        rec.cursor = Math.max(rec.cursor, idx + 1)
         rec.releaseRecording()
         yield { type: 'finish', reason: { kind: 'stop' } }
+        return
+      }
+
+      if (item.kind === 'mcp-call') {
+        const call = item.call
+        if (call.settled || call.emitted) {
+          idx++
+          rec.cursor = Math.max(rec.cursor, idx)
+          continue
+        }
+        if (!cutOnTool) {
+          rec.rejectMcpCall(call.itemIndex, new Error('Delegated MCP execution requires an active DSH tool loop'))
+          idx++
+          rec.cursor = Math.max(rec.cursor, idx)
+          continue
+        }
+        if (!isCodeMode && availableToolNames && !availableToolNames.has(call.name)) {
+          rec.resolveMcpCall(call.itemIndex, {
+            content: [{ type: 'text', text: `Error: Tool "${call.name}" is not available in this DSH step` }],
+            isError: true,
+          })
+          idx++
+          rec.cursor = Math.max(rec.cursor, idx)
+          continue
+        }
+
+        const closed = closeOpenBlock()
+        if (closed) yield closed
+
+        const emittedBatchIds = new Set<string>([`mcp:${call.itemIndex}`])
+        for (const c of emitMcpToolChunks(call)) yield c
+
+        // Standard mode: coalesce sibling concurrent delegated MCP calls arriving in the same model turn,
+        // without mixing in unsettled mirror (`agy_acp_tool`) calls that could deadlock waiting on agy.
+        let sawPostToolContent = false
+        if (!isCodeMode) {
+          const batchDeadline = Date.now() + TOOL_BATCH_MAX_WAIT_MS
+          while (true) {
+            let nextItem = idx + 1 < rec.items.length ? rec.items[idx + 1] : null
+            if (!nextItem && !rec.isSettled && !signal?.aborted) {
+              const waitMs = Math.min(TOOL_BATCH_COALESCE_MS, batchDeadline - Date.now())
+              if (waitMs > 0) {
+                nextItem = await rec.waitForWithin(idx + 1, waitMs, signal)
+              }
+            }
+            if (!nextItem) break
+            if (nextItem.kind === 'mcp-call') {
+              const nextCall = nextItem.call
+              if (nextCall.settled || nextCall.emitted) {
+                idx++
+                continue
+              }
+              if (availableToolNames && !availableToolNames.has(nextCall.name)) {
+                rec.resolveMcpCall(nextCall.itemIndex, {
+                  content: [{ type: 'text', text: `Error: Tool "${nextCall.name}" is not available in this DSH step` }],
+                  isError: true,
+                })
+                idx++
+                continue
+              }
+              idx++
+              emittedBatchIds.add(`mcp:${nextCall.itemIndex}`)
+              for (const c of emitMcpToolChunks(nextCall)) yield c
+              continue
+            }
+            if (nextItem.kind !== 'update') {
+              sawPostToolContent = true
+              break
+            }
+            const nu = nextItem.update
+            if (nu.sessionUpdate === 'usage_update') {
+              idx++
+              continue
+            }
+            if (nu.sessionUpdate === 'tool_call' || nu.sessionUpdate === 'tool_call_update') {
+              const nextTc = nu as AcpToolCallUpdate
+              const nextId =
+                typeof nextTc.toolCallId === 'string' && nextTc.toolCallId.trim() !== ''
+                  ? nextTc.toolCallId
+                  : `step:${idx + 1}`
+              if (rec.isSuppressedMcpTool(nextId) || rec.isToolEmitted(nextId)) {
+                idx++
+                continue
+              }
+              // Defer an interleaved unsettled native tool so sibling MCP calls arriving right after can still coalesce.
+              const nextMerged = rec.getToolCall(nextId)
+              if (nextMerged && !nextMerged.settled) {
+                rec.deferNativeTool(nextId)
+                idx++
+                continue
+              }
+              break
+            }
+            sawPostToolContent = true
+            break
+          }
+        }
+
+        rec.cursor = Math.max(rec.cursor, idx + 1)
+        yield* emitSpanUsage(emittedBatchIds, sawPostToolContent)
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
         return
       }
 
@@ -719,9 +968,15 @@ export class AcpAdapter extends LlmAdapter {
           typeof tcUpdate.toolCallId === 'string' && tcUpdate.toolCallId.trim() !== ''
             ? tcUpdate.toolCallId
             : `step:${idx}`
-        if (!rec.isToolEmitted(toolCallId)) {
+        if (rec.delegatesMcp && rec.isSuppressedMcpTool(toolCallId)) {
+          // Suppressed: this `dsh-tools` MCP call is delegated and rendered as a real native DSH tool call.
+        } else if (!rec.isToolEmitted(toolCallId)) {
           const merged = rec.getToolCall(toolCallId)
-          if (merged && isToolReadyToEmit(rec, idx, merged)) {
+          if (merged && rec.delegatesMcp && !merged.settled && rec.hasUnsettledSuppressedMcpTool()) {
+            // Defer unsettled native mirror tools while a reverse MCP tool is in flight to prevent
+            // agy/DSH mutual-wait deadlocks if agy executes tools sequentially.
+            rec.deferNativeTool(toolCallId)
+          } else if (merged && isToolReadyToEmit(rec, idx, merged)) {
             const closed = closeOpenBlock()
             if (closed) yield closed
 
@@ -743,6 +998,7 @@ export class AcpAdapter extends LlmAdapter {
                   }
                 }
                 if (!nextItem) break
+                if (nextItem.kind === 'mcp-call') break
                 if (nextItem.kind !== 'update') {
                   sawPostToolContent = true
                   break
@@ -761,36 +1017,27 @@ export class AcpAdapter extends LlmAdapter {
                   typeof nextTc.toolCallId === 'string' && nextTc.toolCallId.trim() !== ''
                     ? nextTc.toolCallId
                     : `step:${idx + 1}`
+                if (rec.delegatesMcp && rec.isSuppressedMcpTool(nextId)) break
                 if (rec.isToolEmitted(nextId)) {
                   idx++
                   continue
                 }
                 const nextMerged = rec.getToolCall(nextId)
-                if (!nextMerged || !isToolReadyToEmit(rec, idx + 1, nextMerged)) break
+                if (
+                  !nextMerged ||
+                  (rec.delegatesMcp && !nextMerged.settled && rec.hasUnsettledSuppressedMcpTool()) ||
+                  !isToolReadyToEmit(rec, idx + 1, nextMerged)
+                ) {
+                  break
+                }
                 idx++
                 emittedBatchIds.add(nextMerged.toolCallId)
                 for (const c of emitToolChunks(nextMerged, idx)) yield c
               }
             }
 
-            // One DSH step = the agy model calls since the previous step. With the transcript, report their exact
-            // usage; skip the 160ms poll loop on continuation cuts of the same model call that cannot emit a new record.
-            const boundaryRetries = rec.expectsNewCallUsage(emittedBatchIds) ? BOUNDARY_USAGE_RETRIES : 0
-            const spanUsage =
-              sawPostToolContent && rec.hasPendingUsage
-                ? rec.consumeSpanUsage()
-                : await takeSpanUsage(rec, boundaryRetries, signal)
-            if (spanUsage) {
-              yield { type: 'usage', usage: callUsageToTokenUsage(spanUsage) }
-            } else if (!rec.hasUsageSource && rec.contextUsed !== undefined && rec.contextUsed !== rec.lastFallbackContextUsed) {
-              // No transcript: report live context occupancy once per distinct reading so DSH shows context
-              // pressure without repeatedly billing the same full context across mirrored tool spans.
-              const boundaryUsage = mapContextUsage(undefined, rec.contextUsed)
-              if (boundaryUsage) {
-                rec.lastFallbackContextUsed = rec.contextUsed
-                yield { type: 'usage', usage: boundaryUsage }
-              }
-            }
+            rec.cursor = Math.max(rec.cursor, idx + 1)
+            yield* emitSpanUsage(emittedBatchIds, sawPostToolContent)
             yield { type: 'finish', reason: { kind: 'tool-calls' } }
             return
           }
@@ -798,6 +1045,7 @@ export class AcpAdapter extends LlmAdapter {
       }
 
       idx++
+      rec.cursor = Math.max(rec.cursor, idx)
     }
   }
 }
@@ -833,13 +1081,58 @@ function isToolReadyToEmit(rec: AcpRunRecording, idx: number, tc: MergedToolCall
   return idx + 1 >= rec.items.length
 }
 
+interface DriveRecordingMode {
+  readonly cutOnTool: boolean
+  readonly isCodeMode: boolean
+  readonly isPythonCodeMode: boolean
+  readonly availableToolNames: ReadonlySet<string> | null
+}
+
 // Read the shared fields structurally: older DSH puts results in user blocks,
 // while newer DSH uses a separate tool message with a top-level call ID.
+interface ContinuationBlock {
+  readonly type: string
+  readonly toolCallId?: unknown
+  readonly text?: string
+  readonly content?: unknown
+  readonly isError?: unknown
+}
+
 interface ContinuationMessage {
   readonly role: string
   readonly source?: { readonly kind?: string }
   readonly toolCallId?: unknown
-  readonly content: readonly { readonly type: string; readonly toolCallId?: unknown; readonly text?: string }[]
+  readonly isError?: unknown
+  readonly content: readonly ContinuationBlock[]
+}
+
+/** User message sources that start a fresh turn rather than injecting step-boundary context. */
+const FRESH_TURN_USER_SOURCES = new Set([
+  'user',
+  'scheduled',
+  'schedule',
+  'goal',
+  'goal-continuation',
+  'agent-message',
+  'compact-checkpoint',
+])
+
+function isStepContextUserMessage(message: ContinuationMessage): boolean {
+  const kind = message.source?.kind
+  return typeof kind === 'string' && kind.length > 0 && !FRESH_TURN_USER_SOURCES.has(kind)
+}
+
+function formatContinuationResultBlocks(raw: unknown): string {
+  if (typeof raw === 'string') return raw
+  if (!Array.isArray(raw)) return ''
+  return raw
+    .map((b) => {
+      if (b && typeof b === 'object' && (b as { type?: unknown }).type === 'text' && typeof (b as { text?: unknown }).text === 'string') {
+        return (b as { text: string }).text
+      }
+      return JSON.stringify(b)
+    })
+    .join('\n')
 }
 
 export function detectContinuation(
@@ -850,6 +1143,10 @@ export function detectContinuation(
 
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i]!
+    if (message.role === 'developer') {
+      if (targetRunId === null) continue
+      break
+    }
     if (message.role === 'tool') {
       const parsed = typeof message.toolCallId === 'string' ? decodeMirrorCallId(message.toolCallId) : null
       if (!parsed) break
@@ -866,8 +1163,8 @@ export function detectContinuation(
 
     if (message.role !== 'user') break
 
-    // DSH may append both snapshots while preparing the next step of this same turn.
-    if (message.source?.kind === 'runtime-context' || message.source?.kind === 'time-context') {
+    // DSH may append step-boundary snapshots or deferred tool contexts while preparing the next step of this turn.
+    if (isStepContextUserMessage(message)) {
       if (targetRunId === null) continue
       break
     }
@@ -892,4 +1189,62 @@ export function detectContinuation(
   }
 
   return targetRunId !== null ? { runId: targetRunId, itemIndex: maxItemIndex } : null
+}
+
+/** Extracts trailing DSH tool-result payloads belonging to `runId` for delegated reverse-MCP calls. */
+export function collectContinuationToolResults(
+  messages: readonly ContinuationMessage[],
+  runId: string,
+): Array<{ itemIndex: number; result: DelegatedMcpResult }> {
+  const collected: Array<{ itemIndex: number; result: DelegatedMcpResult }> = []
+  let foundAny = false
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!
+    if (message.role === 'developer') {
+      if (!foundAny) continue
+      break
+    }
+    if (message.role === 'tool') {
+      const parsed = typeof message.toolCallId === 'string' ? decodeMirrorCallId(message.toolCallId) : null
+      if (!parsed || parsed.runId !== runId) break
+      foundAny = true
+      collected.push({
+        itemIndex: parsed.itemIndex,
+        result: {
+          content: [{ type: 'text', text: formatContinuationResultBlocks(message.content) }],
+          isError: Boolean(message.isError),
+        },
+      })
+      continue
+    }
+
+    if (message.role !== 'user') break
+
+    if (isStepContextUserMessage(message)) {
+      if (!foundAny) continue
+      break
+    }
+
+    let matchedInUser = false
+    for (let j = message.content.length - 1; j >= 0; j--) {
+      const block = message.content[j]
+      if (block?.type === 'tool-result' && typeof block.toolCallId === 'string') {
+        const parsed = decodeMirrorCallId(block.toolCallId)
+        if (!parsed || parsed.runId !== runId) continue
+        foundAny = true
+        matchedInUser = true
+        collected.push({
+          itemIndex: parsed.itemIndex,
+          result: {
+            content: [{ type: 'text', text: formatContinuationResultBlocks(block.content) }],
+            isError: Boolean(block.isError),
+          },
+        })
+      }
+    }
+    if (!matchedInUser) break
+  }
+
+  return collected.reverse()
 }
