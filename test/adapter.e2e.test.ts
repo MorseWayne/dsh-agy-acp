@@ -579,7 +579,7 @@ test('parallel tool calls with out-of-order completion resume cleanly without du
   }
 })
 
-test('options.system passes via ACP systemPrompt.append, updates inline on change, and falls back when unsupported', async () => {
+test('host system instructions pass via prompt blocks (never _meta.antigravity.systemPrompt.append), skip when unchanged, and update inline on change', async () => {
   const { adapter, pool } = createHarness()
   try {
     const t1 = await collectChunks(
@@ -587,13 +587,15 @@ test('options.system passes via ACP systemPrompt.append, updates inline on chang
         provider: PROVIDER_ID,
         model: 'gemini-4-neon',
         system: 'Rule Alpha',
-        messages: [{ role: 'user', content: [{ type: 'text', text: 'ECHO_SYSTEM 1' }] } as Message],
+        messages: [
+          { role: 'system', content: [{ type: 'text', text: 'You are an AI agent powered by DeepSeek Harness.' }] } as Message,
+          { role: 'user', content: [{ type: 'text', text: 'ECHO_SYSTEM 1' }] } as Message,
+        ],
         sessionId: 'dsh-sys',
       } as GenerateOptions),
     )
     const out1 = t1.filter(c => c.type === 'text-delta').map(c => c.text).join('')
-    assert.match(out1, /^SYS=Rule Alpha/)
-    assert.equal(out1.includes('<host_system_instructions>'), false)
+    assert.match(out1, /^SYS=NONE\|\|PROMPT=<host_system_instructions>[\s\S]*Rule Alpha[\s\S]*DeepSeek Harness[\s\S]*<\/host_system_instructions>/)
 
     // Unchanged system prompt should not inject updated tag
     const t2 = await collectChunks(
@@ -601,11 +603,15 @@ test('options.system passes via ACP systemPrompt.append, updates inline on chang
         provider: PROVIDER_ID,
         model: 'gemini-4-neon',
         system: 'Rule Alpha',
-        messages: [{ role: 'user', content: [{ type: 'text', text: 'ECHO_SYSTEM 2' }] } as Message],
+        messages: [
+          { role: 'system', content: [{ type: 'text', text: 'You are an AI agent powered by DeepSeek Harness.' }] } as Message,
+          { role: 'user', content: [{ type: 'text', text: 'ECHO_SYSTEM 2' }] } as Message,
+        ],
         sessionId: 'dsh-sys',
       } as GenerateOptions),
     )
     const out2 = t2.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+    assert.equal(out2.includes('<host_system_instructions>'), false)
     assert.equal(out2.includes('<host_system_instructions_updated>'), false)
 
     // Changed system prompt injects updated tag without destroying persistent session
@@ -637,7 +643,7 @@ test('options.system passes via ACP systemPrompt.append, updates inline on chang
     pool.dispose()
   }
 
-  // Fallback when peer does not advertise systemPrompt.append
+  // Still works identically when peer does not advertise systemPrompt.append
   const prevEnv = process.env.FAKE_NO_SYSTEM_APPEND
   process.env.FAKE_NO_SYSTEM_APPEND = '1'
   const fallbackHarness = createHarness()
@@ -673,10 +679,25 @@ test('options.purpose auxiliary calls enforce mode=default, deny all permissions
       } as GenerateOptions),
     )
     const auxText = auxChunks.filter(c => c.type === 'text-delta').map(c => c.text).join('')
-    assert.equal(auxText, 'AUX_MODE=default|READ=false|EXEC=false|SYS=META')
+    assert.equal(auxText, 'AUX_MODE=default|READ=false|EXEC=false|SYS=NONE')
     assert.equal(pool.getStatus().activeSessions, 0)
     const usage = auxChunks.find(c => c.type === 'usage')
     assert.ok(usage && usage.type === 'usage' && usage.usage.inputTokens === 40)
+
+    const auxSysChunks = await collectChunks(
+      adapter.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        purpose: 'compaction',
+        system: 'Summarize concisely.',
+        messages: [
+          { role: 'system', content: [{ type: 'text', text: 'You are an AI agent powered by DeepSeek Harness.' }] } as Message,
+          { role: 'user', content: [{ type: 'text', text: 'ECHO_SYSTEM aux' }] } as Message,
+        ],
+      } as GenerateOptions),
+    )
+    const auxSysText = auxSysChunks.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+    assert.match(auxSysText, /^SYS=NONE\|\|PROMPT=<host_system_instructions>[\s\S]*Summarize concisely\.[\s\S]*Auxiliary Task: compaction/)
 
     // Missing sessionId WITHOUT purpose must still throw
     await assert.rejects(
@@ -936,6 +957,7 @@ test('EgressGuard blocks HK main chat & auxiliary calls with zero subprocess lau
     assert.ok(fin400 && fin400.type === 'finish' && fin400.reason.kind === 'error')
     assert.match(fin400.reason.failure.message, /\[地域限制熔断\]/)
     assert.equal(pool1.getStatus().accounts[0]?.egress?.probeSource, 'runtime-400')
+    assert.equal(pool1.getStatus().activeSessions, 0, 'sticky agy process must be torn down after geo 400')
 
     // Immediate next turn (1ms later!) is blocked locally BEFORE sending `session/prompt` to fake-agy
     const blockedAfter400 = await collectChunks(
@@ -949,6 +971,23 @@ test('EgressGuard blocks HK main chat & auxiliary calls with zero subprocess lau
     const finNext = blockedAfter400.find(c => c.type === 'finish')
     assert.ok(finNext && finNext.type === 'finish' && finNext.reason.kind === 'error')
     assert.match(finNext.reason.failure.message, /\[安全拦截\]/)
+
+    // 3b. Inline `⚠ FAILED_PRECONDITION (code 400)` with end_turn & zero usage (read-only sandbox fallback)
+    //     also triggers runtime-400 circuit breaker and tears down the sticky process.
+    await pool1.checkAccountEgress('default')
+    const inlineGeoTurn = await collectChunks(
+      adapter1.stream({
+        provider: PROVIDER_ID,
+        model: 'gemini-4-neon',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'INLINE_GEO_400' }] } as Message],
+        sessionId: 'dsh-inline-geo',
+      } as GenerateOptions),
+    )
+    const finInlineGeo = inlineGeoTurn.find(c => c.type === 'finish')
+    assert.ok(finInlineGeo && finInlineGeo.type === 'finish' && finInlineGeo.reason.kind === 'error')
+    assert.match(finInlineGeo.reason.failure.message, /\[地域限制熔断\]/)
+    assert.equal(pool1.getStatus().accounts[0]?.egress?.probeSource, 'runtime-400')
+    assert.equal(pool1.getStatus().activeSessions, 0, 'sticky agy process must be torn down after inline geo 400')
   } finally {
     pool1.dispose()
   }

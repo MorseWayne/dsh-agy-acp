@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from 'node:net'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { AcpMcpServerSpec } from '../acp/protocol.ts'
+import type { AcpHttpMcpServerSpec, AcpMcpServerSpec, AcpStdioMcpServerSpec } from '../acp/protocol.ts'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import { MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME } from '../common/types.ts'
 
@@ -26,6 +26,7 @@ export interface McpBridgeStats {
   inFlightCalls: number
   totalCalls: number
   failedCalls: number
+  transport: 'http' | 'stdio'
   lastToolName: string | null
   lastCallAt: number | null
   lastError: string | null
@@ -35,6 +36,8 @@ export interface ReverseMcpBridgeOptions {
   listTools: () => BridgeToolSchema[] | Promise<BridgeToolSchema[]>
   callTool: (name: string, args: Record<string, unknown>, signal: AbortSignal) => Promise<BridgeToolResult>
   blockedTools?: readonly string[]
+  /** When true, hide DSH base tools that duplicate Antigravity's native tools to save prompt tokens. */
+  excludeOverlappingNativeTools?: boolean
   serverName?: string
   bridgeScriptPath?: string
   /** Per-tool-call execution timeout in ms (default: 60_000). */
@@ -47,6 +50,33 @@ export interface ReverseMcpBridgeOptions {
 }
 
 const DEFAULT_BLOCKED_TOOLS = new Set<string>([MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME])
+
+/**
+ * DSH host tools whose capabilities already exist natively in Antigravity (`agy acp`).
+ * Filtering them out by default saves ~6-10K prompt tokens per session, avoids tool-choice
+ * splitting (e.g. `mcp_dsh-tools_glob` scanning `node_modules`), and preserves DSH-unique
+ * extensions (`mnemon_*`, `team_task_*`, `goal`, `office_*`, `present`, `web_fetch`, etc.).
+ */
+export const OVERLAPPING_NATIVE_DSH_TOOLS: ReadonlySet<string> = new Set([
+  'read',
+  'write',
+  'edit',
+  'bash',
+  'glob',
+  'grep',
+  'web_search',
+  'todo_write',
+  'ask_user_question',
+  'subagent',
+  'subagent_fork',
+  'list_agents',
+  'wait_agent',
+  'send_message',
+  'list_subagent_models',
+  'job_output',
+  'job_list',
+  'job_kill',
+])
 
 function resolveDefaultBridgeScriptPath(): string {
   const dir = path.dirname(fileURLToPath(import.meta.url))
@@ -100,6 +130,7 @@ export class ReverseMcpBridge {
   private readonly maxConcurrentCalls: number
   private readonly activeCallControllers = new Set<AbortController>()
   private url: string | null = null
+  private activeTransport: 'http' | 'stdio' = 'stdio'
   private inFlightCalls = 0
   private totalCalls = 0
   private failedCalls = 0
@@ -109,7 +140,11 @@ export class ReverseMcpBridge {
 
   constructor(private readonly opts: ReverseMcpBridgeOptions) {
     this.token = randomBytes(32).toString('hex')
-    this.blocked = new Set([...DEFAULT_BLOCKED_TOOLS, ...(opts.blockedTools ?? [])])
+    this.blocked = new Set([
+      ...DEFAULT_BLOCKED_TOOLS,
+      ...(opts.excludeOverlappingNativeTools ? OVERLAPPING_NATIVE_DSH_TOOLS : []),
+      ...(opts.blockedTools ?? []),
+    ])
     this.serverName = opts.serverName ?? 'dsh-tools'
     this.bridgeScriptPath = opts.bridgeScriptPath ?? resolveDefaultBridgeScriptPath()
     this.maxConcurrentCalls = Math.max(1, opts.maxConcurrentCalls ?? DEFAULT_MCP_MAX_CONCURRENT_CALLS)
@@ -128,6 +163,7 @@ export class ReverseMcpBridge {
       inFlightCalls: this.inFlightCalls,
       totalCalls: this.totalCalls,
       failedCalls: this.failedCalls,
+      transport: this.activeTransport,
       lastToolName: this.lastToolName,
       lastCallAt: this.lastCallAt,
       lastError: this.lastError,
@@ -161,8 +197,9 @@ export class ReverseMcpBridge {
     return this.url
   }
 
-  getMcpServerSpec(): AcpMcpServerSpec | null {
+  getMcpServerSpec(): AcpStdioMcpServerSpec | null {
     if (!this.url) return null
+    this.activeTransport = 'stdio'
     const stdioTimeoutMs = this.resolveCallTimeoutMs() + 5_000
     return {
       name: this.serverName,
@@ -174,6 +211,25 @@ export class ReverseMcpBridge {
         { name: 'DSH_MCP_BRIDGE_TIMEOUT_MS', value: String(stdioTimeoutMs) },
       ],
     }
+  }
+
+  /** Native ACP HTTP MCP server spec (skips spawning per-session stdio `bridge.mjs` child). */
+  getHttpMcpServerSpec(): AcpHttpMcpServerSpec | null {
+    if (!this.url) return null
+    this.activeTransport = 'http'
+    return {
+      type: 'http',
+      name: this.serverName,
+      url: this.url,
+      headers: [
+        { name: 'Authorization', value: `Bearer ${this.token}` },
+      ],
+    }
+  }
+
+  /** Chooses direct HTTP when negotiated via `mcpCapabilities.http`, otherwise falls back to stdio bridge. */
+  getPreferredMcpServerSpec(preferHttp: boolean): AcpMcpServerSpec | null {
+    return preferHttp ? this.getHttpMcpServerSpec() : this.getMcpServerSpec()
   }
 
   async dispose(): Promise<void> {
@@ -201,7 +257,7 @@ export class ReverseMcpBridge {
   }
 
   private async handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (req.method !== 'POST' || req.url !== '/mcp') {
+    if (req.url !== '/mcp') {
       res.writeHead(404)
       res.end('Not Found')
       return
@@ -209,6 +265,16 @@ export class ReverseMcpBridge {
     if (!this.verifyAuth(req)) {
       res.writeHead(401)
       res.end('Unauthorized')
+      return
+    }
+    // This endpoint is stateless at the MCP layer: ACP owns the bridge lifetime and token.
+    if (req.headers.origin && req.headers.origin !== (this.url && new URL(this.url).origin)) {
+      res.writeHead(403).end()
+      return
+    }
+    if (req.method !== 'POST') {
+      res.writeHead(405)
+      res.end('Method Not Allowed')
       return
     }
 
@@ -237,7 +303,7 @@ export class ReverseMcpBridge {
 
     // Notification (no id)
     if (id === undefined || id === null) {
-      res.writeHead(204)
+      res.writeHead(202)
       res.end()
       return
     }
@@ -266,9 +332,10 @@ export class ReverseMcpBridge {
   ): Promise<unknown> {
     if (method === 'initialize') {
       return {
-        protocolVersion: '2024-11-05',
+        protocolVersion: ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'].includes(String(params.protocolVersion))
+          ? params.protocolVersion : '2025-06-18',
         capabilities: { tools: {} },
-        serverInfo: { name: this.serverName, version: '0.4.2' },
+        serverInfo: { name: this.serverName, version: '0.5.0' },
       }
     }
 

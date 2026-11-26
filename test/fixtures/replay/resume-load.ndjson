@@ -1,0 +1,8 @@
+{"expect":{"id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"dsh-agy-acp","version":"$version"}}}}
+{"emit":{"id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"resume":{}}}}}}
+{"expect":{"id":2,"method":"session/resume","params":{"sessionId":"saved","cwd":"$workspace","mcpServers":[]}}}
+{"emit":{"method":"session/update","params":{"sessionId":"saved","update":{"sessionUpdate":"session_info_update","title":"discarded title"}}}}
+{"emit":{"id":2,"error":{"code":-32601,"message":"unsupported"}}}
+{"expect":{"id":3,"method":"session/load","params":{"sessionId":"saved","cwd":"$workspace","mcpServers":[]}}}
+{"emit":{"method":"session/update","params":{"sessionId":"saved","update":{"sessionUpdate":"session_info_update","title":"loaded title"}}}}
+{"emit":{"id":3,"result":{}}}

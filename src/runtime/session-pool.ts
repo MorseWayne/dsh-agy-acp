@@ -8,7 +8,9 @@ import { transcriptCandidates } from '../acp/transcript-usage.ts'
 import { isGeoUnsupportedError } from '../common/geo.ts'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import {
+  supportsMcpHttp,
   supportsSessionLoad,
+  supportsSessionResume,
   type AcpConfigOption,
   type AcpMcpServerSpec,
   type AcpUsage,
@@ -17,13 +19,16 @@ import {
   type SessionLoadResult,
   type SessionNewResult,
   type SessionPromptResult,
+  type SessionResumeResult,
   type SessionUpdatePayload,
   type RequestPermissionParams,
   type RequestPermissionResult,
 } from '../acp/protocol.ts'
 import {
   PROVIDER_ID,
+  type AcpCapabilitiesSnapshot,
   type AccountEgressSnapshot,
+  type AccountFailureOptions,
   type AccountHealthSnapshot,
   type AccountLease,
   type AccountProvider,
@@ -37,10 +42,18 @@ import {
 } from '../common/types.ts'
 
 import { isTosViolationError } from './account-pool.ts'
-import { AccountQuotaError, mapQuotaGroupsToFamilies, readAccountQuota, requireFileCredentialMode } from './account-quota.ts'
+import {
+  AccountQuotaError,
+  mapQuotaGroupsToFamilies,
+  readAccountQuota,
+  readDirectAccountQuota,
+  requireFileCredentialMode,
+} from './account-quota.ts'
 import { EgressBlockedError, EgressGuard } from './egress-guard.ts'
+import { createPrivateProcessTemp } from './session-cleanup.ts'
 import type { SessionIndex } from './session-index.ts'
 import { defaultEffort, sortedEfforts } from '../common/effort.ts'
+import { createTurnOutcomeWatcher } from '../acp/turn-outcome.ts'
 import { mapUsage } from '../acp/usage.ts'
 import { modelCatalog, selectOption, values } from './model-catalog.ts'
 
@@ -62,6 +75,13 @@ export interface ManagedAcpSession {
   currentMode: string
   title?: string
   resumed?: boolean
+  resumedVia?: 'resume' | 'load'
+  mcpTransport?: 'http' | 'stdio' | 'none'
+  promptCapabilities?: {
+    image?: boolean
+    audio?: boolean
+    embeddedContext?: boolean
+  }
   configOptions: AcpConfigOption[]
   hasMcpServers?: boolean
   supportsSystemPromptAppend?: boolean
@@ -139,7 +159,7 @@ export interface SessionPoolDeps {
   accountProvider?: AccountProvider
   egressGuard?: EgressGuard
   sessionIndex?: SessionIndex
-  getMcpServers?: (sessionKey: string) => Promise<AcpMcpServerSpec[]>
+  getMcpServers?: (sessionKey: string, opts?: { preferHttp?: boolean }) => Promise<AcpMcpServerSpec[]>
   log?: (msg: string) => void
 }
 
@@ -168,10 +188,14 @@ export class AcpSessionPool extends EventEmitter {
   private readonly sessions = new Map<string, ManagedAcpSession>()
   private readonly sessionEnvs = new Map<string, NodeJS.ProcessEnv | undefined>()
 
+  /** Effective process environment bound to this session's account (if isolated). */
+  accountEnvFor(session: ManagedAcpSession): NodeJS.ProcessEnv | undefined {
+    return this.sessionEnvs.get(session.dshSessionKey) ?? this.accountProvider.getAccountEnv?.(session.accountId)
+  }
+
   /** Where agy writes this session's per-call transcript, under the account's own HOME. */
   transcriptPaths(session: ManagedAcpSession): string[] {
-    const env = this.sessionEnvs.get(session.dshSessionKey) ?? this.accountProvider.getAccountEnv?.(session.accountId)
-    return transcriptCandidates(session.acpSessionId, env)
+    return transcriptCandidates(session.acpSessionId, this.accountEnvFor(session))
   }
   private readonly sessionUnsubs = new Map<string, () => void>()
   private readonly accountProvider: AccountProvider
@@ -333,8 +357,8 @@ export class AcpSessionPool extends EventEmitter {
     this.emitStatus()
   }
 
-  reportAccountFailure(accountId: string, model: string, error: unknown): void {
-    this.accountProvider.reportFailure?.(accountId, model, error)
+  reportAccountFailure(accountId: string, model: string, error: unknown, options?: AccountFailureOptions): void {
+    this.accountProvider.reportFailure?.(accountId, model, error, options)
     this.emitStatus()
   }
 
@@ -393,10 +417,18 @@ export class AcpSessionPool extends EventEmitter {
         const versionArgv = await this.deps.prepareArgv([bin, '--version'], policy, signal)
         await requireFileCredentialMode(versionArgv, lease.env, cwd, signal)
       }
-      const argv = await this.deps.prepareArgv([bin, '-p', '/usage', '--output-format', 'stream-json'], policy, signal)
-      const groups = await readAccountQuota(argv, lease.env, cwd, signal)
+      let groups = lease.directQuotaHome
+        ? await readDirectAccountQuota(lease.env, signal, { accountHome: lease.directQuotaHome })
+        : null
+      let source: 'direct' | 'cli' = 'direct'
+      if (!groups?.length) {
+        signal.throwIfAborted()
+        source = 'cli'
+        const argv = await this.deps.prepareArgv([bin, '-p', '/usage', '--output-format', 'stream-json'], policy, signal)
+        groups = await readAccountQuota(argv, lease.env, cwd, signal)
+      }
       signal.throwIfAborted()
-      const sample: AccountQuotaSample = { groups, sampledAt: Date.now() }
+      const sample: AccountQuotaSample = { groups, sampledAt: Date.now(), source }
       this.quotaSamples.set(id, sample)
       if (this.deps.getConfig().quotaAwareScheduling) {
         this.applySampleToScheduler(id, sample)
@@ -408,6 +440,7 @@ export class AcpSessionPool extends EventEmitter {
   private applySampleToScheduler(accountId: string, sample: AccountQuotaSample): void {
     if (!this.accountProvider.updateQuota) return
     const mapped = mapQuotaGroupsToFamilies(sample.groups)
+    this.accountProvider.clearQuotaSamples?.(accountId)
     for (const [family, buckets] of Object.entries(mapped)) {
       if (buckets) {
         this.accountProvider.updateQuota(accountId, family as Parameters<NonNullable<AccountProvider['updateQuota']>>[1], buckets)
@@ -424,6 +457,8 @@ export class AcpSessionPool extends EventEmitter {
       this.accountProvider.clearQuotaSamples?.()
     }
   }
+
+  supportsImageInput(): boolean { return this.initResult?.agentCapabilities?.promptCapabilities?.image === true }
 
   contextWindowFor(model: string): number | undefined {
     return this.observedWindows.get(model) ?? (model.startsWith('claude') ? 200_000 : model.startsWith('gemini') ? 1_048_576 : undefined)
@@ -490,12 +525,25 @@ export class AcpSessionPool extends EventEmitter {
       currentMode: s.currentMode,
       ...(s.title ? { title: s.title } : {}),
       ...(s.resumed ? { resumed: true } : {}),
+      ...(s.resumedVia ? { resumedVia: s.resumedVia } : {}),
+      ...(s.mcpTransport ? { mcpTransport: s.mcpTransport } : {}),
       contextUsed: s.contextUsed,
       contextSize: s.contextSize,
       lastActiveAt: s.lastActiveAt,
     }))
     const connected = Array.from(this.clients.values()).some((c) => c.isRunning)
     const mcpBridge = this.deps.getMcpBridgeSnapshot?.()
+    const capabilities: AcpCapabilitiesSnapshot | undefined = this.initResult
+      ? {
+          resumeSession: supportsSessionResume(this.initResult),
+          loadSession: supportsSessionLoad(this.initResult),
+          mcpHttp: supportsMcpHttp(this.initResult),
+          image: this.initResult.agentCapabilities?.promptCapabilities?.image === true,
+          audio: this.initResult.agentCapabilities?.promptCapabilities?.audio === true,
+          embeddedContext: this.initResult.agentCapabilities?.promptCapabilities?.embeddedContext === true,
+          systemPromptAppend: Boolean(this.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append),
+        }
+      : undefined
     return {
       providerId: PROVIDER_ID,
       enabled: cfg.enabled,
@@ -503,6 +551,7 @@ export class AcpSessionPool extends EventEmitter {
       agentName: this.initResult?.agentInfo?.name ?? null,
       agentVersion: this.initResult?.agentInfo?.version ?? null,
       tierName: this.cachedTier,
+      ...(capabilities ? { capabilities } : {}),
       activeSessions: sessions.length,
       ...(this.deps.sessionIndex ? { persistedSessions: this.deps.sessionIndex.size } : {}),
       sessions,
@@ -517,6 +566,7 @@ export class AcpSessionPool extends EventEmitter {
         defaultModel: cfg.defaultModel,
         defaultEffort: cfg.defaultEffort,
         mcpBridge: cfg.mcpBridge,
+        mcpExposeOverlappingTools: cfg.mcpExposeOverlappingTools,
         quotaAwareScheduling: cfg.quotaAwareScheduling,
         sessionIdleTtlMs: cfg.sessionIdleTtlMs,
         requestTimeoutMs: cfg.requestTimeoutMs,
@@ -665,6 +715,7 @@ export class AcpSessionPool extends EventEmitter {
   ): Promise<{ client: AcpClient; initResult: InitializeResult }> {
     const bin = this.deps.resolveBin()
     if (!bin) throw new Error('agy binary not found — install Antigravity CLI first')
+    // The host owns the writable roots. Never implicitly grant the credential or executable directory.
     const argv = await this.deps.prepareArgv([bin, 'acp'], policy, signal)
     signal.throwIfAborted()
     if (!argv[0] || this.disposed) throw new Error('ACP launch unavailable')
@@ -678,12 +729,14 @@ export class AcpSessionPool extends EventEmitter {
       exe = '/usr/bin/strace'
       this.deps.log?.(`ACP signal trace for "${policy.sessionId}": ${trace}`)
     }
-    const client = new AcpClient({ bin: exe, args, env, cwd: policy.workspaceRoot,
+    const temp = createPrivateProcessTemp(env, { argv })
+    const client = new AcpClient({ bin: exe, args, env: temp.env, cwd: policy.workspaceRoot,
+      onClose: () => { temp.cleanup() },
       defaultTimeoutMs: this.deps.getConfig().requestTimeoutMs, onPermission, onExit, onLog: this.deps.log })
     const stop = () => client.dispose(signal.reason)
     signal.addEventListener('abort', stop, { once: true })
     try {
-      client.start()
+      try { client.start() } catch (err) { temp.cleanup(); throw err }
       this.deps.log?.(`ACP started for "${policy.sessionId}" (pid=${client.pid}, executable=${argv[0]})`)
       const initResult = await client.initialize()
       this.initResult = initResult
@@ -790,62 +843,109 @@ export class AcpSessionPool extends EventEmitter {
         this.emitStatus()
       }
 
-      let launched = await this.newClient(policy, lease.env, opening.signal, makePermissionBridge(), makeExitHandler())
+      const leaseEnv = lease.env
+      let launched = await this.newClient(policy, leaseEnv, opening.signal, makePermissionBridge(), makeExitHandler())
       client = launched.client
       let supportsSystemPromptAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
       opening.signal.throwIfAborted()
-      let mcpServers = await this.deps.getMcpServers?.(key) ?? []
+      let mcpServers = await this.deps.getMcpServers?.(key, { preferHttp: supportsMcpHttp(launched.initResult) }) ?? []
       opening.signal.throwIfAborted()
 
       const persisted = !options?.forceNew ? this.deps.sessionIndex?.get(key) : undefined
-      const canAttemptLoad = Boolean(
+      const persistedMatches = Boolean(
         persisted &&
         persisted.accountId === lease.accountId &&
         persisted.cwd === cwd &&
-        persisted.policyFingerprint === fingerprint &&
-        supportsSessionLoad(launched.initResult),
+        persisted.policyFingerprint === fingerprint,
       )
 
       let sessionResult: SessionNewResult | undefined
       let resumedFromDisk = false
-      const bufferedLoadUpdates: SessionUpdatePayload[] = []
+      let resumedVia: 'resume' | 'load' | undefined
+      // Ignore replayed conversation content. Only the latest three kinds of metadata affect a restored session.
+      const bufferedLoadUpdates = new Map<string, SessionUpdatePayload>()
+      const rememberMetadata = (u: SessionUpdatePayload): void => {
+        if (!['session_info_update', 'config_option_update', 'usage_update'].includes(u.sessionUpdate)) return
+        bufferedLoadUpdates.delete(u.sessionUpdate)
+        bufferedLoadUpdates.set(u.sessionUpdate, u)
+      }
 
-      if (canAttemptLoad && persisted) {
-        const unsubReplay = client.onSessionUpdate(persisted.acpSessionId, (u) => {
-          bufferedLoadUpdates.push(u)
-        })
-        try {
-          const loadRes: SessionLoadResult = await client.sessionLoad({
-            sessionId: persisted.acpSessionId,
-            cwd,
-            mcpServers,
-            ...(supportsSystemPromptAppend && systemPrompt?.append
-              ? { _meta: { antigravity: { systemPrompt: { append: systemPrompt.append } } } }
-              : {}),
-          })
-          resumedFromDisk = true
-          sessionResult = {
-            ...loadRes,
-            sessionId: loadRes.sessionId || persisted.acpSessionId,
+      const respawnIfDead = async (): Promise<void> => {
+        if (client?.isRunning) return
+        client?.dispose()
+        this.deps.onSessionClosed?.(key)
+        opening.signal.throwIfAborted()
+        launched = await this.newClient(policy, leaseEnv, opening.signal, makePermissionBridge(), makeExitHandler())
+        client = launched.client
+        supportsSystemPromptAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
+        mcpServers = await this.deps.getMcpServers?.(key, { preferHttp: supportsMcpHttp(launched.initResult) }) ?? []
+        opening.signal.throwIfAborted()
+      }
+
+      if (persistedMatches && persisted) {
+        // Never inject DSH's host system prompt via `_meta.antigravity.systemPrompt.append`:
+        // Google Cloud Code upstream returns HTTP 429 RESOURCE_EXHAUSTED (triggering ~2.5m silent
+        // agy retries) when native `systemInstruction` contains third-party harness identity.
+        // Host instructions are delivered via `<host_system_instructions>` prompt blocks instead.
+        const resumePayload = {
+          sessionId: persisted.acpSessionId,
+          cwd,
+          mcpServers,
+        }
+
+        // Prefer lightweight `session/resume` (no full history replay storm); fall back to `session/load`.
+        if (supportsSessionResume(launched.initResult)) {
+          const unsubResume = client.onSessionUpdate(persisted.acpSessionId, rememberMetadata)
+          try {
+            const resumeRes: SessionResumeResult = await client.sessionResume(resumePayload)
+            resumedFromDisk = true
+            resumedVia = 'resume'
+            sessionResult = {
+              ...resumeRes,
+              sessionId: resumeRes.sessionId || persisted.acpSessionId,
+            }
+          } catch (resumeErr) {
+            opening.signal.throwIfAborted()
+            if (isTosViolationError(resumeErr) || isGeoUnsupportedError(resumeErr)) throw resumeErr
+            bufferedLoadUpdates.clear()
+            this.deps.log?.(
+              `ACP session/resume failed for "${key}" (${sanitizeDiagnosticText(String(resumeErr), 140)}); ${supportsSessionLoad(launched.initResult) ? 'falling back to session/load' : 'falling back to session/new'}`,
+            )
+            if (resumeErr instanceof AcpTimeoutError) client.dispose()
+            await respawnIfDead()
+          } finally {
+            unsubResume()
           }
-        } catch (loadErr) {
+        }
+
+        if (!sessionResult && supportsSessionLoad(launched.initResult)) {
+          const unsubReplay = client.onSessionUpdate(persisted.acpSessionId, rememberMetadata)
+          try {
+            const loadRes: SessionLoadResult = await client.sessionLoad({
+              ...resumePayload,
+              mcpServers,
+            })
+            resumedFromDisk = true
+            resumedVia = 'load'
+            sessionResult = {
+              ...loadRes,
+              sessionId: loadRes.sessionId || persisted.acpSessionId,
+            }
+          } catch (loadErr) {
+            opening.signal.throwIfAborted()
+            if (isTosViolationError(loadErr) || isGeoUnsupportedError(loadErr)) throw loadErr
+            this.deps.sessionIndex?.delete(key)
+            bufferedLoadUpdates.clear()
+            this.deps.log?.(
+              `ACP session/load failed for "${key}" (${sanitizeDiagnosticText(String(loadErr), 140)}); falling back to session/new`,
+            )
+            if (loadErr instanceof AcpTimeoutError) client.dispose()
+            await respawnIfDead()
+          } finally {
+            unsubReplay()
+          }
+        } else if (!sessionResult) {
           this.deps.sessionIndex?.delete(key)
-          bufferedLoadUpdates.length = 0
-          this.deps.log?.(
-            `ACP session/load failed for "${key}" (${sanitizeDiagnosticText(String(loadErr), 140)}); falling back to session/new`,
-          )
-          if (!client.isRunning) {
-            client.dispose()
-            this.deps.onSessionClosed?.(key)
-            opening.signal.throwIfAborted()
-            launched = await this.newClient(policy, lease.env, opening.signal, makePermissionBridge(), makeExitHandler())
-            client = launched.client
-            supportsSystemPromptAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
-            mcpServers = await this.deps.getMcpServers?.(key) ?? []
-            opening.signal.throwIfAborted()
-          }
-        } finally {
-          unsubReplay()
         }
       }
 
@@ -853,9 +953,6 @@ export class AcpSessionPool extends EventEmitter {
         sessionResult = await client.sessionNew({
           cwd,
           mcpServers,
-          ...(supportsSystemPromptAppend && systemPrompt?.append
-            ? { _meta: { antigravity: { systemPrompt: { append: systemPrompt.append } } } }
-            : {}),
         })
       }
 
@@ -863,12 +960,13 @@ export class AcpSessionPool extends EventEmitter {
       if (policyKey(this.policy(key)) !== fingerprint) throw new Error('DSH session policy changed during startup')
       const { routes: modelRoutes, models } = this.captureCatalogFromSession(sessionResult)
       const configOptions = sessionResult.configOptions ?? []
-      const appliedSystemHash =
-        supportsSystemPromptAppend && systemPrompt
-          ? systemPrompt.hash
-          : resumedFromDisk
-            ? (persisted?.appliedSystemHash ?? null)
-            : null
+      const appliedSystemHash = resumedFromDisk ? (persisted?.appliedSystemHash ?? null) : null
+      const mcpTransport: ManagedAcpSession['mcpTransport'] =
+        mcpServers.length === 0
+          ? 'none'
+          : mcpServers.some((s) => s.type === 'http')
+            ? 'http'
+            : 'stdio'
       const session: ManagedAcpSession = {
         models,
         modelRoutes,
@@ -881,6 +979,11 @@ export class AcpSessionPool extends EventEmitter {
         currentMode: findCurrentOption(configOptions, 'mode') ?? sessionResult.modes?.currentModeId ?? '',
         ...(resumedFromDisk && persisted?.title ? { title: persisted.title } : {}),
         ...(resumedFromDisk ? { resumed: true } : {}),
+        ...(resumedVia ? { resumedVia } : {}),
+        mcpTransport,
+        ...(launched.initResult.agentCapabilities?.promptCapabilities
+          ? { promptCapabilities: launched.initResult.agentCapabilities.promptCapabilities }
+          : {}),
         configOptions,
         hasMcpServers: mcpServers.length > 0,
         supportsSystemPromptAppend,
@@ -889,7 +992,7 @@ export class AcpSessionPool extends EventEmitter {
         contextSize: 0,
         lastActiveAt: Date.now(),
       }
-      for (const replayUpdate of bufferedLoadUpdates) {
+      for (const replayUpdate of bufferedLoadUpdates.values()) {
         this.applySessionMetadataUpdate(key, session, replayUpdate)
       }
       this.clients.set(key, client)
@@ -948,6 +1051,7 @@ export class AcpSessionPool extends EventEmitter {
       )
       let client: AcpClient | undefined
       let acpSessionId: string | undefined
+      let helperInit: InitializeResult | undefined
       let unsub: (() => void) | undefined
       const onAbort = (): void => {
         if (acpSessionId && client?.isRunning) client.sessionCancel(acpSessionId)
@@ -964,15 +1068,12 @@ export class AcpSessionPool extends EventEmitter {
           denyAllPermissions,
         )
         client = launched.client
-        const supportsAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
+        helperInit = launched.initResult
         runSignal.throwIfAborted()
 
         const res = await client.sessionNew({
           cwd,
           mcpServers: [],
-          ...(supportsAppend && params.systemPromptAppend
-            ? { _meta: { antigravity: { systemPrompt: { append: params.systemPromptAppend } } } }
-            : {}),
         })
         acpSessionId = res.sessionId
         runSignal.throwIfAborted()
@@ -1037,9 +1138,16 @@ export class AcpSessionPool extends EventEmitter {
         runSignal.addEventListener('abort', onAbort, { once: true })
         runSignal.throwIfAborted()
 
-        const promptBlocks = supportsAppend ? params.prompt : [params.systemFallbackBlock, ...params.prompt]
+        const promptBlocks = [params.systemFallbackBlock, ...params.prompt]
         const timeoutMs = params.timeoutMs ?? Math.min(cfg.requestTimeoutMs, 90_000)
+        const watcher = createTurnOutcomeWatcher(acpSessionId, lease.env)
         const result = await client.sessionPrompt({ sessionId: acpSessionId, prompt: promptBlocks }, timeoutMs)
+        runSignal.throwIfAborted()
+        const hidden = watcher.check(result)
+        if (hidden) {
+          this.recordTurnUsage(result.usage)
+          throw Object.assign(new Error(`${hidden.kind === 'quota' ? 'QUOTA_EXHAUSTED' : hidden.code}: ${hidden.message}`), { resetAt: hidden.resetAt })
+        }
         this.reportAccountSuccess(lease.accountId, requestedModel)
         this.recordTurnUsage(result.usage)
         return result
@@ -1064,22 +1172,13 @@ export class AcpSessionPool extends EventEmitter {
           }
           throw err
         }
-        this.reportAccountFailure(lease.accountId, requestedModel, err)
+        const resetAt = err instanceof Error && 'resetAt' in err && typeof err.resetAt === 'number' ? err.resetAt : undefined
+        this.reportAccountFailure(lease.accountId, requestedModel, err, { resetAt })
         throw err
       } finally {
         runSignal.removeEventListener('abort', onAbort)
         unsub?.()
-        if (acpSessionId && client?.isRunning && !runSignal.aborted) {
-          let timer: ReturnType<typeof setTimeout> | undefined
-          await Promise.race([
-            client.sessionClose(acpSessionId).catch(() => {}),
-            new Promise<void>(resolve => {
-              timer = setTimeout(resolve, 1_000)
-              timer.unref?.()
-            }),
-          ])
-          if (timer) clearTimeout(timer)
-        }
+        if (!runSignal.aborted) await this.finishHelperSession(client, helperInit, acpSessionId)
         client?.dispose()
         lease.release()
       }
@@ -1095,8 +1194,6 @@ export class AcpSessionPool extends EventEmitter {
     const route = desired.model ? session.modelRoutes.get(desired.model) : undefined
     const model = route?.value ?? desired.model
     if (model && model !== session.currentModel) {
-      session.contextUsed = null
-      session.contextSize = 0
       if (route?.kind === 'legacy') {
         await client.request('session/set_model', { sessionId: session.acpSessionId, modelId: model }, 15_000)
         session.currentModel = model
@@ -1119,6 +1216,8 @@ export class AcpSessionPool extends EventEmitter {
           base.nativeEffort = thought.currentValue
         }
       }
+      session.contextUsed = null
+      session.contextSize = 0
     }
     const fixedEffort = route?.kind === 'config' ? route.effort : undefined
     const effort = route?.kind === 'legacy' ? undefined : fixedEffort ?? desired.effort
@@ -1213,6 +1312,17 @@ export class AcpSessionPool extends EventEmitter {
     return await this.runCatalogProbe(cwd)
   }
 
+  // Only the child which just created this disposable session may retire it. If the peer
+  // has no native delete operation, close it and leave shared profile files untouched.
+  private async finishHelperSession(client?: AcpClient, init?: InitializeResult, id?: string): Promise<void> {
+    if (!id || !client?.isRunning || [...this.sessions.values()].some(s => s.acpSessionId === id) ||
+        this.deps.sessionIndex?.hasNativeSession(id)) return
+    const capability = init?.agentCapabilities?.sessionCapabilities?.delete
+    const method = capability === true || (capability && typeof capability === 'object' && !Array.isArray(capability))
+      ? 'session/delete' : 'session/close'
+    await client.request(method, { sessionId: id }, 1_000).catch(() => {})
+  }
+
   private async probeCatalog(cwd?: string, expectedGen?: number): Promise<AcpModelOption[]> {
     const cfg = this.deps.getConfig()
     const maxAccounts = Math.max(1, cfg.accounts.filter((a) => a.enabled !== false).length || 1)
@@ -1224,16 +1334,21 @@ export class AcpSessionPool extends EventEmitter {
         triedAccounts.size > 0 ? triedAccounts : undefined,
       )
       let client: AcpClient | undefined
+      const root = cwd || cfg.workspaceRoot || process.cwd()
+      let probeId: string | undefined
+      let probeInit: InitializeResult | undefined
       try {
         await this.assertEgressAllowed(lease.accountId, lease.env, this.lifetime.signal)
-        const root = cwd || cfg.workspaceRoot || process.cwd()
         // No initiating agent: never prompt, attach MCP, or start an unrestricted helper.
-        client = (await this.newClient({ sessionId: '__catalog__', workspaceRoot: root, mode: 'read-only' }, lease.env, this.lifetime.signal)).client
+        const launched = await this.newClient({ sessionId: '__catalog__', workspaceRoot: root, mode: 'read-only' }, lease.env, this.lifetime.signal)
+        client = launched.client
+        probeInit = launched.initResult
         this.lifetime.signal.throwIfAborted()
         const stop = () => client?.dispose()
         this.lifetime.signal.addEventListener('abort', stop, { once: true })
         try {
           const res = await client.sessionNew({ cwd: root, mcpServers: [] })
+          probeId = res.sessionId
           if (expectedGen !== undefined && expectedGen !== this.catalogGeneration) {
             return this.cachedModels
           }
@@ -1262,6 +1377,7 @@ export class AcpSessionPool extends EventEmitter {
         }
         throw err
       } finally {
+        if (!this.lifetime.signal.aborted) await this.finishHelperSession(client, probeInit, probeId)
         client?.dispose()
         lease.release()
       }

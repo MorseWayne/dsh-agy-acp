@@ -3,7 +3,7 @@ export const MIRROR_TOOL_NAME = 'agy_acp_tool'
 export const WRAPPER_TOOL_NAME = 'run_code'
 export const LOW_QUOTA_THRESHOLD = 0.15
 
-export type ModelFamily = 'gemini-pro' | 'gemini-flash' | 'claude' | 'other'
+export type ModelFamily = 'gemini-pro' | 'gemini-flash' | 'claude' | 'gpt' | 'other'
 
 export interface AccountProfileConfig {
   id: string
@@ -39,6 +39,7 @@ export interface AccountQuotaGroup {
 export interface AccountQuotaSample {
   sampledAt: number
   groups: AccountQuotaGroup[]
+  source?: 'direct' | 'cli'
 }
 
 export type GeoFenceMode = 'block' | 'strict' | 'warn' | 'off'
@@ -53,7 +54,7 @@ export interface AccountEgressSnapshot {
   ipMasked: string | null
   /** Actual outbound routing mode used for this probe. */
   proxyMode: 'proxy' | 'direct'
-  /** Probe source identifier, e.g. "cloudflare-trace" | "ipsb" | "runtime-400". */
+  /** Probe source identifier, e.g. "google-aistudio" | "google-cloudcode" | "runtime-400". */
   probeSource: string | null
   checkedAt: number
   expiresAt: number
@@ -80,6 +81,7 @@ export interface AccountHealthSnapshot {
 
 export interface PersistedConfigPatch {
   mcpBridge?: boolean
+  mcpExposeOverlappingTools?: boolean
   quotaAwareScheduling?: boolean
   defaultModel?: string
   defaultEffort?: string
@@ -100,6 +102,8 @@ export interface PluginConfig {
   requestTimeoutMs: number
   /** Attach session-scoped reverse MCP bridge via ACP session/new. */
   mcpBridge: boolean
+  /** Expose DSH base tools that overlap with Antigravity native tools over reverse MCP (default: false). */
+  mcpExposeOverlappingTools?: boolean
   /** Opt-in: feed sampled account quotas into MultiAccountPool scheduler weights (default: false). */
   quotaAwareScheduling: boolean
   /** Local egress geo-fence protection policy (default: 'block'). */
@@ -129,6 +133,8 @@ export interface SessionSummary {
   currentMode: string
   title?: string
   resumed?: boolean
+  resumedVia?: 'resume' | 'load'
+  mcpTransport?: 'http' | 'stdio' | 'none'
   contextUsed: number | null
   contextSize: number
   lastActiveAt: number
@@ -140,9 +146,20 @@ export interface McpBridgeSnapshot {
   inFlightCalls: number
   totalCalls: number
   failedCalls: number
+  transport?: 'http' | 'stdio' | 'mixed'
   lastToolName: string | null
   lastCallAt: number | null
   lastError: string | null
+}
+
+export interface AcpCapabilitiesSnapshot {
+  resumeSession?: boolean
+  loadSession?: boolean
+  mcpHttp?: boolean
+  image?: boolean
+  audio?: boolean
+  embeddedContext?: boolean
+  systemPromptAppend?: boolean
 }
 
 export interface UsageTotals {
@@ -160,6 +177,7 @@ export interface StatusSnapshot {
   agentName: string | null
   agentVersion: string | null
   tierName: string | null
+  capabilities?: AcpCapabilitiesSnapshot
   activeSessions: number
   persistedSessions?: number
   sessions: SessionSummary[]
@@ -174,6 +192,7 @@ export interface StatusSnapshot {
     defaultModel: string
     defaultEffort: string
     mcpBridge: boolean
+    mcpExposeOverlappingTools?: boolean
     quotaAwareScheduling?: boolean
     sessionIdleTtlMs: number
     requestTimeoutMs: number
@@ -195,18 +214,24 @@ export interface AccountLease {
   release: () => void
 }
 
+export interface AccountFailureOptions {
+  /** Upstream-provided cooldown reset timestamp (Unix ms) if available. */
+  resetAt?: number
+  code?: string
+}
+
 export interface AccountProvider {
   acquire(sessionKey: string, model: string, excludeAccountIds?: ReadonlySet<string>): Promise<AccountLease>
   reportSuccess?(accountId: string, model: string): void
-  reportFailure?(accountId: string, model: string, error: unknown): void
+  reportFailure?(accountId: string, model: string, error: unknown, options?: AccountFailureOptions): void
   updateQuota?(
     accountId: string,
     family: ModelFamily,
     buckets: { fiveHour?: QuotaBucketState; sevenDay?: QuotaBucketState },
   ): void
-  clearQuotaSamples?(): void
+  clearQuotaSamples?(accountId?: string): void
   /** Acquire only this profile's environment, without invoking model selection or changing stickiness. */
-  acquireQuotaLease?(accountId: string): Promise<AccountLease & { requiresFileCredentialMode?: boolean }>
+  acquireQuotaLease?(accountId: string): Promise<AccountLease & { requiresFileCredentialMode?: boolean; directQuotaHome?: string }>
   /** Read effective environment for egress probing without mutating lease counters or stickiness. */
   getAccountEnv?(accountId: string): NodeJS.ProcessEnv | undefined
   markGeoBlocked?(accountId: string, untilMs: number, reason?: string): void

@@ -1,4 +1,5 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import type { ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawnOwnedProcess } from './process-tree.ts'
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import type {
@@ -14,6 +15,8 @@ import type {
   SessionNewResult,
   SessionPromptParams,
   SessionPromptResult,
+  SessionResumeParams,
+  SessionResumeResult,
   SessionSetConfigOptionParams,
   SessionSetConfigOptionResult,
   SessionUpdateNotification,
@@ -33,13 +36,24 @@ export interface AcpClientOptions {
   cwd?: string
   env?: NodeJS.ProcessEnv
   defaultTimeoutMs?: number
+  clientInfo?: { name: string; version: string }
   onPermission?: PermissionHandler
   onLog?: (msg: string) => void
   onExit?: (code: number | null, signal: NodeJS.Signals | null, client: AcpClient) => void
+  /** Called on real stdio close, including spawn errors and caller-initiated disposal. */
+  onClose?: () => void
 }
 
 interface PendingCall {
+  id: JsonRpcId
   method: string
+  sessionId?: string
+  timeoutMs: number
+  inactivityMode: boolean
+  pausedCount: number
+  readonly activeTools: Set<string>
+  cancelling: boolean
+  timerMode?: 'idle' | 'tool'
   stderrStartOffset: number
   resolve: (value: unknown) => void
   reject: (err: Error) => void
@@ -102,6 +116,27 @@ export class AcpProcessExitError extends Error {
 const MAX_STDERR_CHUNKS = 50
 const MAX_STDERR_BYTES = 64 * 1024
 const EXIT_CLOSE_FALLBACK_MS = 250
+const CANCEL_GRACE_MS = 2_000
+// Missing terminal tool notifications must not disable liveness indefinitely.
+const TOOL_GRACE_MS = 30 * 60_000
+// Output of the running prompt. Session metadata notifications (`session_info_update`,
+// `usage_update`, `available_commands_update`, `config_option_update`) do not reset inactivity.
+const PROMPT_ACTIVITY_UPDATES: ReadonlySet<string> = new Set([
+  'agent_message',
+  'agent_message_chunk',
+  'agent_thought',
+  'agent_thought_chunk',
+  'tool_call',
+  'tool_call_update',
+  'tool_call_content_chunk',
+  'terminal_output_chunk',
+  'terminal_update',
+  'plan',
+  'plan_update',
+  'plan_removed',
+  'compaction_update',
+  'compaction_summary_chunk',
+])
 
 /**
  * Bidirectional JSON-RPC 2.0 client over stdio for `agy acp`.
@@ -110,6 +145,7 @@ const EXIT_CLOSE_FALLBACK_MS = 250
  */
 export class AcpClient {
   private child: ChildProcessWithoutNullStreams | null = null
+  private stopChild?: () => void
   private rl: ReadlineInterface | null = null
   private spawnedPid?: number
   get pid(): number | undefined { return this.spawnedPid }
@@ -167,13 +203,8 @@ export class AcpClient {
     this.stderrBaseOffset = 0
 
     const args = this.opts.args ?? ['acp']
-    const child = spawn(this.opts.bin, args, {
-      cwd: this.opts.cwd || process.cwd(),
-      env: this.opts.env ?? process.env,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      // Own the local process group so a sandbox wrapper is not the only process stopped.
-      detached: process.platform !== 'win32',
-    })
+    const { child, stop } = spawnOwnedProcess(this.opts.bin, args, this.opts.cwd || process.cwd(), this.opts.env ?? process.env)
+    this.stopChild = stop
     this.spawnedPid = child.pid
     this.child = child
 
@@ -183,6 +214,7 @@ export class AcpClient {
     })
 
     child.stderr.on('data', (chunk: Buffer) => {
+      if (this.child !== child) return
       const text = chunk.toString('utf8')
       const bytes = Buffer.byteLength(text, 'utf8')
       this.stderrRing.push(text)
@@ -208,19 +240,23 @@ export class AcpClient {
 
     const rl = createInterface({ input: child.stdout, crlfDelay: Infinity })
     this.rl = rl
-    rl.on('line', (line) => this.handleLine(line))
+    rl.on('line', (line) => { if (this.child === child) this.handleLine(line) })
 
     child.on('error', (err) => {
+      if (this.child !== child) return
       this.opts.onLog?.(`agy acp spawn error: ${sanitizeDiagnosticText(err.message, 200)}`)
       this.settleProcessTermination(null, null, err)
     })
 
     child.on('exit', (code, signal) => {
-      if (this.disposedByCaller) return
+      if (this.child !== child || this.disposedByCaller) return
       this.closed = true
       if (!this.exitSettled && !this.exitFallbackTimer) {
         this.exitFallbackTimer = setTimeout(() => {
           this.exitFallbackTimer = null
+          child.stdin.destroy()
+          child.stdout.destroy()
+          child.stderr.destroy()
           this.settleProcessTermination(code, signal)
         }, EXIT_CLOSE_FALLBACK_MS)
         this.exitFallbackTimer.unref?.()
@@ -228,8 +264,9 @@ export class AcpClient {
     })
 
     // Wait for `close` so stdout/stderr pipes are completely drained before building diagnostics.
-    child.on('close', (code, signal) => {
-      this.settleProcessTermination(code, signal)
+    child.once('close', (code, signal) => {
+      try { if (this.child === child) this.settleProcessTermination(code, signal) }
+      finally { this.opts.onClose?.() }
     })
   }
 
@@ -253,7 +290,12 @@ export class AcpClient {
     }
   }
 
-  async request<T>(method: string, params?: unknown, timeoutMs?: number): Promise<T> {
+  async request<T>(
+    method: string,
+    params?: unknown,
+    timeoutMs?: number,
+    options?: { sessionId?: string; inactivity?: boolean },
+  ): Promise<T> {
     if (!this.isRunning || !this.child) {
       if (!this.disposedByCaller) {
         if (this.lastExitError) throw this.lastExitError
@@ -275,18 +317,19 @@ export class AcpClient {
 
     return new Promise<T>((resolve, reject) => {
       const entry: PendingCall = {
+        id,
         method,
+        sessionId: options?.sessionId,
+        timeoutMs: limit,
+        inactivityMode: Boolean(options?.inactivity),
+        pausedCount: 0,
+        activeTools: new Set(),
+        cancelling: false,
         stderrStartOffset,
         resolve: resolve as (v: unknown) => void,
         reject,
       }
-      if (limit > 0) {
-        entry.timer = setTimeout(() => {
-          this.pending.delete(id)
-          reject(new AcpTimeoutError(method, limit, sanitizeDiagnosticText(this.readStderrSince(entry.stderrStartOffset))))
-        }, limit)
-        entry.timer.unref?.()
-      }
+      this.armPendingTimer(entry)
       this.pending.set(id, entry)
       this.child!.stdin.write(payload, (err) => {
         if (err) {
@@ -309,6 +352,44 @@ export class AcpClient {
     })
   }
 
+  private armPendingTimer(entry: PendingCall): void {
+    if (entry.cancelling) return // fixed cancel deadline, never extended by notifications
+    const mode = entry.activeTools.size ? 'tool' : 'idle'
+    if (entry.timer && mode === 'tool' && entry.timerMode === 'tool' && entry.pausedCount === 0) return
+    if (entry.timer) {
+      clearTimeout(entry.timer)
+      entry.timer = undefined
+    }
+    if (entry.timeoutMs <= 0 || entry.pausedCount > 0) return
+    entry.timerMode = mode
+    const limit = mode === 'tool' ? Math.max(entry.timeoutMs, TOOL_GRACE_MS) : entry.timeoutMs
+    entry.timer = setTimeout(() => {
+      this.pending.delete(entry.id)
+      entry.reject(
+        new AcpTimeoutError(
+          entry.method,
+          limit,
+          sanitizeDiagnosticText(this.readStderrSince(entry.stderrStartOffset)),
+        ),
+      )
+    }, limit)
+    entry.timer.unref?.()
+  }
+
+  private touchSessionTimers(sessionId: string, update: SessionUpdatePayload): void {
+    if (!PROMPT_ACTIVITY_UPDATES.has(update.sessionUpdate)) return
+    for (const entry of this.pending.values()) {
+      if (!entry.inactivityMode || entry.sessionId !== sessionId || entry.cancelling) continue
+      if ((update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') &&
+        typeof update.toolCallId === 'string' && update.toolCallId) {
+        if (update.status === 'pending' || update.status === 'in_progress' ||
+            (update.status == null && update.sessionUpdate === 'tool_call')) entry.activeTools.add(update.toolCallId)
+        else if (update.status === 'completed' || update.status === 'failed') entry.activeTools.delete(update.toolCallId)
+      }
+      this.armPendingTimer(entry)
+    }
+  }
+
   notify(method: string, params?: unknown): void {
     if (!this.isRunning || !this.child) return
     const payload = JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n'
@@ -328,7 +409,7 @@ export class AcpClient {
         fs: { readTextFile: false, writeTextFile: false },
         terminal: false,
       },
-      clientInfo: { name: 'dsh-agy-acp', version: '0.4.2' },
+      clientInfo: this.opts.clientInfo ?? { name: 'dsh-agy-acp', version: '0.5.0' },
       ...params,
     }, 15_000)
   }
@@ -341,16 +422,35 @@ export class AcpClient {
     return this.request<SessionLoadResult>('session/load', params, 30_000)
   }
 
+  sessionResume(params: SessionResumeParams): Promise<SessionResumeResult> {
+    return this.request<SessionResumeResult>('session/resume', params, 30_000)
+  }
+
   sessionSetConfigOption(params: SessionSetConfigOptionParams): Promise<SessionSetConfigOptionResult> {
     return this.request<SessionSetConfigOptionResult>('session/set_config_option', params, 15_000)
   }
 
   sessionPrompt(params: SessionPromptParams, timeoutMs?: number): Promise<SessionPromptResult> {
-    return this.request<SessionPromptResult>('session/prompt', params, timeoutMs)
+    return this.request<SessionPromptResult>('session/prompt', params, timeoutMs, {
+      sessionId: params.sessionId,
+      inactivity: true,
+    })
   }
 
   sessionCancel(sessionId: string): void {
+    const prompts = [...this.pending.values()].filter(entry => entry.method === 'session/prompt' && entry.sessionId === sessionId)
+    if (prompts.length && prompts.every(entry => entry.cancelling)) return
     this.notify('session/cancel', { sessionId })
+    for (const entry of prompts) {
+      if (entry.cancelling) continue
+      entry.cancelling = true
+      if (entry.timer) clearTimeout(entry.timer)
+      entry.timer = setTimeout(() => {
+        // Without a prompt response we cannot safely reuse this process for another turn.
+        this.dispose(new Error('ACP prompt cancellation not acknowledged; process terminated'))
+      }, CANCEL_GRACE_MS)
+      entry.timer.unref?.()
+    }
   }
 
   sessionClose(sessionId: string): Promise<Record<string, never>> {
@@ -368,13 +468,14 @@ export class AcpClient {
     this.failAllPending(reason)
     this.rl?.close()
     this.rl = null
+    this.stopChild?.()
+    this.stopChild = undefined
     if (this.child) {
-      try {
-        if (process.platform !== 'win32' && this.child.pid) process.kill(-this.child.pid, 'SIGKILL')
-        else this.child.kill()
-      } catch {
-        // ignore
-      }
+      // A non-delegated detached grandchild may retain inherited stdio. Do not leave
+      // those pipes (or a caller's onClose cleanup) waiting indefinitely.
+      this.child.stdin.destroy()
+      this.child.stdout.destroy()
+      this.child.stderr.destroy()
       this.child = null
     }
     this.sessionListeners.clear()
@@ -425,6 +526,7 @@ export class AcpClient {
       return
     }
 
+    if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return
     // 1. Server -> Client RPC request (has both `id` and `method`)
     if (msg.id !== undefined && typeof msg.method === 'string') {
       void this.handleServerRequest(msg.id as JsonRpcId, msg.method, msg.params)
@@ -449,7 +551,9 @@ export class AcpClient {
     // 3. Notification (e.g. session/update)
     if (msg.method === 'session/update' && msg.params && typeof msg.params === 'object') {
       const notif = msg.params as SessionUpdateNotification
-      if (notif.sessionId && notif.update) {
+      if (typeof notif.sessionId === 'string' && notif.sessionId && notif.update && typeof notif.update === 'object' &&
+          typeof notif.update.sessionUpdate === 'string') {
+        this.touchSessionTimers(notif.sessionId, notif.update)
         const set = this.sessionListeners.get(notif.sessionId)
         if (set) {
           for (const fn of set) {
@@ -475,13 +579,24 @@ export class AcpClient {
     try {
       if (method === 'session/request_permission') {
         const req = params as RequestPermissionParams
-        let result: RequestPermissionResult
-        if (this.opts.onPermission) {
-          result = await this.opts.onPermission(req)
-        } else {
-          result = { outcome: { outcome: 'cancelled' } }
+        const owners = [...this.pending.values()].filter(entry => entry.method === 'session/prompt' && entry.sessionId === req?.sessionId)
+        const owner = owners.length === 1 ? owners[0] : undefined
+        const child = this.child
+        let result: RequestPermissionResult = { outcome: { outcome: 'cancelled' } }
+        if (owner && !owner.cancelling && this.opts.onPermission) {
+          owner.pausedCount++
+          this.armPendingTimer(owner)
+          try {
+            const choice = await this.opts.onPermission(req)
+            if (this.pending.get(owner.id) === owner && !owner.cancelling) result = choice
+          } catch (err) {
+            if (this.child === child && this.pending.get(owner.id) === owner && !owner.cancelling) throw err
+          } finally {
+            owner.pausedCount--
+            if (this.pending.get(owner.id) === owner) this.armPendingTimer(owner)
+          }
         }
-        this.writeResponse(id, result)
+        if (this.child === child) this.writeResponse(id, result)
         return
       }
       this.writeResponse(id, {})

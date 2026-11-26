@@ -14,7 +14,10 @@ interface PermissionHost {
   }
   sandbox?: { confine(argv: readonly string[], policy: FilePolicy, signal?: AbortSignal): Promise<{ argv: string[]; enforcement: string }> }
 }
-export function hostPermissions(host: PermissionHost) {
+export interface QuestionService {
+  ask(request: { agent: SessionAgent; signal: AbortSignal; questions: Array<{ id: string; question: string; options: Array<{ label: string }> }> }): Promise<{ answers: Array<{ id: string; selected: string[]; custom?: string }> }>
+}
+export function hostPermissions(host: PermissionHost, questions?: () => QuestionService | undefined) {
   function agent(key: string): SessionAgent {
     const owner = host.agents.get(key)
     if (!owner || owner.session.id !== key) throw new Error('No live DSH session owns this Antigravity call')
@@ -39,7 +42,19 @@ export function hostPermissions(host: PermissionHost) {
       const deadline = AbortSignal.any([signal, AbortSignal.timeout(5 * 60_000)])
       return decidePermission(req, () => readPolicy(key), reason => host.approval.request({
         agent: agent(key), toolName: `agy:${req.toolCall.name ?? req.toolCall.kind ?? 'tool'}`, reason, signal: deadline,
-      }), deadline, launchPolicy)
+      }), deadline, launchPolicy, async ({toolCall, options}) => {
+        const owner = agent(key)
+        const id = toolCall.toolCallId
+        const labels = options.map((o, i) => `${i + 1}. ${(o.name?.trim() || o.optionId).slice(0, 240)}`)
+        const reply = await questions?.()?.ask({ agent: owner, signal: deadline, questions: [{
+          id, question: toolCall.title?.trim().slice(0, 2000) || '请选择一项',
+          options: labels.map(label => ({ label })),
+        }] })
+        const answer = reply?.answers[0]
+        if (!answer || reply?.answers.length !== 1 || answer.id !== id || answer.custom ||
+            answer.selected.length !== 1 || owner !== agent(key)) return undefined
+        return options[labels.indexOf(answer.selected[0]!)]?.optionId
+      })
     },
   }
 }

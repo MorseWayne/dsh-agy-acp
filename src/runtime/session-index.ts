@@ -155,6 +155,11 @@ export class SessionIndex {
     }
   }
 
+  hasNativeSession(id: string): boolean {
+    this.ensureLoaded()
+    return [...this.entries.values()].some(binding => binding.acpSessionId === id)
+  }
+
   get(dshSessionKey: string): PersistedSessionBinding | undefined {
     this.ensureLoaded()
     const item = this.entries.get(dshSessionKey)

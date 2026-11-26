@@ -120,6 +120,21 @@ for (const node of graph.keys()) {
   }
 }
 
+// Legacy integration tests still have real-time waits. Ratchet their count per file;
+// new regressions (especially offline replay) should use protocol barriers or a mock clock.
+const legacyTimerCalls = new Map([
+  ['test/phase2.test.ts', 2], ['test/phase3.test.ts', 3],
+  ['test/egress-guard.test.ts', 1], ['test/adapter.e2e.test.ts', 3],
+])
+for (const file of walkFiles(path.join(ROOT, 'test')).filter(name => /\.test\.[cm]?[jt]sx?$/.test(name))) {
+  const rel = path.relative(ROOT, file).replaceAll('\\', '/')
+  const source = readFileSync(file, 'utf8')
+  const count = [...source.matchAll(/\bsetTimeout\s*\(/g)].length
+  if (count > (legacyTimerCalls.get(rel) ?? 0) || /['"](?:node:)?timers\/promises['"]/.test(source)) {
+    violations.push(`[test-time] ${rel}: avoid wall-clock waits; use a protocol barrier or injected clock`)
+  }
+}
+
 if (violations.length > 0) {
   console.error(`Architecture lint failed (${violations.length} violation(s)):`)
   for (const v of violations) {

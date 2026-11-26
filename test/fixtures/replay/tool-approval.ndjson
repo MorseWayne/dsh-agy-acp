@@ -1,0 +1,18 @@
+{"expect":{"id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"fixture","version":"0"}}}}
+{"emit":{"id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"mcpCapabilities":{"http":true,"sse":true},"promptCapabilities":{"audio":false,"embeddedContext":true,"image":false}}}}}
+{"expect":{"id":2,"method":"session/new","params":{"cwd":"/fixture","mcpServers":[]}}}
+{"emit":{"id":2,"result":{"sessionId":"s"}}}
+{"expect":{"id":3,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"type":"text","text":"fixture"}]}}}
+{"emit":{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"a","title":"Fixture tool","kind":"execute","status":"pending"}}}}
+{"emit":{"id":"approval","method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"a","title":"Fixture tool","kind":"execute","status":"pending"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}}
+{"expect":{"id":"approval","result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}}}
+{"emit":{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"a","status":"in_progress"}}}}
+{"emit":{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"b","status":"in_progress"}}}}
+{"emit":{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"a","status":"completed","rawOutput":{"exitCode":0,"stdout":"","stderr":""}}}}}
+{"expect":{"id":4,"method":"replay/advance"}}
+{"emit":{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"b","status":"failed"}}}}
+{"emit":{"id":4,"result":{}}}
+{"expect":{"id":5,"method":"replay/advance"}}
+{"emit":{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Fixture complete."}}}}}
+{"emit":{"id":3,"result":{"stopReason":"end_turn"}}}
+{"emit":{"id":5,"result":{}}}

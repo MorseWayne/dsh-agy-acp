@@ -3,6 +3,7 @@ import {
   type AccountEgressSnapshot,
   type AccountHealthSnapshot,
   type AccountQuotaSample,
+  type GeoFenceMode,
   type QuotaBucketState,
   type StatusSnapshot,
 } from '../common/types.ts'
@@ -91,26 +92,33 @@ export function lowQuotaWarnings(
   return out
 }
 
-export function formatEgressBadge(egress: AccountEgressSnapshot | undefined): EgressBadgeDisplay {
+export function formatEgressProbeSource(probeSource: string | null | undefined): string | null {
+  if (probeSource === 'google-aistudio') return 'Google 匿名预检'
+  if (probeSource === 'google-cloudcode') return 'Google API 连通检查'
+  if (probeSource === 'runtime-400') return '运行时 400 熔断'
+  return null
+}
+
+export function formatEgressBadge(egress: AccountEgressSnapshot | undefined, mode: GeoFenceMode = 'block'): EgressBadgeDisplay {
   if (!egress) {
     return { label: '出口：待检测', tone: 'idle' }
   }
   const modeLabel = egress.proxyMode === 'proxy' ? '代理' : '直连'
   if (egress.status === 'supported') {
     return {
-      label: `出口：${egress.country ?? '合规'}（${modeLabel}）· 合规`,
+      label: `出口：${egress.country ?? 'Google 可用'}（${modeLabel}）· 合规`,
       tone: 'success',
     }
   }
   if (egress.status === 'unsupported') {
-    const region = egress.country ?? (egress.probeSource === 'runtime-400' ? '上游 400' : '受限区')
+    const region = egress.country ?? (egress.probeSource === 'runtime-400' ? '上游 400' : 'Google 受限区')
     return {
-      label: `出口：${region}（${modeLabel}）· 不支持 Gemini（已拦截）`,
+      label: `出口：${region}（${modeLabel}）· 不支持 Gemini（${mode === 'off' ? '本地防护关闭' : mode === 'warn' ? '仅告警' : '策略拦截'}）`,
       tone: 'error',
     }
   }
   return {
-    label: `出口：探测异常（${modeLabel}）`,
+    label: egress.status === 'unknown' ? `出口：地域待确认（${modeLabel}）` : `出口：探测异常（${modeLabel}）`,
     tone: 'warn',
   }
 }

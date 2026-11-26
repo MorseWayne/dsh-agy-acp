@@ -1,0 +1,7 @@
+{"expect":{"id":1,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"type":"text","text":"fixture"}]}}}
+{"emit":{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"t","status":"in_progress"}}}}
+{"emit":{"id":"approval","method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"t"},"options":[]}}}
+{"expect":{"method":"session/cancel","params":{"sessionId":"s"}}}
+{"expect":{"id":2,"method":"replay/advance"}}
+{"emit":{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"t","status":"in_progress"}}}}
+{"emit":{"id":2,"result":{}}}

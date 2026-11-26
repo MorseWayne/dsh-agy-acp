@@ -8,7 +8,8 @@ import type { AccountHealthSnapshot, StatusSnapshot } from '../src/common/types.
 import { initialSnapshot, reduceSnapshot, snapshotNotice } from '../src/client/snapshot-state.ts'
 import { AccountCard } from '../src/client/account-card.ts'
 import { activeCooldowns, bucketDisplay, lowQuotaWarnings, nextAccountExpiry, requestAccountAction, sessionAccountLabel } from '../src/client/account-display.ts'
-import { SettingsView } from '../src/client/index.ts'
+import { resetSessions, type SessionResetTarget } from '../src/client/panel-actions.ts'
+import { ConfigFieldset, SettingsView } from '../src/client/index.ts'
 import { createStatusStore, type EventSourceLike } from '../src/client/status-store.ts'
 
 const account: AccountHealthSnapshot = {
@@ -242,8 +243,8 @@ test('createStatusStore shares one EventSource across subscribers, avoids fake-o
   ssrStore.dispose()
 })
 
-test('SettingsView renders model select, lastError banner, timeout inputs, context progressbar, and uses DSH theme tokens', () => {
-  const snap: StatusSnapshot = {
+function panelFixture(): StatusSnapshot {
+  return {
     providerId: 'antigravity-acp',
     enabled: true,
     connected: true,
@@ -298,6 +299,10 @@ test('SettingsView renders model select, lastError banner, timeout inputs, conte
     lastError: 'ACP 模型目录探测超时，请检查 agy CLI 登录状态',
     updatedAt: now,
   }
+}
+
+test('SettingsView renders model select, lastError banner, timeout inputs, context progressbar, and uses DSH theme tokens', () => {
+  const snap = panelFixture()
 
   const html = renderToStaticMarkup(
     React.createElement(SettingsView, { status: snap, stream: 'live', failed: false, applyStatus: () => {} }),
@@ -314,8 +319,8 @@ test('SettingsView renders model select, lastError banner, timeout inputs, conte
   assert.match(html, /严格模式（受限与未知均拦截）/)
   assert.match(html, /桥接运行态：挂载会话 1 · 在途调用 0 · 累计调用 4 · 失败\/超时 1 · 最近工具 search_docs/)
   assert.match(html, /最近桥接告警/)
-  assert.match(html, /已索引可恢复会话 2 个/)
-  assert.match(html, /session\/load 已恢复/)
+  assert.match(html, /恢复索引：2 个/)
+  assert.match(html, /已恢复（方式未上报）/)
   assert.match(html, /标题：修复鉴权缓存逻辑/)
   assert.match(html, /配额感知多账号调度（Quota-Aware Scheduling）/)
   assert.match(html, /恢复默认/)
@@ -345,6 +350,37 @@ test('AccountCard renders supported, unsupported, error, and unchecked egress st
   assert.match(supportedHtml, /出口：US（代理）· 合规/)
   assert.match(supportedHtml, /IP 203\.0\.113\.\*/)
 
+  const googleSupportedHtml = markup({
+    ...account,
+    egress: {
+      status: 'supported',
+      country: null,
+      ipMasked: null,
+      proxyMode: 'proxy',
+      probeSource: 'google-aistudio',
+      checkedAt: now,
+      expiresAt: now + 300_000,
+    },
+  })
+  assert.match(googleSupportedHtml, /出口：Google 可用（代理）· 合规/)
+  assert.match(googleSupportedHtml, /Google 匿名预检/)
+
+  const googleUnknownHtml = markup({
+    ...account,
+    egress: {
+      status: 'unknown',
+      country: null,
+      ipMasked: null,
+      proxyMode: 'proxy',
+      probeSource: 'google-cloudcode',
+      checkedAt: now,
+      expiresAt: now + 30_000,
+      reason: 'daily-cloudcode-pa.googleapis.com 代理通道可达',
+    },
+  })
+  assert.match(googleUnknownHtml, /出口：地域待确认（代理）/)
+  assert.match(googleUnknownHtml, /Google API 连通检查/)
+
   const unsupportedHtml = markup({
     ...account,
     egress: {
@@ -358,7 +394,7 @@ test('AccountCard renders supported, unsupported, error, and unchecked egress st
       reason: '当前出口位于不受 Google 支持的地区（HK）',
     },
   })
-  assert.match(unsupportedHtml, /出口：HK（直连）· 不支持 Gemini（已拦截）/)
+  assert.match(unsupportedHtml, /出口：HK（直连）· 不支持 Gemini（策略拦截）/)
   assert.match(unsupportedHtml, /当前出口位于不受 Google 支持的地区（HK）/)
 
   const errorHtml = markup({
@@ -424,4 +460,117 @@ test('AccountCard renders supported, unsupported, error, and unchecked egress st
   })
   assert.match(tosHtml, /风控\/TOS 隔离中/)
   assert.match(tosHtml, /解除隔离与冷却/)
+})
+
+function panelMarkup(status: StatusSnapshot | null, stream: 'live' | 'offline' | 'connecting' = 'live', initialPanel = 'sessions'): string {
+  return renderToStaticMarkup(React.createElement(SettingsView, { status, stream, failed: false, initialPanel, applyStatus: () => {} }))
+}
+
+test('handshake capabilities, actual session recovery and negotiated bridge transport remain distinct', () => {
+  const snap = panelFixture()
+  snap.capabilities = { mcpHttp: true, resumeSession: true, loadSession: false, audio: false }
+  snap.sessions = [
+    { ...snap.sessions[0]!, dshSessionKey: 'resume', resumedVia: 'resume', mcpTransport: 'stdio' },
+    { ...snap.sessions[0]!, dshSessionKey: 'load', resumedVia: 'load', mcpTransport: 'http' },
+    { ...snap.sessions[0]!, dshSessionKey: 'unbridged', resumed: false, mcpTransport: 'none' },
+  ]
+  snap.mcpBridge = { ...snap.mcpBridge!, activeBridges: 2, transport: 'mixed' }
+  const html = panelMarkup(snap)
+  for (const text of ['session/resume：支持', 'session/load：不支持', 'HTTP MCP：支持', '音频：不支持', '图像：未上报',
+    'session/resume 已恢复', 'session/load 已恢复', '实际传输：HTTP + stdio', 'MCP 实际传输：stdio', 'MCP 实际传输：HTTP', 'MCP 实际传输：未挂载']) {
+    assert.ok(html.includes(text), text)
+  }
+  snap.sessions = [{ ...snap.sessions[0]!, resumedVia: undefined, mcpTransport: undefined }]
+  snap.mcpBridge.activeBridges = 0
+  const legacy = panelMarkup(snap)
+  assert.match(legacy, /已恢复（方式未上报）/)
+  assert.match(legacy, /MCP 实际传输：未上报/)
+  assert.match(legacy, /实际传输：未挂载/)
+  assert.doesNotMatch(legacy, /session\/load 已恢复|session\/resume 已恢复|实际传输：HTTP/)
+})
+
+test('account cards label direct, CLI and unknown quota sources without inventing observations', () => {
+  for (const [source, expected] of [['direct', '上游接口'], ['cli', 'agy CLI /usage'], [undefined, '未上报']] as const) {
+    const html = markup({ ...account, quota: { source, groups: [], sampledAt: now } })
+    assert.ok(html.includes(`来源：${expected}`))
+    assert.match(html, /本次查询没有返回配额窗口/)
+    assert.doesNotMatch(html, /低配额预警/)
+  }
+  assert.doesNotMatch(markup(account), /来源：/)
+})
+
+test('offline and waiting panels never label a cached connected snapshot as a live connection', () => {
+  const snap = panelFixture()
+  assert.match(panelMarkup(snap), /ACP 已连接/)
+  for (const stream of ['connecting', 'offline'] as const) {
+    const html = panelMarkup(snap, stream)
+    assert.match(html, /显示上次快照/)
+    assert.match(html, /快照中的会话/)
+    assert.doesNotMatch(html, /ACP 已连接|ACP 待机/)
+  }
+  assert.match(panelMarkup(null, 'offline'), /暂时无法读取 ACP 状态/)
+})
+
+test('panel navigation surfaces only enabled-account alerts; empty states point to the next action', () => {
+  const snap = panelFixture()
+  snap.accounts = [{ ...account, tosBlocked: true }, { ...account, id: 'disabled', enabled: false, tosBlocked: true }]
+  const flagged = panelMarkup(snap, 'live', 'config')
+  assert.match(flagged, /账号与配额 · 2（1 个快照告警）/)
+  assert.match(flagged, /aria-pressed="true"[^>]*>桥接配置/)
+  assert.match(flagged, /会话与用量 · 1（桥接告警）/)
+  snap.accounts = []; snap.models = []; snap.sessions = []; snap.persistedSessions = 0
+  const empty = panelMarkup(snap)
+  assert.doesNotMatch(empty, /重置全部会话|个快照告警/)
+  assert.match(empty, /模型目录为空。可点击「刷新模型目录」探测/)
+  assert.match(empty, /尚未收到账号状态。请检查账号配置/)
+  assert.match(empty, /选择 Antigravity \(ACP\) 模型并发送消息/)
+})
+
+test('restricted egress reflects warn/off policy rather than claiming every request is blocked', () => {
+  const sample: AccountHealthSnapshot = { ...account, egress: { status: 'unsupported', country: 'HK', ipMasked: null,
+    proxyMode: 'direct', probeSource: null, checkedAt: now, expiresAt: now + 20_000 } }
+  for (const [geoFenceMode, expected] of [['warn', '仅告警'], ['off', '本地防护关闭']] as const) {
+    const html = renderToStaticMarkup(React.createElement(AccountCard, { account: sample, geoFenceMode, applyStatus: () => {} }))
+    assert.ok(html.includes(`不支持 Gemini（${expected}）`))
+    assert.doesNotMatch(html, /已拦截|策略拦截/)
+  }
+})
+
+test('session actions scope the request and only acknowledge a validated host reply', async () => {
+  const status = panelFixture()
+  const bodies: unknown[] = []
+  const respond: typeof fetch = async (url, init) => {
+    assert.equal(url, '/plugins/agy-acp/sessions/reset')
+    assert.equal(init?.method, 'POST')
+    bodies.push(JSON.parse(String(init?.body)))
+    return Response.json({ status })
+  }
+  for (const invalid of [undefined, null, {}, { kind: 'one' }, { kind: 'one', sessionKey: null },
+    { kind: 'one', sessionKey: 42 }, { kind: 'one', sessionKey: '' }, { kind: 'one', sessionKey: ' ' }]) {
+    assert.match((await resetSessions(invalid as SessionResetTarget, respond)).message, /未执行关闭/)
+  }
+  assert.deepEqual(bodies, [])
+  assert.deepEqual(await resetSessions({ kind: 'one', sessionKey: 'session-A' }, respond), { status, message: '已关闭会话 session-A' })
+  assert.match((await resetSessions({ kind: 'all' }, respond)).message, /已重置全部/)
+  assert.deepEqual(bodies, [{ sessionKey: 'session-A' }, {}])
+  for (const response of [Response.json({ status: {} }), Response.json({ status: { ...status, sessions: [{}] } }), Response.json({ error: 'raw-host-error' }, { status: 500 })]) {
+    const result = await resetSessions({ kind: 'one', sessionKey: 'session-A' }, async () => response)
+    assert.equal(result.status, undefined)
+    assert.match(result.message, /未完成/)
+    assert.doesNotMatch(result.message, /raw-host-error|已关闭/)
+  }
+})
+
+
+test('the configuration fieldset locks all edits for both pending writes', () => {
+  const html = panelMarkup(panelFixture(), 'live', 'config')
+  const form = html.match(/<fieldset[^>]*aria-label="桥接配置"[^>]*>([\s\S]*?)<\/fieldset>/)?.[1]
+  assert.ok(form, 'the native group wraps the actual editable fields')
+  assert.equal((form.match(/<(?:input|select)\b/g) ?? []).length, 9)
+  assert.equal((html.match(/<(?:input|select)\b/g) ?? []).length, 9)
+  for (const operation of ['save', 'resetConfig', null, 'resetSessions'] as const) {
+    const group = renderToStaticMarkup(React.createElement(ConfigFieldset, { operation, hidden: false, onEdit() {} }, React.createElement('input')))
+    if (operation === 'save' || operation === 'resetConfig') assert.match(group, /<fieldset[^>]*disabled=""[^>]*aria-busy="true"/)
+    else assert.doesNotMatch(group, /<fieldset[^>]*disabled/)
+  }
 })

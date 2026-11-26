@@ -19,6 +19,8 @@ export const theme = {
 } as const
 
 export const styles = {
+  panelNav: { display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '10px' },
+  sectionHeading: { margin: '0 0 6px', fontSize: '14px', fontWeight: 600 },
   card: {
     borderRadius: '10px',
     border: theme.borderPrimary,
@@ -84,13 +86,15 @@ export const styles = {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    padding: '24px',
+    padding: 'clamp(6px, 3vw, 24px)',
     backgroundColor: theme.surfaceMask,
     backdropFilter: 'blur(4px)',
   },
   modalDialog: {
     position: 'relative' as const,
-    width: 'min(780px, 94vw)',
+    width: 'min(780px, 100%)',
+    boxSizing: 'border-box' as const,
+    minWidth: 0,
     maxHeight: '86vh',
     overflowY: 'auto' as const,
     borderRadius: '14px',
@@ -98,6 +102,6 @@ export const styles = {
     backgroundColor: theme.surfaceElevated,
     color: theme.textPrimary,
     boxShadow: '0 24px 64px rgba(0, 0, 0, 0.28)',
-    padding: '18px 22px',
+    padding: '34px clamp(10px, 3vw, 22px) 18px',
   },
 } as const

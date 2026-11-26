@@ -1,0 +1,7 @@
+# Offline ACP replay
+
+`tool-approval.ndjson` adapts [T3 Code’s ACP registry fixture, lines 2–12](https://github.com/pingdotgg/t3code/blob/b2d51f35bb8b7ecda414e2f5f351ef192fa1d7c5/apps/server/src/orchestration-v2/testkit/fixtures/tool_call_read_only_on_request/registry_transcript.ndjson#L2-L12) from the local checkout at that revision. Its own provenance is `generatedBy: live-grok-shape-probe`: this is **not** a recording from an Antigravity account. Upstream is MIT, copyright 2026 T3 Tools Inc.; see [license](LICENSE.t3code).
+
+Adapted: initialize/new/prompt, pending tool → permission request/selected response → completed tool → assistant text → end turn. Commands, prompts, paths, identifiers, model/auth metadata and output were removed or replaced with fixture constants. Handwritten: ACP v1 request envelopes/IDs, overlapping second tool, intermediate status, failure and `replay/advance` barriers. The remaining NDJSON scenarios (timeout, ignored cancel, restore negotiation/fallback) and peer implementation are entirely synthetic. `$workspace` checks the current working directory; `$version` checks the client’s version shape without pinning a release.
+
+The peer only matches incoming JSON-RPC lines and emits literal frames; it never interprets a tool, executes fixture commands or contacts a service. Mocked parent timers plus wire barriers make the elapsed time independent of child startup and CPU load.

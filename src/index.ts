@@ -7,6 +7,7 @@ import { MIRROR_TOOL_NAME, PROVIDER_ID, type McpBridgeSnapshot } from './common/
 import { ReverseMcpBridge } from './mcp/server.ts'
 import { AcpAdapter } from './provider/adapter.ts'
 import { defineAgyAcpMirrorTool } from './provider/mirror-tool.ts'
+import type { ReadPromptFile, ReadPromptImage } from './provider/prompt-builder.ts'
 import { AcpRunStore } from './provider/run-store.ts'
 import { resolveAgyBin } from './runtime/bin.ts'
 import { MultiAccountPool } from './runtime/account-pool.ts'
@@ -14,7 +15,7 @@ import { ConfigStore } from './runtime/config-store.ts'
 import { CredentialSlotLeaseManager } from './runtime/credential-lease.ts'
 import { formatAgyStatusReport, runAgyDoctor } from './runtime/doctor.ts'
 import { EgressGuard } from './runtime/egress-guard.ts'
-import { hostPermissions, type SessionAgent } from './runtime/host-permissions.ts'
+import { hostPermissions, type QuestionService, type SessionAgent } from './runtime/host-permissions.ts'
 import { SessionPolicyChangedError } from './runtime/permission-manager.ts'
 import { SessionIndex } from './runtime/session-index.ts'
 import { AcpSessionPool } from './runtime/session-pool.ts'
@@ -42,7 +43,12 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const loaded = configStore.load()
   let cfg = { ...baseCfg, ...loaded.patch }
 
-  const permissions = hostPermissions(ctx as unknown as Parameters<typeof hostPermissions>[0])
+  let questions: QuestionService | undefined
+  ctx.inject(['userQuestions'], sub => {
+    questions = sub.get('userQuestions') as QuestionService | undefined
+    return () => { questions = undefined }
+  })
+  const permissions = hostPermissions(ctx as unknown as Parameters<typeof hostPermissions>[0], () => questions)
   let bridgeTools: DshToolsServiceLike | undefined
   const bridges = new Map<string, ReverseMcpBridge>()
   let archivedBridgeCalls = 0
@@ -74,23 +80,30 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     let latestTool = lastBridgeToolName
     let latestAt = lastBridgeCallAt
     let latestErr = lastBridgeError
+    let sawHttp = false
+    let sawStdio = false
     for (const b of bridges.values()) {
       const st = b.getStats()
       inFlightCalls += st.inFlightCalls
       totalCalls += st.totalCalls
       failedCalls += st.failedCalls
+      if (st.transport === 'http') sawHttp = true
+      else sawStdio = true
       if (st.lastCallAt && (!latestAt || st.lastCallAt >= latestAt)) {
         latestAt = st.lastCallAt
         latestTool = st.lastToolName
         latestErr = st.lastError
       }
     }
+    const transport: McpBridgeSnapshot['transport'] =
+      sawHttp && sawStdio ? 'mixed' : sawHttp ? 'http' : sawStdio ? 'stdio' : undefined
     return {
       enabled: cfg.mcpBridge,
       activeBridges: bridges.size,
       inFlightCalls,
       totalCalls,
       failedCalls,
+      ...(transport ? { transport } : {}),
       lastToolName: latestTool,
       lastCallAt: latestAt,
       lastError: latestErr,
@@ -156,7 +169,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       }
     },
     onSessionClosed: releaseBridge,
-    async getMcpServers(key) {
+    async getMcpServers(key, opts) {
       const tools = bridgeTools
       if (!cfg.mcpBridge || !tools?.schemas || !tools.execute) return []
       const owner = permissions.agent(key)
@@ -166,10 +179,17 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         return signal
       }
       const bridge = new ReverseMcpBridge({
+        excludeOverlappingNativeTools: !cfg.mcpExposeOverlappingTools,
         listTools: () => tools.schemas!(owner).map(t => ({ name: t.name, description: t.description, inputSchema: t.parameters })),
         callTool: async (name, args, signal) => {
           const turn = authority()
-          if (!tools.schemas!(owner).some(t => t.name === name)) throw new Error('Tool not available to this DSH session')
+          const schema = tools.schemas!(owner).find(t => t.name === name)
+          if (!schema) throw new Error('Tool not available to this DSH session')
+          // agy may add its display-only summary even for strict tools which do not declare it.
+          if (Object.hasOwn(args, 'toolSummary') && !Object.hasOwn(schema.parameters?.properties ?? {}, 'toolSummary')) {
+            const { toolSummary: _, ...actualArgs } = args
+            args = actualArgs
+          }
           const batch = await tools.execute!({ agent: owner, signal: AbortSignal.any([signal, turn]),
             calls: [{ type: 'tool-call', id: `mcp:${randomUUID()}` as ToolCallId, name, arguments: args }] })
           const result = batch.results[0]?.result
@@ -183,7 +203,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       bridges.set(key, bridge)
       await bridge.start()
       if (!cfg.mcpBridge || bridges.get(key) !== bridge) { await bridge.dispose(); return [] }
-      const spec = bridge.getMcpServerSpec()
+      const spec = bridge.getPreferredMcpServerSpec(Boolean(opts?.preferHttp))
       return spec ? [spec] : []
     },
     log,
@@ -199,7 +219,17 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     pool.notifyStatusChange()
   })
 
+  let readFileStream: ReadPromptFile | undefined
+  let readImage: ReadPromptImage | undefined
+  ctx.inject(['attachments'], sub => {
+    const svc = sub.get('attachments') as { readImage?: ReadPromptImage; readFileStream?: ReadPromptFile } | undefined
+    readImage = svc?.readImage?.bind(svc)
+    readFileStream = svc?.readFileStream?.bind(svc)
+    return () => { readImage = undefined; readFileStream = undefined }
+  })
   const adapter = new AcpAdapter({
+    get readImage() { return readImage },
+    get readFileStream() { return readFileStream },
     getConfig: () => cfg,
     pool,
     runs,

@@ -13,6 +13,7 @@ const EFFORT_ID_RE = /^[a-zA-Z0-9._-]{1,64}$/
 const HOST_ONLY_CONFIG_KEYS = new Set(['accounts', 'credentialSlotDir', 'enabled'])
 const ALLOWED_PERSIST_KEYS = new Set<keyof PersistedConfigPatch>([
   'mcpBridge',
+  'mcpExposeOverlappingTools',
   'quotaAwareScheduling',
   'defaultModel',
   'defaultEffort',
@@ -97,7 +98,7 @@ export function validateConfigPatchInput(
     }
 
     const val = body[key]
-    if (key === 'mcpBridge' || key === 'quotaAwareScheduling') {
+    if (key === 'mcpBridge' || key === 'mcpExposeOverlappingTools' || key === 'quotaAwareScheduling') {
       if (typeof val !== 'boolean') return { ok: false, error: `${key} 必须为布尔值` }
       patch[key] = val
       count++
@@ -171,6 +172,7 @@ export function resolveConfig(raw: Record<string, unknown> = {}): PluginConfig {
     sessionIdleTtlMs: parseNumber(raw.sessionIdleTtlMs, 30 * 60_000, SESSION_IDLE_TTL_MIN_MS, SESSION_IDLE_TTL_MAX_MS),
     requestTimeoutMs: parseNumber(raw.requestTimeoutMs, 10 * 60_000, REQUEST_TIMEOUT_MIN_MS, REQUEST_TIMEOUT_MAX_MS),
     mcpBridge: parseBool(raw.mcpBridge, false),
+    mcpExposeOverlappingTools: parseBool(raw.mcpExposeOverlappingTools, false),
     quotaAwareScheduling: parseBool(raw.quotaAwareScheduling, false),
     geoFenceMode: isGeoFenceMode(rawGeoMode) ? rawGeoMode : 'block',
     accounts: parseAccounts(raw.accounts),

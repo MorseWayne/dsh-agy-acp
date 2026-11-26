@@ -1,15 +1,17 @@
 // @ts-expect-error runtime React is supplied by the DSH web host
 import React from 'react'
-import type { AccountHealthSnapshot, QuotaBucketState, StatusSnapshot } from '../common/types.ts'
+import type { AccountHealthSnapshot, GeoFenceMode, QuotaBucketState, StatusSnapshot } from '../common/types.ts'
 import {
   activeCooldowns,
   bucketDisplay,
   formatEgressBadge,
+  formatEgressProbeSource,
   lowQuotaWarnings,
   nextAccountExpiry,
   requestAccountAction,
   type AccountActionKind,
 } from './account-display.ts'
+import { accountAttention } from './runtime-display.ts'
 import { styles, theme } from './theme.ts'
 
 const h = React.createElement
@@ -31,7 +33,7 @@ function quotaWindow(title: string, bucket: QuotaBucketState | undefined, now: n
   )
 }
 
-export function AccountCard({ account, applyStatus }: { account: AccountHealthSnapshot; applyStatus: (value: StatusSnapshot) => void }): unknown {
+export function AccountCard({ account, applyStatus, geoFenceMode = 'block' }: { account: AccountHealthSnapshot; geoFenceMode?: GeoFenceMode; applyStatus: (value: StatusSnapshot) => void }): unknown {
   const [pending, setPending] = React.useState(null as AccountActionKind | null)
   const [feedback, setFeedback] = React.useState('')
   const locked = React.useRef(false)
@@ -47,7 +49,8 @@ export function AccountCard({ account, applyStatus }: { account: AccountHealthSn
   const cooldowns = activeCooldowns(account.families, now)
   const { quota, egress } = account
   const lowWarnings = lowQuotaWarnings(quota, now)
-  const egressBadge = formatEgressBadge(egress)
+  const flag = accountAttention(account, now)
+  const egressBadge = formatEgressBadge(egress, geoFenceMode)
   const egressColor =
     egressBadge.tone === 'success'
       ? theme.stateSuccess
@@ -71,9 +74,9 @@ export function AccountCard({ account, applyStatus }: { account: AccountHealthSn
         const updatedEgress = nextStatus.accounts.find(a => a.id === account.id)?.egress
         setFeedback(
           updatedEgress?.status === 'supported'
-            ? `出口检测通过（${updatedEgress.country ?? '合规'}）。`
+            ? `出口检测通过（${updatedEgress.country ?? 'Google 可用'}）。`
             : updatedEgress?.status === 'unsupported'
-              ? `检测到受限出口（${updatedEgress.country ?? '受限区'}），请求将在本地安全拦截。`
+              ? formatEgressBadge(updatedEgress, nextStatus.config?.geoFenceMode).label
               : '出口检测已完成。',
         )
       } else {
@@ -92,7 +95,7 @@ export function AccountCard({ account, applyStatus }: { account: AccountHealthSn
   return h('article', { style: { borderTop: border, padding: '12px 0', overflowWrap: 'anywhere' } },
     h('div', { style: row },
       h('h4', { style: { margin: 0, fontSize: '14px' } }, account.label, account.id !== account.label ? h('small', { style: { ...secondary, fontWeight: 400 } }, ` · ${account.id}`) : null),
-      h('span', { style: { ...secondary, border, borderRadius: '12px', padding: '0 8px' } }, account.enabled ? '已启用' : '已停用')),
+      h('span', { style: { ...secondary, ...(flag ? { color: theme.stateWarn } : {}), border, borderRadius: '12px', padding: '0 8px' } }, flag ? `已启用 · ${flag}` : account.enabled ? '已启用' : '已停用')),
     h('div', { style: { ...secondary, marginTop: '4px' }, title: '最近分配指最近一次租约分配（包括模型探测），不是最近一轮对话。' }, [
       `活跃租约 ${account.activeLeases}`, `最近分配：${account.lastUsedAt != null ? localTime(account.lastUsedAt) : '暂无记录'}`,
       account.hasSandboxHome && '独立 HOME', account.lastError && '最近请求出现错误',
@@ -121,10 +124,10 @@ export function AccountCard({ account, applyStatus }: { account: AccountHealthSn
       egressBadge.label),
       egress
         ? h('span', { style: secondary }, [
-            egress.ipMasked && `IP ${egress.ipMasked}`,
+            egress.ipMasked ? `IP ${egress.ipMasked}` : formatEgressProbeSource(egress.probeSource),
             `检测于 ${localTime(egress.checkedAt)}`,
           ].filter(Boolean).join(' · '))
-        : h('span', { style: secondary }, '首次请求前自动预检，也可点击右侧手动检测')),
+        : h('span', { style: secondary }, '首次请求前自动预检，也可点击「检测出口」手动检查')),
     egress?.reason && egress.status !== 'supported'
       ? h('div', { style: { ...secondary, color: egressBadge.tone === 'error' ? theme.stateError : theme.stateWarn, opacity: 0.95, marginTop: '2px' } }, egress.reason)
       : null,
@@ -159,12 +162,12 @@ export function AccountCard({ account, applyStatus }: { account: AccountHealthSn
           },
         }, `低配额预警：${lowWarnings.map(w => `${w.group} · ${w.windowLabel}${w.exhausted ? '已耗尽' : `仅剩 ${bucketDisplay({ remainingFraction: w.remainingFraction }, now)}`}`).join('；')}`)
       : null,
-    quota ? h('div', { style: secondary }, `上次成功更新：${localTime(quota.sampledAt)}`) : null,
+    quota ? h('div', { style: secondary }, `上次成功更新：${localTime(quota.sampledAt)} · 来源：${quota.source === 'direct' ? '上游接口' : quota.source === 'cli' ? 'agy CLI /usage' : '未上报'}`) : null,
     quota?.groups.length ? quota.groups.map(group => h('div', { key: group.name, style: { marginTop: '6px', padding: '6px 10px', borderInlineStart: border } },
       h('div', { style: { fontWeight: 550 } }, group.name),
       h('dl', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 9rem), 1fr))', gap: '4px 12px', margin: '4px 0 0' } },
         quotaWindow('5 小时', group.fiveHour, now), quotaWindow('7 天', group.sevenDay, now))))
-      : h('div', { style: secondary }, quota ? '本次查询没有返回配额窗口。' : '暂无配额样本。'),
+      : h('div', { style: secondary }, quota ? '本次查询没有返回配额窗口。' : '暂无配额样本。' + (unavailable ? '' : '点击「刷新配额」查询此账号的余量。')),
     h('div', { role: 'status', 'aria-live': 'polite', style: secondary }, feedback),
   )
 }

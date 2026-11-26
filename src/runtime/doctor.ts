@@ -26,9 +26,10 @@ function summarizeAccountLine(account: AccountHealthSnapshot, now: number): stri
   if (account.egress) {
     const mode = account.egress.proxyMode === 'proxy' ? '代理' : '直连'
     if (account.egress.status === 'supported') {
-      parts.push(`出口=${account.egress.country ?? '合规'}/${mode}${account.egress.ipMasked ? ` (${account.egress.ipMasked})` : ''}`)
+      parts.push(`出口=${account.egress.country ?? 'Google可用'}/${mode}${account.egress.ipMasked ? ` (${account.egress.ipMasked})` : ''}`)
     } else if (account.egress.status === 'unsupported') {
-      parts.push(`出口=${account.egress.country ?? '受限'}/${mode} [已拦截]`)
+      const region = account.egress.country ?? (account.egress.probeSource === 'runtime-400' ? '上游400' : 'Google受限')
+      parts.push(`出口=${region}/${mode} [已拦截]`)
     } else {
       parts.push(`出口=异常/${mode}`)
     }
@@ -84,8 +85,17 @@ export function formatAgyStatusReport(status: StatusSnapshot, now = Date.now()):
 
   if (status.mcpBridge) {
     const b = status.mcpBridge
+    const transportLabel =
+      b.transport === 'http'
+        ? 'HTTP 直连'
+        : b.transport === 'mixed'
+          ? 'HTTP+stdio 混合'
+          : b.transport === 'stdio'
+            ? 'stdio 桥接'
+            : ''
     const mcpLine = [
       `反向 MCP=${b.enabled ? '开启' : '关闭'}`,
+      transportLabel ? `传输=${transportLabel}` : '',
       `挂载=${b.activeBridges}`,
       `在途=${b.inFlightCalls}`,
       `累计调用=${b.totalCalls}`,
@@ -201,7 +211,16 @@ export async function runAgyDoctor(
       .map((a) => {
         const eg = a.egress
         const mode = eg?.proxyMode === 'proxy' ? '代理' : '直连'
-        return `${a.label}=${eg?.country ?? eg?.status ?? '未知'}(${mode}${eg?.ipMasked ? `, ${eg.ipMasked}` : ''})`
+        const region =
+          eg?.country ??
+          (eg?.status === 'supported'
+            ? 'Google可用'
+            : eg?.status === 'unsupported'
+              ? eg.probeSource === 'runtime-400'
+                ? '上游400'
+                : 'Google受限'
+              : eg?.status ?? '未知')
+        return `${a.label}=${region}(${mode}${eg?.ipMasked ? `, ${eg.ipMasked}` : ''})`
       })
       .join('；')
 

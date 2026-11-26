@@ -1,5 +1,6 @@
-import { randomUUID } from 'node:crypto'
-import type { AcpToolCallUpdate, AcpUsage, SessionUpdatePayload } from '../acp/protocol.ts'
+import { createHash, randomUUID } from 'node:crypto'
+import { boundTailText, copyBoundedText, sanitizeToolPayload } from '../acp/payload-bounds.ts'
+import type { AcpToolCallContentEntry, AcpToolCallUpdate, AcpUsage, SessionUpdatePayload } from '../acp/protocol.ts'
 import { mergeCallUsage, type CallUsage, type CallUsageSource } from '../acp/transcript-usage.ts'
 
 export interface NormalizedLocation {
@@ -17,7 +18,7 @@ export interface MergedToolCall {
   args?: Record<string, unknown>
   locations?: NormalizedLocation[]
   rawOutput?: unknown
-  content?: Array<{ type: string; content?: { type: string; text?: string } }>
+  content?: AcpToolCallContentEntry[]
   status: 'pending' | 'in_progress' | 'completed' | 'failed'
   settled: boolean
 }
@@ -36,11 +37,11 @@ export type RunItem =
 export function normalizeLocations(raw: unknown, maxItems = 32): NormalizedLocation[] | undefined {
   if (!Array.isArray(raw) || raw.length === 0) return undefined
   const out: NormalizedLocation[] = []
-  for (const item of raw) {
+  for (const item of raw.slice(0, maxItems)) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) continue
     const rec = item as Record<string, unknown>
-    if (typeof rec.path !== 'string' || rec.path.trim() === '') continue
-    const loc: NormalizedLocation = { path: rec.path }
+    if (typeof rec.path !== 'string' || rec.path.length > 4096 || rec.path.trim() === '') continue
+    const loc: NormalizedLocation = { path: copyBoundedText(rec.path) }
     if (typeof rec.line === 'number' && Number.isFinite(rec.line) && rec.line >= 1) {
       loc.line = Math.floor(rec.line)
     }
@@ -78,6 +79,7 @@ export class AcpRunRecording {
   readonly items: RunItem[] = []
   readonly toolResults = new Map<number, AcpToolCallUpdate>()
   private readonly toolCalls = new Map<string, MergedToolCall>()
+  private readonly preEditCalls = new Set<string>()
   private readonly stepToToolCallId = new Map<number, string>()
   private readonly emittedToolCallIds = new Set<string>()
   private waiters: Array<() => void> = []
@@ -87,9 +89,15 @@ export class AcpRunRecording {
   private runError?: string
   private cancelHandler: (() => void) | null = null
 
-  constructor(id?: string, readonly owner?: string) {
+  private released = false
+  constructor(id?: string, readonly owner?: string, private readonly preEdit?: (tc: AcpToolCallUpdate) => NormalizedLocation[] | undefined) {
     this.id = id ?? randomUUID().slice(0, 12)
   }
+
+  /** Explicitly release only after the adapter consumes (or abandons) the final span. */
+  releaseRecording(): void { this.released = true }
+
+  get canEvict(): boolean { return this.settled && this.released && !this.waiters.length }
 
   get isSettled(): boolean {
     return this.settled
@@ -135,9 +143,25 @@ export class AcpRunRecording {
 
   /** Latest `usage_update.used` seen during this run: the real live context occupancy. */
   contextUsed: number | undefined
+  /** Last fallback occupancy already reported to DSH when transcript usage is unavailable. */
+  lastFallbackContextUsed: number | undefined
 
   private usageSource: CallUsageSource | null = null
   private pendingUsage: CallUsage | null = null
+  private hasModelOutputSinceLastUsage = true
+  private spanUsageCount = 0
+  private compacted = false
+  private inlineMessageAcc = ''
+  private inlineMessageOverflow = false
+  private sawThoughtOrTool = false
+
+  get hasThoughtOrTool(): boolean {
+    return this.sawThoughtOrTool
+  }
+
+  get inlineMessageText(): string | undefined {
+    return this.inlineMessageOverflow || !this.inlineMessageAcc ? undefined : this.inlineMessageAcc
+  }
 
   /** Attach agy's per-call usage source (the transcript tailer) for this run. */
   attachUsageSource(source: CallUsageSource): void {
@@ -146,6 +170,10 @@ export class AcpRunRecording {
 
   get hasUsageSource(): boolean {
     return this.usageSource?.available === true
+  }
+
+  get consumedSpanUsageCount(): number {
+    return this.spanUsageCount
   }
 
   /** Pull newly completed model calls into the current DSH step; returns how many arrived. */
@@ -160,28 +188,99 @@ export class AcpRunRecording {
     return this.pendingUsage !== null
   }
 
+  /**
+   * Whether a new model call is expected before this tool-call batch.
+   * When a single model call streams multiple concurrent tool calls split across consecutive DSH spans,
+   * subsequent spans see neither new model text/thought nor all prior tools settled, so waiting 160ms
+   * polling the transcript would only burn wall-clock latency with zero new PLANNER_RESPONSE records.
+   */
+  expectsNewCallUsage(currentBatchToolCallIds: ReadonlySet<string>): boolean {
+    if (this.hasPendingUsage || this.hasModelOutputSinceLastUsage) return true
+    let priorEmittedCount = 0
+    for (const id of this.emittedToolCallIds) {
+      if (currentBatchToolCallIds.has(id)) continue
+      priorEmittedCount++
+      if (!this.toolCalls.get(id)?.settled) return false
+    }
+    return priorEmittedCount > 0
+  }
+
   /** Usage of the model calls since the previous DSH step, or null when none arrived (never re-billed). */
   consumeSpanUsage(): CallUsage | null {
     const out = this.pendingUsage
     this.pendingUsage = null
+    if (out) {
+      this.hasModelOutputSinceLastUsage = false
+      this.spanUsageCount++
+    }
     return out
+  }
+
+  /** Release intermediate streaming frames once this run is settled and no longer active. */
+  compactSettled(): void {
+    if (!this.canEvict || this.compacted) return
+    this.compacted = true
+    this.items.length = 0
+    this.toolResults.clear()
+    this.usageSource = null
+    this.pendingUsage = null
+    this.inlineMessageAcc = ''
   }
 
   pushUpdate(update: SessionUpdatePayload): number {
     if (this.settled) return this.items.length - 1
     const idx = this.items.length
-    this.items.push({ kind: 'update', update })
+    let storedUpdate: SessionUpdatePayload = { sessionUpdate: boundTailText(update.sessionUpdate, 128) }
     if (update.sessionUpdate === 'usage_update') {
       const used = (update as { used?: unknown }).used
-      if (typeof used === 'number' && Number.isSafeInteger(used) && used >= 0) this.contextUsed = used
+      if (typeof used === 'number' && Number.isSafeInteger(used) && used >= 0) {
+        this.contextUsed = used
+        storedUpdate = { sessionUpdate: 'usage_update', used }
+        if (typeof update.size === 'number' && Number.isSafeInteger(update.size) && update.size >= 0) storedUpdate.size = update.size
+      }
+    } else if (update.sessionUpdate === 'agent_thought_chunk' || update.sessionUpdate === 'agent_message_chunk') {
+      this.hasModelOutputSinceLastUsage = true
+      if (update.sessionUpdate === 'agent_thought_chunk') {
+        this.sawThoughtOrTool = true
+      }
+      const c = update.content
+      if (c && typeof c === 'object' && 'text' in c && typeof c.text === 'string') {
+        if (update.sessionUpdate === 'agent_message_chunk' && !this.inlineMessageOverflow) {
+          if (this.inlineMessageAcc.length + c.text.length > 1024) {
+            this.inlineMessageOverflow = true
+            this.inlineMessageAcc = ''
+          } else {
+            this.inlineMessageAcc += c.text
+          }
+        }
+        storedUpdate = { sessionUpdate: update.sessionUpdate, content: { type: 'text', text: copyBoundedText(c.text) } }
+      }
     }
 
     if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
-      const tc = update as AcpToolCallUpdate
-      const toolCallId =
-        typeof tc.toolCallId === 'string' && tc.toolCallId.trim() !== ''
-          ? tc.toolCallId
-          : `step:${idx}`
+      this.sawThoughtOrTool = true
+      const rawTc = update as AcpToolCallUpdate
+      const id = rawTc.toolCallId
+      const toolCallId = typeof id !== 'string' || !id.length ? `step:${idx}` :
+        id.length > 512 ? `long:${createHash('sha256').update(id).digest('hex')}` : copyBoundedText(id)
+      // Whitelist protocol fields, never spread a raw peer frame. Dropped values stay dropped.
+      const tc: AcpToolCallUpdate = { sessionUpdate: rawTc.sessionUpdate, toolCallId }
+      if (typeof rawTc.name === 'string') tc.name = boundTailText(rawTc.name, 256)
+      if (typeof rawTc.kind === 'string') tc.kind = boundTailText(rawTc.kind, 64)
+      if (typeof rawTc.title === 'string') tc.title = boundTailText(rawTc.title, 2048)
+      if (rawTc.status && ['pending', 'in_progress', 'completed', 'failed'].includes(rawTc.status)) tc.status = rawTc.status
+      if (rawTc.args && typeof rawTc.args === 'object' && !Array.isArray(rawTc.args)) {
+        tc.args = sanitizeToolPayload(rawTc.args) as Record<string, unknown>
+      }
+      if (rawTc.rawInput !== undefined) tc.rawInput = sanitizeToolPayload(rawTc.rawInput)
+      if (rawTc.rawOutput !== undefined) tc.rawOutput = sanitizeToolPayload(rawTc.rawOutput)
+      if (Array.isArray(rawTc.content)) tc.content = sanitizeToolPayload(rawTc.content, { maxTotalText: 32_000 }) as AcpToolCallContentEntry[]
+      tc.locations = normalizeLocations(rawTc.locations)
+      if (tc.sessionUpdate === 'tool_call' && !this.toolCalls.has(toolCallId) && tc.status !== 'completed' && tc.status !== 'failed') {
+        const captured = this.preEdit?.(tc)
+        if (captured) { tc.locations = captured; this.preEditCalls.add(toolCallId) }
+      }
+      storedUpdate = tc
       this.stepToToolCallId.set(idx, toolCallId)
 
       let merged = this.toolCalls.get(toolCallId)
@@ -204,7 +303,7 @@ export class AcpRunRecording {
         merged.args = tc.args
       }
       const locs = normalizeLocations(tc.locations)
-      if (locs) merged.locations = locs
+      if (locs && (!merged.locations || !this.preEditCalls.has(toolCallId))) merged.locations = locs
       if (tc.rawOutput !== undefined) merged.rawOutput = tc.rawOutput
       if (Array.isArray(tc.content) && tc.content.length > 0) merged.content = tc.content
 
@@ -224,6 +323,7 @@ export class AcpRunRecording {
       }
     }
 
+    this.items.push({ kind: 'update', update: storedUpdate })
     this.wakeAll()
     return idx
   }
@@ -248,6 +348,20 @@ export class AcpRunRecording {
       if (this.settled) return null
       if (signal?.aborted) return null
       await this.waitOnce(signal)
+    }
+    return this.items[index] ?? null
+  }
+
+  /** Wait up to `timeoutMs` for an item at `index` to arrive; returns null immediately on timeout/settle/abort. */
+  async waitForWithin(index: number, timeoutMs: number, signal?: AbortSignal): Promise<RunItem | null> {
+    if (index < this.items.length) return this.items[index] ?? null
+    if (this.settled || signal?.aborted || timeoutMs <= 0) return null
+    const deadline = Date.now() + timeoutMs
+    while (index >= this.items.length) {
+      if (this.settled || signal?.aborted) return null
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) return null
+      await this.waitOnceWithTimeout(remaining, signal)
     }
     return this.items[index] ?? null
   }
@@ -297,6 +411,32 @@ export class AcpRunRecording {
     })
   }
 
+  private waitOnceWithTimeout(timeoutMs: number, signal?: AbortSignal): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const cleanup = (): void => {
+        if (timer) {
+          clearTimeout(timer)
+          timer = undefined
+        }
+        signal?.removeEventListener('abort', onAbort)
+        this.waiters = this.waiters.filter((w) => w !== done)
+      }
+      const onAbort = (): void => {
+        cleanup()
+        resolve()
+      }
+      const done = (): void => {
+        cleanup()
+        resolve()
+      }
+      this.waiters.push(done)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      timer = setTimeout(done, timeoutMs)
+      timer.unref?.()
+    })
+  }
+
   private wakeAll(): void {
     const list = this.waiters
     this.waiters = []
@@ -304,17 +444,22 @@ export class AcpRunRecording {
   }
 }
 
+const MAX_RETAINED_RUNS = 32
+const MAX_FULL_SETTLED_RUNS = 8
+
 export class AcpRunStore {
   private readonly runs = new Map<string, AcpRunRecording>()
+  private readonly superseded = new WeakSet<AcpRunRecording>()
 
-  create(owner?: string): AcpRunRecording {
-    const rec = new AcpRunRecording(undefined, owner)
+  create(owner?: string, preEdit?: (tc: AcpToolCallUpdate) => NormalizedLocation[] | undefined): AcpRunRecording {
+    const rec = new AcpRunRecording(undefined, owner, preEdit)
+    for (const run of this.runs.values()) if (run.owner === owner) this.superseded.add(run)
     this.runs.set(rec.id, rec)
-    // Keep bounded memory (last 64 runs)
-    if (this.runs.size > 64) {
-      const oldest = this.runs.keys().next().value
-      if (oldest) this.runs.delete(oldest)
-    }
+    // The cap applies to eligible history only: waking a waiter or finishing the
+    // ACP producer does not mean DSH has consumed the remaining continuation.
+    const history = [...this.runs.values()].filter(run => run.canEvict)
+    for (const old of history.slice(0, Math.max(0, history.length - MAX_FULL_SETTLED_RUNS))) old.compactSettled()
+    for (const old of history.slice(0, Math.max(0, this.runs.size - MAX_RETAINED_RUNS))) this.runs.delete(old.id)
     return rec
   }
 
@@ -323,7 +468,7 @@ export class AcpRunStore {
   }
 
   isLatestForOwner(run: AcpRunRecording): boolean {
-    return Array.from(this.runs.values()).findLast(candidate => candidate.owner === run.owner) === run
+    return this.runs.get(run.id) === run && !this.superseded.has(run)
   }
 
   forget(runId: string): void {

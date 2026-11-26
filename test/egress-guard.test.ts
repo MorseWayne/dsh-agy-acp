@@ -4,8 +4,11 @@ import https from 'node:https'
 import net, { type AddressInfo } from 'node:net'
 import test from 'node:test'
 import {
+  DEFAULT_EGRESS_PROBES,
   EgressBlockedError,
   EgressGuard,
+  evaluateGoogleAiStudioProbe,
+  evaluateGoogleCloudCodeProbe,
   parseCloudflareTrace,
   parseIpSbGeoIp,
   resolveProxyForUrl,
@@ -482,5 +485,162 @@ test('EgressGuard falls back to backup probe, deduplicates singleflight, enforce
   } finally {
     guard.dispose()
     await trackedProbe.close()
+  }
+})
+
+test('DEFAULT_EGRESS_PROBES uses pure anonymous Google endpoints and evaluates AI Studio + CloudCode over HTTP CONNECT', async () => {
+  // 1. Default probe configuration never calls third-party IP services and carries zero credentials
+  assert.ok(DEFAULT_EGRESS_PROBES.length >= 2)
+  const serializedDefaults = JSON.stringify(DEFAULT_EGRESS_PROBES)
+  assert.equal(serializedDefaults.includes('cloudflare.com'), false)
+  assert.equal(serializedDefaults.includes('ip.sb'), false)
+  assert.equal(/authorization|cookie/i.test(serializedDefaults), false)
+  assert.equal(DEFAULT_EGRESS_PROBES[0]?.id, 'google-aistudio')
+  assert.equal(DEFAULT_EGRESS_PROBES[0]?.url, 'https://aistudio.google.com/')
+  assert.equal(DEFAULT_EGRESS_PROBES[0]?.method, 'HEAD')
+  assert.equal(DEFAULT_EGRESS_PROBES[0]?.confirm?.url, 'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist')
+
+  // 2. Live loopback TLS + HTTP CONNECT proxy testing all anonymous Google probe outcomes
+  let aiMode: 'welcome' | 'restricted' | 'down' = 'welcome'
+  let cloudMode: 'unauth' | 'geo-400' | 'down' = 'unauth'
+  const observed: Array<{ method: string; path: string; hasAuth: boolean; hasCookie: boolean }> = []
+
+  const trackedTarget = trackServer(
+    https.createServer({ key: TEST_TLS_KEY, cert: TEST_TLS_CERT }, (req, res) => {
+      observed.push({
+        method: req.method ?? '',
+        path: req.url ?? '',
+        hasAuth: 'authorization' in req.headers,
+        hasCookie: 'cookie' in req.headers,
+      })
+      if (req.url === '/') {
+        if (aiMode === 'welcome') {
+          res.writeHead(302, { Location: 'https://aistudio.google.com/welcome', 'Content-Length': '0' })
+          res.end()
+          return
+        }
+        if (aiMode === 'restricted') {
+          res.writeHead(302, { Location: 'https://aistudio.google.com/available-regions', 'Content-Length': '0' })
+          res.end()
+          return
+        }
+        res.writeHead(503)
+        res.end()
+        return
+      }
+      if (req.url === '/v1internal:loadCodeAssist') {
+        if (cloudMode === 'unauth') {
+          res.writeHead(401, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: { code: 401, status: 'UNAUTHENTICATED' } }))
+          return
+        }
+        if (cloudMode === 'geo-400') {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: { code: 400, status: 'FAILED_PRECONDITION', message: 'User location is not supported for the API use.' } }))
+          return
+        }
+        res.writeHead(503)
+        res.end('unavailable')
+        return
+      }
+      res.writeHead(404)
+      res.end()
+    }),
+  )
+  await new Promise<void>((resolve) => trackedTarget.server.listen(0, '127.0.0.1', () => resolve()))
+  const targetPort = (trackedTarget.server.address() as AddressInfo).port
+
+  const trackedProxy = trackServer(http.createServer((_req, res) => { res.writeHead(405); res.end() }))
+  trackedProxy.server.on('connect', (_req, clientSocket, head) => {
+    const upstream = net.connect({ host: '127.0.0.1', port: targetPort }, () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      if (head.length > 0) upstream.write(head)
+      upstream.pipe(clientSocket)
+      clientSocket.pipe(upstream)
+    })
+    upstream.on('error', () => clientSocket.destroy())
+    clientSocket.on('error', () => upstream.destroy())
+  })
+  await new Promise<void>((resolve) => trackedProxy.server.listen(0, '127.0.0.1', () => resolve()))
+  const proxyPort = (trackedProxy.server.address() as AddressInfo).port
+
+  const guard = new EgressGuard({
+    probes: [
+      {
+        id: 'google-aistudio',
+        url: `https://aistudio.google.com:${targetPort}/`,
+        method: 'HEAD',
+        evaluate: evaluateGoogleAiStudioProbe,
+        confirm: {
+          id: 'google-cloudcode',
+          url: `https://daily-cloudcode-pa.googleapis.com:${targetPort}/v1internal:loadCodeAssist`,
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+          evaluate: (res) => evaluateGoogleCloudCodeProbe(res, 'confirm'),
+        },
+      },
+      {
+        id: 'google-cloudcode',
+        url: `https://daily-cloudcode-pa.googleapis.com:${targetPort}/v1internal:loadCodeAssist`,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+        evaluate: (res) => evaluateGoogleCloudCodeProbe(res, 'standalone'),
+      },
+    ],
+    tlsOptions: { rejectUnauthorized: false },
+  })
+  const env = { HTTPS_PROXY: `http://127.0.0.1:${proxyPort}` }
+
+  try {
+    // Supported: AI Studio 302 /welcome + CloudCode 401 -> supported, zero auth/cookies sent
+    const okSnap = await guard.check('g-ok', env, { force: true })
+    assert.equal(okSnap.status, 'supported')
+    assert.equal(okSnap.country, null)
+    assert.equal(okSnap.proxyMode, 'proxy')
+    assert.equal(okSnap.probeSource, 'google-aistudio')
+    assert.deepEqual(
+      observed.map((o) => `${o.method} ${o.path}`),
+      ['HEAD /', 'POST /v1internal:loadCodeAssist'],
+    )
+    assert.ok(observed.every((o) => !o.hasAuth && !o.hasCookie))
+
+    // Restricted: AI Studio 302 /available-regions -> immediately unsupported (skips confirm)
+    observed.length = 0
+    aiMode = 'restricted'
+    const restrictedSnap = await guard.check('g-hk', env, { force: true })
+    assert.equal(restrictedSnap.status, 'unsupported')
+    assert.equal(restrictedSnap.probeSource, 'google-aistudio')
+    assert.equal(observed.length, 1)
+    await assert.rejects(
+      guard.assertAllowed({ accountId: 'g-hk', env, mode: 'block' }),
+      (err: unknown) => err instanceof EgressBlockedError && err.message.includes('Google AI Studio 受限区'),
+    )
+
+    // Split route: AI Studio welcome, but CloudCode returns 400 geo -> unsupported
+    aiMode = 'welcome'
+    cloudMode = 'geo-400'
+    const splitSnap = await guard.check('g-split', env, { force: true })
+    assert.equal(splitSnap.status, 'unsupported')
+    assert.equal(splitSnap.probeSource, 'google-cloudcode')
+
+    // AI Studio down (503) + CloudCode reachable (401) -> unknown (block allows, strict blocks)
+    aiMode = 'down'
+    cloudMode = 'unauth'
+    const unkSnap = await guard.assertAllowed({ accountId: 'g-unk', env, mode: 'block' })
+    assert.equal(unkSnap?.status, 'unknown')
+    assert.equal(unkSnap?.probeSource, 'google-cloudcode')
+    await assert.rejects(guard.assertAllowed({ accountId: 'g-unk', env, mode: 'strict' }), EgressBlockedError)
+
+    // AI Studio welcome, but CloudCode unreachable (503) -> error (never false green)
+    aiMode = 'welcome'
+    cloudMode = 'down'
+    const errSnap = await guard.check('g-err', env, { force: true })
+    assert.equal(errSnap.status, 'error')
+  } finally {
+    guard.dispose()
+    await trackedProxy.close()
+    await trackedTarget.close()
   }
 })

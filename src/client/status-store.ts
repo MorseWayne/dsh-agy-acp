@@ -22,10 +22,11 @@ export interface StatusStore {
   dispose(): void
 }
 
-function isValidSnapshot(v: unknown): v is StatusSnapshot {
+export function isValidSnapshot(v: unknown): v is StatusSnapshot {
   if (!v || typeof v !== 'object') return false
   const s = v as Partial<StatusSnapshot>
-  return Number.isFinite(s.updatedAt) && Array.isArray(s.sessions) && Array.isArray(s.accounts)
+  return Number.isFinite(s.updatedAt) && Array.isArray(s.accounts) && Array.isArray(s.sessions)
+    && s.sessions.every(row => row && typeof row.dshSessionKey === 'string' && row.dshSessionKey.trim().length > 0)
 }
 
 async function defaultFetchStatus(): Promise<StatusSnapshot | null> {

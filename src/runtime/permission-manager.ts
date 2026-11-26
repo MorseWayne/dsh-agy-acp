@@ -1,6 +1,39 @@
 import { realpathSync } from 'node:fs'
 import path from 'node:path'
-import type { RequestPermissionParams, RequestPermissionResult } from '../acp/protocol.ts'
+import type { PermissionOption, RequestPermissionParams, RequestPermissionResult } from '../acp/protocol.ts'
+
+/** Native Antigravity user questions share `session/request_permission`, identified by `interaction_` id prefix. */
+export function isInteractionQuestion(req: RequestPermissionParams): boolean {
+  return typeof req.toolCall?.toolCallId === 'string' && req.toolCall.toolCallId.startsWith('interaction_')
+}
+
+/** Extracts `agy.security.warning` metadata attached by agy to high-impact approval options. */
+export function extractSecurityWarning(option: PermissionOption): string | undefined {
+  const meta = option._meta
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return undefined
+  const warning = (meta as Record<string, unknown>)['agy.security.warning']
+  if (!warning || typeof warning !== 'object' || Array.isArray(warning)) return undefined
+  const rec = warning as Record<string, unknown>
+  const message = typeof rec.message === 'string' && rec.message.trim() ? rec.message.trim() : undefined
+  const title = typeof rec.title === 'string' && rec.title.trim() ? rec.title.trim() : undefined
+  const text = message || title
+  return text ? (text.length > 512 ? `${text.slice(0, 509)}...` : text) : undefined
+}
+
+const DIRECT_DSH_MCP_TITLE_RE = /^Run mcp_dsh-tools_(?<tool>[A-Za-z0-9_-]+)\??$/
+const PROXIED_MCP_TITLE_RE = /^MCP Tool (?<tool>[A-Za-z0-9_-]+)\??$/
+
+/** Strictly identifies requests targeting this plugin's own `dsh-tools` reverse MCP server. */
+export function isDshReverseMcpRequest(req: RequestPermissionParams): boolean {
+  const title = req.toolCall.title?.trim() ?? ''
+  const rawInput = asRecord(req.toolCall.rawInput) ?? asRecord(req.toolCall.args)
+  const proxiedTool = PROXIED_MCP_TITLE_RE.exec(title)?.groups?.tool
+  if (proxiedTool) {
+    return rawInput?.ServerName === 'dsh-tools' && rawInput?.ToolName === proxiedTool
+  }
+  if (typeof rawInput?.CommandLine === 'string') return false
+  return DIRECT_DSH_MCP_TITLE_RE.test(title)
+}
 
 export interface FilePolicy {
   mode: 'read-only' | 'workspace-write' | 'danger-full-access'
@@ -614,6 +647,23 @@ export function formatApprovalReason(req: RequestPermissionParams): string {
   const rawPayload = tc.rawInput ?? tc.args
   const lines: string[] = []
 
+  if (isInteractionQuestion(req)) {
+    lines.push('Antigravity 发起交互确认（原生问题选项）')
+    if (tc.title) lines.push(`问题: ${tc.title}`)
+    if (req.options.length > 0) {
+      lines.push('可选项:')
+      for (const opt of req.options) {
+        const label = opt.name?.trim() || opt.optionId
+        lines.push(`- ${label} (${opt.optionId})`)
+      }
+    }
+    return lines.join('\n')
+  }
+
+  const securityWarnings = req.options
+    .map((o) => extractSecurityWarning(o))
+    .filter((w): w is string => Boolean(w))
+
   if (kind === 'execute') {
     lines.push(`Antigravity 请求执行命令 (${kind}): ${toolName}`)
     if (tc.title) lines.push(`说明: ${tc.title}`)
@@ -626,6 +676,9 @@ export function formatApprovalReason(req: RequestPermissionParams): string {
       lines.push(`⚠️ 高危命令拦截: ${risk.reason}`)
     } else if (extracted?.hasDangerousEnv) {
       lines.push('⚠️ 高危环境拦截: 命令携带受限环境变量注入（如 LD_PRELOAD / NODE_OPTIONS）')
+    }
+    for (const w of securityWarnings) {
+      lines.push(`⚠️ 上游安全提示: ${w}`)
     }
 
     const fullCmd = extracted?.displayCmd
@@ -654,6 +707,9 @@ export function formatApprovalReason(req: RequestPermissionParams): string {
     if (paths.length > 0) {
       lines.push(`目标路径 (${paths.length}):\n${paths.map(p => `- ${p}`).join('\n')}`)
     }
+    for (const w of securityWarnings) {
+      lines.push(`⚠️ 上游安全提示: ${w}`)
+    }
     const body = extractEditBody(inputObj)
     if (body) {
       const bytes = Buffer.byteLength(body.text, 'utf8')
@@ -673,6 +729,9 @@ export function formatApprovalReason(req: RequestPermissionParams): string {
   if (paths.length > 0) lines.push(`目标路径: ${paths.join(', ')}`)
   const url = firstString(inputObj, ['Url', 'url'])
   if (url) lines.push(`URL: ${url}`)
+  for (const w of securityWarnings) {
+    lines.push(`⚠️ 上游安全提示: ${w}`)
+  }
   if (rawPayload !== undefined) {
     lines.push(`参数:\n${safeJsonPreview(rawPayload, MAX_GENERIC_PREVIEW_CHARS)}`)
   }
@@ -686,6 +745,12 @@ function disposition(p: SessionPolicy, req: RequestPermissionParams): 'allow' | 
   if (p.mode === 'read-only') return 'deny'
   if (p.mode === 'danger-full-access' && p.preset === 'danger-full-access' && p.approval === 'never') return 'allow'
   if (p.mode === 'workspace-write' && p.preset === 'workspace-write') {
+    // Reverse MCP calls to this plugin's own `dsh-tools` server are executed by DSH's `tools.execute()`,
+    // which enforces DSH's own pre-execute hooks, file sandbox, and approval chain. Auto-allowing at the
+    // ACP layer prevents redundant double-approval prompts without weakening host security authority.
+    if (isDshReverseMcpRequest(req)) {
+      return 'allow'
+    }
     if (kind === 'edit' || kind === 'delete' || kind === 'move') {
       const targets = extractEditTargets(req)
       if (targets && isWithinRoots(targets, p.workspaceRoot, p.additionalWritableRoots)) {
@@ -714,13 +779,32 @@ export async function decidePermission(
   ask: (reason: string) => Promise<string>,
   signal: AbortSignal,
   launchPolicy?: SessionPolicy,
+  choose?: (req: RequestPermissionParams) => Promise<string | undefined>,
 ): Promise<RequestPermissionResult> {
   try {
     const p = readPolicy()
+    if (signal.aborted) return cancelled()
+
+    // Native Antigravity questions (`interaction_*`) are fixed-choice prompts, never auto-answered
+    // even in full-access mode. Route through host ask when interactive; cancel when non-interactive.
+    if (isInteractionQuestion(req)) {
+      const tc = req.toolCall
+      const ids = new Set(req.options.map(o => o.optionId))
+      if (!choose || !req.options.length || req.options.length > 32 || ids.size !== req.options.length ||
+          req.options.some(o => typeof o.optionId !== 'string' || !o.optionId.trim() || o.optionId.length > 256 ||
+            o.kind === 'allow_always' || extractSecurityWarning(o)) ||
+          (tc.kind && tc.kind !== 'other') || tc.locations?.length ||
+          [tc.args, tc.rawInput].some(data => data != null && (!asRecord(data) || Object.keys(data).length)) ||
+          p.approval !== 'ask' || launchPolicy?.approval === 'never') return cancelled()
+      const answer = await choose(req)
+      if (signal.aborted || policyKey(readPolicy()) !== policyKey(p) || !answer || !ids.has(answer)) return cancelled()
+      return { outcome: { outcome: 'selected', optionId: answer } }
+    }
+
     const allow = req.options.find(o => o.kind === 'allow_once')
     const reject = req.options.find(o => o.kind === 'reject_once')
     const denied = (): RequestPermissionResult => reject ? { outcome: { outcome: 'selected', optionId: reject.optionId } } : cancelled()
-    if (signal.aborted || !allow) return denied()
+    if (!allow) return denied()
     const action = disposition(p, req)
     const launchAction = launchPolicy ? disposition(launchPolicy, req) : action
     if (action === 'deny' || launchAction === 'deny') return denied()

@@ -1,9 +1,11 @@
 import { EventEmitter } from 'node:events'
 import path from 'node:path'
-import { realpathSync } from 'node:fs'
+import { lstatSync, realpathSync } from 'node:fs'
+import os from 'node:os'
 import { isGeoUnsupportedError } from '../common/geo.ts'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import type {
+  AccountFailureOptions,
   AccountHealthSnapshot,
   AccountLease,
   AccountProfileConfig,
@@ -12,6 +14,7 @@ import type {
   ModelFamily,
   QuotaBucketState,
 } from '../common/types.ts'
+import { detectLinuxCaBundle } from './session-cleanup.ts'
 import type { CredentialSlotLeaseManager } from './credential-lease.ts'
 
 export function classifyModelFamily(model: string): ModelFamily {
@@ -20,6 +23,7 @@ export function classifyModelFamily(model: string): ModelFamily {
   if (m.includes('claude') || m.includes('opus') || m.includes('sonnet') || m.includes('haiku')) {
     return 'claude'
   }
+  if (/(?:^|[^a-z])gpt(?:$|[^a-z])/.test(m)) return 'gpt'
   if (m.includes('flash')) {
     return 'gemini-flash'
   }
@@ -128,9 +132,53 @@ export interface MultiAccountPoolOptions {
   log?: (msg: string) => void
 }
 
-function buildAccountEnv(profile: AccountProfileConfig): NodeJS.ProcessEnv | undefined {
-  const env: NodeJS.ProcessEnv = { ...process.env }
+/** Ambient credential/runtime env vars stripped from isolated accounts so host creds never bleed in. */
+const STRIPPED_ISOLATED_ENV_KEYS = new Set([
+  'GEMINI_API_KEY',
+  'GOOGLE_API_KEY',
+  'GOOGLE_APPLICATION_CREDENTIALS',
+  'GOOGLE_CLOUD_PROJECT',
+  'GOOGLE_CLOUD_LOCATION',
+  'GOOGLE_CLOUD_QUOTA_PROJECT',
+  'GOOGLE_GENAI_USE_VERTEXAI',
+  'GCLOUD_PROJECT',
+  'CLOUDSDK_CORE_PROJECT',
+  'AGY_ACP_CCPA_PROJECT',
+  'AGY_ACP_ENABLE_OAUTH',
+  'GEMINI_HOME',
+  'GEMINI_CLI_HOME',
+  'ANTIGRAVITY_GEMINI_DIR',
+  'ANTIGRAVITY_APP_DATA_DIR',
+  'CLOUDSDK_CONFIG',
+  'CLOUDSDK_AUTH_ACCESS_TOKEN',
+  'GOOGLE_OAUTH_ACCESS_TOKEN',
+  'GOOGLE_GHA_CREDS_PATH',
+  'CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE',
+  'GOOGLE_GENAI_USE_GCA',
+  'XDG_RUNTIME_DIR',
+  'BROWSER',
+  'PYTHONUNBUFFERED',
+  'AGY_ACP_FORCE_FILE_STORAGE',
+  'ELECTRON_RUN_AS_NODE',
+  'CHROME_CRASHPAD_PIPE_NAME',
+])
+
+export function buildAccountEnv(profile: AccountProfileConfig): NodeJS.ProcessEnv | undefined {
+  const env: NodeJS.ProcessEnv = {}
   let modified = false
+
+  // When an account uses an isolated homeDir or explicit env, scrub ambient cloud/Gemini credentials
+  // (case-insensitive for Windows) so host variables never leak into another account.
+  const scrubAmbient = Boolean(profile.homeDir || Object.keys(profile.env ?? {}).length)
+  for (const [k, v] of Object.entries(process.env)) {
+    const upper = k.toUpperCase()
+    if ((scrubAmbient && STRIPPED_ISOLATED_ENV_KEYS.has(upper)) ||
+        (profile.homeDir && ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME'].includes(upper))) {
+      modified = true
+      continue
+    }
+    env[k] = v
+  }
 
   if (profile.homeDir) {
     const absHome = path.resolve(profile.homeDir)
@@ -139,18 +187,36 @@ function buildAccountEnv(profile: AccountProfileConfig): NodeJS.ProcessEnv | und
     env.XDG_CONFIG_HOME = path.join(absHome, '.config')
     env.XDG_DATA_HOME = path.join(absHome, '.local', 'share')
     env.XDG_CACHE_HOME = path.join(absHome, '.cache')
+    env.XDG_STATE_HOME = path.join(absHome, '.local', 'state')
+    env.GEMINI_HOME = path.join(absHome, '.gemini')
+    env.AGY_ACP_FORCE_FILE_STORAGE = '1'
+    if (process.platform === 'win32') {
+      env.APPDATA = path.join(absHome, 'AppData', 'Roaming')
+      env.LOCALAPPDATA = path.join(absHome, 'AppData', 'Local')
+    }
+    env.AGY_CLI_DISABLE_AUTO_UPDATE = '1'
     modified = true
   }
 
   let hasProxy = false
   if (profile.env) {
     for (const [k, v] of Object.entries(profile.env)) {
-      env[k] = v
+      const key = process.platform === 'win32' ? k.toUpperCase() : k
+      if (process.platform === 'win32') {
+        for (const prev of Object.keys(env)) if (prev !== key && prev.toUpperCase() === key) delete env[prev]
+      }
+      env[key] = v
       if ((PROXY_ENV_KEYS as readonly string[]).includes(k) && v.trim()) {
         hasProxy = true
       }
       modified = true
     }
+  }
+
+  const caBundle = detectLinuxCaBundle(env)
+  if (caBundle) {
+    env.SSL_CERT_FILE = caBundle
+    modified = true
   }
 
   if (hasProxy) {
@@ -166,7 +232,15 @@ function buildAccountEnv(profile: AccountProfileConfig): NodeJS.ProcessEnv | und
 
 function canonicalPath(dir: string): string {
   let resolved = path.resolve(dir)
-  try { resolved = realpathSync(resolved) } catch { /* agy may not have created it yet */ }
+  // Resolve existing ancestors even when the final store has not been created yet.
+  const suffix: string[] = []
+  let ancestor = resolved
+  while (true) {
+    try { resolved = path.join(realpathSync(ancestor), ...suffix); break } catch { /* try its parent */ }
+    if (ancestor === path.dirname(ancestor)) break
+    suffix.unshift(path.basename(ancestor))
+    ancestor = path.dirname(ancestor)
+  }
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved
 }
 
@@ -178,14 +252,30 @@ function quotaUnavailable(profile: AccountProfileConfig, profiles: AccountProfil
   const env = buildAccountEnv(profile)!
   const home = canonicalPath(profile.homeDir)
   const effectiveHome = (e: NodeJS.ProcessEnv) => process.platform === 'win32' ? e.USERPROFILE : e.HOME
+  if (home === canonicalPath(os.homedir()) || home === path.parse(home).root) return '账号 HOME 与本机环境重叠'
+  const configuredHome = path.resolve(profile.homeDir)
+  if (home !== (process.platform === 'win32' ? configuredHome.toLowerCase() : configuredHome)) return '账号 HOME 不得经过符号链接'
   if (canonicalPath(effectiveHome(env) || '.') !== home) return '账号环境覆盖了独立 HOME'
   const storePaths = (e: NodeJS.ProcessEnv) => {
     const gemini = path.join(effectiveHome(e) || '.', '.gemini')
-    return [e.GEMINI_CLI_HOME || gemini, e.ANTIGRAVITY_GEMINI_DIR || gemini, e.ANTIGRAVITY_APP_DATA_DIR || path.join(gemini, 'antigravity-cli')].map(canonicalPath)
+    return [e.GEMINI_HOME || gemini, e.GEMINI_CLI_HOME || gemini, e.ANTIGRAVITY_GEMINI_DIR || gemini, e.ANTIGRAVITY_APP_DATA_DIR || path.join(gemini, 'antigravity-cli')].map(canonicalPath)
   }
   const stores = storePaths(env)
   if (stores.some(dir => dir !== home && !dir.startsWith(home + path.sep))) return '账号凭据目录未隔离'
-  if (profiles.some(p => p !== profile && storePaths(buildAccountEnv(p) ?? process.env).some(dir => stores.includes(dir)))) return '多个账号共享凭据目录，无法归属配额'
+  // Check the actual file-backed stores as well as their parents. A symlink/hardlinked
+  // token is not grounds for running the CLI under someone else's sign-in either.
+  const gemini = env.GEMINI_HOME || path.join(home, '.gemini')
+  for (const dir of new Set([path.join(gemini, 'antigravity-acp'), env.ANTIGRAVITY_APP_DATA_DIR || path.join(gemini, 'antigravity-cli')])) {
+    for (const entry of [dir, path.join(dir, 'antigravity-oauth-token'), path.join(dir, 'acp_token.json')]) {
+      try {
+        const stat = lstatSync(entry)
+        if (stat.isSymbolicLink() || (entry === dir ? !stat.isDirectory() : !stat.isFile() || stat.nlink !== 1) ||
+            (process.getuid && stat.uid !== process.getuid()) || !canonicalPath(entry).startsWith(home + path.sep)) return '账号凭据文件未隔离'
+      } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return '无法确认账号凭据文件归属' }
+    }
+  }
+  const overlaps = (a: string, b: string) => a === b || a.startsWith(b + path.sep) || b.startsWith(a + path.sep)
+  if (profiles.some(p => p !== profile && (p.homeDir && overlaps(home, canonicalPath(p.homeDir)) || storePaths(buildAccountEnv(p) ?? process.env).some(dir => stores.some(store => overlaps(store, dir)))))) return '多个账号共享凭据目录，无法归属配额'
   // Desktop keyrings are user-wide even when HOME differs. Only accept the CLI's
   // existing file-backed SSH mode, or an explicitly private Linux bus inside this HOME.
   const privateBusPath = /^unix:path=([^,;%]+)$/.exec(env.DBUS_SESSION_BUS_ADDRESS ?? '')?.[1]
@@ -230,14 +320,20 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     }
   }
 
-  async acquireQuotaLease(accountId: string): Promise<AccountLease & { requiresFileCredentialMode: boolean }> {
+  async acquireQuotaLease(accountId: string): Promise<AccountLease & { requiresFileCredentialMode: boolean; directQuotaHome?: string }> {
     const acc = this.accounts.get(accountId)
     if (!acc) throw new Error('未知账号')
     const reason = quotaUnavailable(acc.profile, this.opts.accounts)
     if (reason) throw new Error(reason)
     const slot = await this.opts.slotManager?.acquire(accountId)
+    // A process-global slot can be awaited; validate again against the current filesystem after it is granted.
+    const changed = quotaUnavailable(acc.profile, this.opts.accounts)
+    if (changed) { slot?.release(); throw new Error(changed) }
     const env = buildAccountEnv(acc.profile)
-    return { accountId, env, requiresFileCredentialMode: Boolean(acc.profile.homeDir && env?.SSH_CONNECTION?.trim()), release: () => slot?.release() }
+    const requiresFileCredentialMode = Boolean(acc.profile.homeDir && env?.SSH_CONNECTION?.trim())
+    return { accountId, env, requiresFileCredentialMode,
+      ...(requiresFileCredentialMode ? { directQuotaHome: path.resolve(acc.profile.homeDir!) } : {}),
+      release: () => slot?.release() }
   }
 
   getAccountEnv(accountId: string): NodeJS.ProcessEnv | undefined {
@@ -285,9 +381,10 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     this.emit('change')
   }
 
-  clearQuotaSamples(): void {
+  clearQuotaSamples(accountId?: string): void {
     let changed = false
     for (const acc of this.accounts.values()) {
+      if (accountId !== undefined && acc.profile.id !== accountId) continue
       for (const state of acc.families.values()) {
         if (state.fiveHour || state.sevenDay) {
           state.fiveHour = undefined
@@ -385,7 +482,7 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     this.emit('change')
   }
 
-  reportFailure(accountId: string, model: string, error: unknown): void {
+  reportFailure(accountId: string, model: string, error: unknown, options?: AccountFailureOptions): void {
     const acc = this.accounts.get(accountId)
     if (!acc) return
     const family = classifyModelFamily(model)
@@ -403,13 +500,22 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
         `account "${accountId}" quarantined due to TOS/account-restriction violation (failover halted): ${acc.tosBlockedReason}`,
       )
     } else if (category === 'quota') {
+      const now = this.now()
+      const maxExplicitCooldownMs = 24 * 60 * 60_000
+      const explicitReset =
+        typeof options?.resetAt === 'number' &&
+        Number.isFinite(options.resetAt) &&
+        options.resetAt > now
+          ? Math.min(options.resetAt, now + maxExplicitCooldownMs)
+          : undefined
       const backoff = Math.min(
         this.maxCooldownMs,
         this.baseCooldownMs * 2 ** Math.min(state.consecutiveFailures - 1, 6),
       )
-      state.cooldownUntil = this.now() + backoff
+      state.cooldownUntil = explicitReset ?? now + backoff
+      const waitSec = Math.max(1, Math.round((state.cooldownUntil - now) / 1000))
       this.opts.log?.(
-        `account "${accountId}" entered ${Math.round(backoff / 1000)}s cooldown for family "${family}": ${safeMessage}`,
+        `account "${accountId}" entered ${waitSec}s cooldown for family "${family}"${explicitReset ? ' (upstream resetAt)' : ''}: ${safeMessage}`,
       )
     } else if (category === 'geo') {
       acc.geoBlockedUntil = Math.max(acc.geoBlockedUntil ?? 0, this.now() + 60_000)

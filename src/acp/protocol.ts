@@ -39,7 +39,7 @@ export interface InitializeParams {
 
 export interface InitializeResult {
   protocolVersion: number
-  agentInfo?: { name: string; version: string }
+  agentInfo?: { name: string; title?: string; version: string }
   agentCapabilities?: {
     loadSession?: boolean
     load_session?: boolean
@@ -47,6 +47,11 @@ export interface InitializeResult {
       image?: boolean
       audio?: boolean
       embeddedContext?: boolean
+    }
+    mcpCapabilities?: {
+      http?: boolean
+      sse?: boolean
+      acp?: boolean
     }
     sessionCapabilities?: Record<string, unknown>
     session_capabilities?: Record<string, unknown>
@@ -73,6 +78,18 @@ export function supportsSessionLoad(init: InitializeResult | null | undefined): 
   return false
 }
 
+export function supportsSessionResume(init: InitializeResult | null | undefined): boolean {
+  const caps = init?.agentCapabilities
+  if (!caps) return false
+  const values = [caps.sessionCapabilities?.resume, caps.session_capabilities?.resume]
+  return !values.includes(false) && values.some(value =>
+    value === true || (value !== null && typeof value === 'object' && !Array.isArray(value)))
+}
+
+export function supportsMcpHttp(init: InitializeResult | null | undefined): boolean {
+  return init?.agentCapabilities?.mcpCapabilities?.http === true
+}
+
 export interface AcpConfigOptionValue {
   value: string
   name: string
@@ -88,12 +105,22 @@ export interface AcpConfigOption {
   options?: Array<AcpConfigOptionValue | { groupId: string; name: string; options: AcpConfigOptionValue[] }>
 }
 
-export interface AcpMcpServerSpec {
+export interface AcpStdioMcpServerSpec {
+  type?: 'stdio'
   name: string
   command: string
   args: string[]
   env?: Array<{ name: string; value: string }>
 }
+
+export interface AcpHttpMcpServerSpec {
+  type: 'http'
+  name: string
+  url: string
+  headers?: Array<{ name: string; value: string }>
+}
+
+export type AcpMcpServerSpec = AcpStdioMcpServerSpec | AcpHttpMcpServerSpec
 
 export interface SessionNewParams {
   cwd: string
@@ -130,6 +157,9 @@ export interface SessionLoadResult extends Omit<SessionNewResult, 'sessionId'> {
   sessionId?: string
 }
 
+export type SessionResumeParams = SessionLoadParams
+export type SessionResumeResult = SessionLoadResult
+
 export interface SessionSetConfigOptionParams {
   sessionId: string
   configId: string
@@ -143,6 +173,9 @@ export interface SessionSetConfigOptionResult {
 export type PromptContentBlock =
   | { type: 'text'; text: string }
   | { type: 'image'; data: string; mimeType: string }
+  | { type: 'audio'; data: string; mimeType: string }
+  | { type: 'resource_link'; uri: string; name: string; mimeType?: string; size?: number }
+  | { type: 'resource'; resource: { uri: string; mimeType?: string } & ({ text: string } | { blob: string }) }
 
 export interface SessionPromptParams {
   sessionId: string
@@ -163,6 +196,14 @@ export interface SessionPromptResult {
   usage?: AcpUsage
 }
 
+export interface AcpToolCallContentEntry {
+  type: string
+  content?: { type: string; text?: string }
+  path?: string
+  oldText?: string | null
+  newText?: string
+}
+
 export interface AcpToolCallUpdate {
   sessionUpdate: 'tool_call' | 'tool_call_update'
   toolCallId: string
@@ -174,7 +215,8 @@ export interface AcpToolCallUpdate {
   locations?: Array<{ path: string; line?: number }>
   rawInput?: unknown
   rawOutput?: unknown
-  content?: Array<{ type: string; content?: { type: string; text?: string } }>
+  content?: AcpToolCallContentEntry[]
+  _meta?: Record<string, unknown>
 }
 
 export type SessionUpdatePayload =
@@ -196,6 +238,7 @@ export interface PermissionOption {
   optionId: string
   name: string
   kind: 'allow_once' | 'allow_always' | 'reject_once' | 'reject_always' | string
+  _meta?: Record<string, unknown>
 }
 
 export interface RequestPermissionParams {

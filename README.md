@@ -1,6 +1,6 @@
 # dsh-agy-acp
 
-新一代 **DeepSeek Harness (DSH) × Google Antigravity (`agy acp`)** 桥接插件，基于官方持久化 ACP JSON-RPC 2.0 长连接协议构建，提供实时原生工具卡片镜像、会话级权限沙箱对齐、出口地域合规防风控熔断、`session/load` 跨重启会话恢复、反向 MCP 桥接与多账号配额感知运维闭环。
+新一代 **DeepSeek Harness (DSH) × Google Antigravity (`agy acp`)** 桥接插件，基于官方持久化 ACP JSON-RPC 2.0 长连接协议构建，提供实时原生工具卡片镜像、会话级权限沙箱对齐、出口地域合规防风控熔断、按能力协商的跨重启会话恢复、反向 MCP 桥接与多账号配额感知运维闭环。
 
 ## 安装与本地联调
 
@@ -12,12 +12,13 @@
 dsh plugin --profile web add @morsewayne/dsh-agy-acp --registry=https://registry.npmjs.org
 ```
 
-本地源码构建与链接调试：
+本地联调先构建，再使用 DSH 插件管理器安装本项目目录（不需要打包 `.tgz`）：
 
 ```bash
 pnpm install
 pnpm run verify
-dsh plugin --profile web add /path/to/dsh-agy-acp
+npm run build
+# DSH → 插件管理 → 安装本地项目目录
 ```
 
 启动或重启 `dsh web` 后，可在聊天框输入 `/agy-acp` 查看运行状态，或输入 `/agy-acp doctor` 执行一键只读环境自检。
@@ -26,9 +27,9 @@ dsh plugin --profile web add /path/to/dsh-agy-acp
 
 ## 核心特性
 
-### 1. 持久 `agy acp` 长连接与 `session/load` 原生连续性
+### 1. 持久 `agy acp` 长连接与 会话原生连续性
 - **零冷启动长连接**（`src/acp/` + `src/runtime/session-pool.ts`）：按 DSH 会话与权限指纹维护长驻 `agy acp` 进程，动态同步 `model` / `thought_level` / `mode` 及 `config_option_update`、`session_info_update` 实时通知，支持 `AbortSignal` 毫秒级 `session/cancel`。
-- **`session/load` 跨空闲与重启恢复**（`src/runtime/session-index.ts`）：轻量级索引持久化于 `~/.dsh/agy-acp/sessions.json`（`0600` 权限，上限 200 条、7 天自动过期，**不落盘任何对话正文或凭据**）。当空闲 TTL 回收或 DSH 重启后，若账号、工作目录与权限指纹未变且对端支持 `loadSession`，优先调用 `session/load` 原生恢复上下文与服务端 Prompt Cache；若不可用则无感降级至 `session/new` + 24K 预算制 `<prior_conversation_digest>` 摘要。
+- **跨空闲与重启恢复**（`src/runtime/session-index.ts`）：轻量级索引持久化于 `~/.dsh/agy-acp/sessions.json`（`0600` 权限，上限 200 条、7 天自动过期，**不落盘任何对话正文或凭据**）。当空闲 TTL 回收或 DSH 重启后，若账号、工作目录与权限指纹未变，优先使用 `session/resume` 恢复原生上下文；老版本回退 `session/load`，只保留模型、标题和用量元数据，不向对话重放历史。两者均不可用时改用 `session/new` + 24K 预算制 `<prior_conversation_digest>` 摘要。
 - **`options.system` 与只读辅助调用**：优先通过 `_meta.antigravity.systemPrompt.append` 注入宿主系统提示词并按哈希增量更新；针对标题生成、上下文压缩等 `options.purpose` 请求，使用独立只读沙箱、拒绝全部工具审批且不污染主会话池。
 
 ### 2. 实时工具流式镜像与全系原生卡片
@@ -45,7 +46,7 @@ dsh plugin --profile web add /path/to/dsh-agy-acp
 - **前端单例 SSE 与主题适配**（`src/client/`）：模块级共享单条 `/plugins/agy-acp/events` 连接，全面接入 DSH `--dsw-alias-*` 浅色/深色主题令牌。
 
 ### 5. 会话级反向 MCP 桥接与 `/agy-acp` 诊断工具箱
-- **反向 MCP 桥接加固**（`src/mcp/server.ts`）：通过 `session/new` / `session/load` 动态注入本机 `127.0.0.1` Bearer 鉴权桥接，不污染全局 `~/.gemini/config/mcp_config.json`；内置单次工具调用超时（触发 `AbortSignal` 中断慢工具并返回 `-32001`）与单会话并发上限保护（`-32005`）。
+- **反向 MCP 桥接加固**（`src/mcp/server.ts`）：优先使用对端声明的 HTTP MCP 能力，旧版用 stdio 转发；创建和恢复会话时动态注入本机 `127.0.0.1` Bearer 鉴权桥接，不污染全局 `~/.gemini/config/mcp_config.json`；内置单次工具调用超时（触发 `AbortSignal` 中断慢工具并返回 `-32001`）与单会话并发上限保护（`-32005`）。
 - **斜杠命令诊断**（`src/runtime/doctor.ts`）：
   - `/agy-acp`（或 `/agy-acp status`）：输出连接套餐、活跃/已索引会话、地域防护与配额调度状态、反向 MCP 统计、账号出口与 Token 概览；
   - `/agy-acp doctor`：执行只读 5 步自检（`agy` 可执行文件与版本、宿主只读沙箱强制约束、启用账号出口地域合规性、ACP 模型目录握手、本机持久化文件状态），全量输出经凭据与 IP 脱敏处理。
@@ -66,6 +67,15 @@ dsh plugin --profile web add /path/to/dsh-agy-acp
 受限模式（含目录探测、辅助调用、配额查询、`doctor` 自检）必须由宿主 `sandbox.confine` 返回 `enforcement === 'full'`；无法提供时直接拒绝启动，绝不无沙箱降级执行。
 
 ---
+
+## 面板与故障排查
+
+- **会话与用量**：看该会话实际使用的恢复方式和 MCP 传输，而不是仅看对端声称支持的能力。SSE 中断时展示最后快照，不表示仍在线。
+- **账号与配额**：显示读数来源与采样时间。只有明确属于该隔离账号、尚未过期的文件凭据才尝试配额接口；不续签 OAuth，不读取机器默认账号的共享令牌。不具备条件时使用只读 CLI。`3p` 为共享额度，不把满额滚动窗口的占位时间当作真实倒计时。
+- **桥接配置**：`requestTimeoutMs` 对 `session/prompt` 表示空闲超时，而不是整轮最长运行时间。属于本会话的活动会重置计时；权限等待、长工具及取消有单独的生命周期处理。
+- **异常完成**：按本轮新增的原生 SQLite 步骤识别伪装成 `end_turn` 的错误；不可读时仅依据 ACP 结果，不猜测普通消息。配额错误优先采用有效的上游重试时间，已损坏的 thinking 签名会使旧会话索引失效，下轮用摘要新建，不自动重跑已执行的工具。
+- **原生提问与工具卡片**：业务选择只接受该会话用户明确选中的选项；不以「允许一次」代选。工具镜像对输入、输出和内联数据有预算，工作区外或匹配不唯一时不推测编辑行号。
+- **隔离边界**：只清理本插件创建且可核实归属的私有临时目录。不递归清除共享账号的会话数据库，不向真实 HOME 创建可写规则/技能链接，也不冒用其他客户端标识解锁老版本模型。
 
 ## 开发与验证
 

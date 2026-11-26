@@ -3,7 +3,7 @@ import http from 'node:http'
 import https from 'node:https'
 import net from 'node:net'
 import tls from 'node:tls'
-import { isUnsupportedGeoCountry, maskIpAddress, normalizeGeoCountryCode } from '../common/geo.ts'
+import { isGeoUnsupportedError, isUnsupportedGeoCountry, maskIpAddress, normalizeGeoCountryCode } from '../common/geo.ts'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import type { AccountEgressSnapshot, GeoFenceMode } from '../common/types.ts'
 
@@ -23,10 +23,110 @@ const PROXY_ENV_KEYS = [
   'http_proxy',
 ] as const
 
+export interface EgressProbeHttpResponse {
+  statusCode: number
+  headers: Record<string, string>
+  body: string
+}
+
+export type EgressProbeEvaluation =
+  | { kind: 'supported'; country?: string | null; ip?: string | null; reason?: string }
+  | { kind: 'unsupported'; country?: string | null; ip?: string | null; reason?: string }
+  | { kind: 'unknown'; ip?: string | null; reason: string }
+  | { kind: 'retry'; reason: string }
+
 export interface EgressProbeEndpoint {
   id: string
   url: string
-  parse: (body: string) => { rawCountry: string | null; ip: string | null }
+  method?: 'GET' | 'HEAD' | 'POST'
+  headers?: Record<string, string>
+  body?: string
+  parse?: (body: string) => { rawCountry: string | null; ip: string | null }
+  evaluate?: (res: EgressProbeHttpResponse) => EgressProbeEvaluation
+  /** Optional follow-up check executed only when this probe returns `supported`. */
+  confirm?: Omit<EgressProbeEndpoint, 'confirm'>
+}
+
+const AISTUDIO_UNSUPPORTED_LOCATION_RE = /(?:available[_-]?regions|unsupported|not[_-]?available|restricted)/i
+const AISTUDIO_SUPPORTED_LOCATION_RE =
+  /^(?:https?:\/\/(?:aistudio\.google\.com|accounts\.google\.com)(?:\/|$)|\/(?:welcome|app|prompts|apikey|live)(?:[/?#]|$))/i
+
+/**
+ * Evaluates a strictly anonymous (zero-cookie, zero-token) `HEAD https://aistudio.google.com/`
+ * pre-flight response. Google's edge GeoIP redirects supported regions to `/welcome` (or `/app`)
+ * and unsupported regions to `/available-regions` (or returns 451 / geo error).
+ */
+export function evaluateGoogleAiStudioProbe(res: EgressProbeHttpResponse): EgressProbeEvaluation {
+  const location = (res.headers.location ?? '').trim()
+  if (
+    res.statusCode === 451 ||
+    isGeoUnsupportedError(res.body) ||
+    (location !== '' && AISTUDIO_UNSUPPORTED_LOCATION_RE.test(location))
+  ) {
+    return {
+      kind: 'unsupported',
+      reason: 'Google AI Studio 匿名预检判定当前出口位于不受支持的地区',
+    }
+  }
+  if (
+    res.statusCode === 301 ||
+    res.statusCode === 302 ||
+    res.statusCode === 303 ||
+    res.statusCode === 307 ||
+    res.statusCode === 308
+  ) {
+    if (location !== '' && AISTUDIO_SUPPORTED_LOCATION_RE.test(location)) {
+      return { kind: 'supported' }
+    }
+    return {
+      kind: 'retry',
+      reason: `Google AI Studio 匿名预检返回未识别重定向（HTTP ${res.statusCode}）`,
+    }
+  }
+  if (res.statusCode === 200) {
+    if (/available[_-]?regions/i.test(res.body) && /not available in your/i.test(res.body)) {
+      return {
+        kind: 'unsupported',
+        reason: 'Google AI Studio 匿名预检判定当前出口位于不受支持的地区',
+      }
+    }
+    return { kind: 'supported' }
+  }
+  return {
+    kind: 'retry',
+    reason: `Google AI Studio 匿名预检返回 HTTP ${res.statusCode}`,
+  }
+}
+
+/**
+ * Evaluates a strictly anonymous (zero-Authorization) `POST https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`
+ * connectivity & edge geo probe.
+ * - In `confirm` mode (paired with AI Studio): 401/403/200 confirms the actual `*.googleapis.com` proxy route is reachable.
+ * - In `standalone` fallback mode: 400 geo block => `unsupported`, 401/403 => `unknown` (reachable, auth checked before geo).
+ */
+export function evaluateGoogleCloudCodeProbe(
+  res: EgressProbeHttpResponse,
+  mode: 'confirm' | 'standalone' = 'standalone',
+): EgressProbeEvaluation {
+  if (res.statusCode === 451 || isGeoUnsupportedError(res.body)) {
+    return {
+      kind: 'unsupported',
+      reason: 'daily-cloudcode-pa.googleapis.com 匿名连通检查返回地域不受支持',
+    }
+  }
+  if (res.statusCode === 401 || res.statusCode === 403 || res.statusCode === 200) {
+    if (mode === 'confirm') {
+      return { kind: 'supported' }
+    }
+    return {
+      kind: 'unknown',
+      reason: 'daily-cloudcode-pa.googleapis.com 代理通道可达，但匿名接口不返回地域结论（Google AI Studio 预检暂不可用）',
+    }
+  }
+  return {
+    kind: 'retry',
+    reason: `daily-cloudcode-pa.googleapis.com 匿名连通检查返回 HTTP ${res.statusCode}`,
+  }
 }
 
 export function parseCloudflareTrace(body: string): { rawCountry: string | null; ip: string | null } {
@@ -59,23 +159,50 @@ export function parseIpSbGeoIp(body: string): { rawCountry: string | null; ip: s
   }
 }
 
+const GOOGLE_CLOUDCODE_CONFIRM_PROBE: Omit<EgressProbeEndpoint, 'confirm'> = {
+  id: 'google-cloudcode',
+  url: 'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist',
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: '{}',
+  evaluate: (res) => evaluateGoogleCloudCodeProbe(res, 'confirm'),
+}
+
+/**
+ * Pure anonymous (zero-credential) Google egress probes.
+ * Probing Google domains directly ensures domain-based split-tunnel proxies (e.g. Clash Verge)
+ * route the check through the exact same Google policy group as `agy`, without touching third-party IP services.
+ */
 export const DEFAULT_EGRESS_PROBES: readonly EgressProbeEndpoint[] = [
   {
-    id: 'cloudflare-trace',
-    url: 'https://cloudflare.com/cdn-cgi/trace',
-    parse: parseCloudflareTrace,
+    id: 'google-aistudio',
+    url: 'https://aistudio.google.com/',
+    method: 'HEAD',
+    evaluate: evaluateGoogleAiStudioProbe,
+    confirm: GOOGLE_CLOUDCODE_CONFIRM_PROBE,
   },
   {
-    id: 'ipsb',
-    url: 'https://api.ip.sb/geoip',
-    parse: parseIpSbGeoIp,
+    id: 'google-cloudcode',
+    url: 'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+    evaluate: (res) => evaluateGoogleCloudCodeProbe(res, 'standalone'),
   },
 ]
 
 export function formatEgressBlockedMessage(accountLabel: string, snapshot: AccountEgressSnapshot): string {
   const label = accountLabel || 'default'
   if (snapshot.status === 'unsupported') {
-    const region = snapshot.country ?? (snapshot.probeSource === 'runtime-400' ? '上游 400 地域限制' : '受限区域')
+    const region =
+      snapshot.country ??
+      (snapshot.probeSource === 'runtime-400'
+        ? '上游 400 地域限制'
+        : snapshot.probeSource === 'google-aistudio'
+          ? 'Google AI Studio 受限区'
+          : snapshot.probeSource === 'google-cloudcode'
+            ? 'Google API 受限区'
+            : '受限区域')
     return `[安全拦截] 已在本地阻断发往 Google 的请求（未发送任何上游流量）：检测到账号“${label}”当前出口位于不受支持的地区（${region}），代理模式=${snapshot.proxyMode}。请切换至 US / JP / SG / TW 等支持区域节点后重试，或在控制台点击「检测出口」刷新状态。`
   }
   const detail = snapshot.reason ? `（${snapshot.reason}）` : ''
@@ -565,22 +692,60 @@ function decodeChunkedBody(raw: Buffer, maxBytes: number): Buffer {
   return Buffer.concat(chunks)
 }
 
-async function sendHttpGetOverStream(
+function parseRawHttpHeaders(headLines: readonly string[]): Record<string, string> {
+  const headers: Record<string, string> = {}
+  for (let i = 1; i < headLines.length; i++) {
+    const line = headLines[i]!
+    const colon = line.indexOf(':')
+    if (colon <= 0) continue
+    const key = line.slice(0, colon).trim().toLowerCase()
+    const val = line.slice(colon + 1).trim()
+    if (key) headers[key] = headers[key] ? `${headers[key]}, ${val}` : val
+  }
+  return headers
+}
+
+function normalizeNodeHeaders(raw: http.IncomingHttpHeaders): Record<string, string> {
+  const headers: Record<string, string> = {}
+  for (const [k, v] of Object.entries(raw)) {
+    if (v === undefined) continue
+    headers[k.toLowerCase()] = Array.isArray(v) ? v.join(', ') : v
+  }
+  return headers
+}
+
+async function sendHttpRequestOverStream(
   stream: net.Socket,
   hostHeader: string,
   requestPath: string,
   maxBytes: number,
   signal: AbortSignal,
-): Promise<{ statusCode: number; body: string }> {
+  opts?: { method?: string; headers?: Record<string, string>; body?: string },
+): Promise<EgressProbeHttpResponse> {
   signal.throwIfAborted()
-  const rawReq =
-    `GET ${requestPath} HTTP/1.1\r\n` +
-    `Host: ${hostHeader}\r\n` +
-    `User-Agent: curl/8.5.0\r\n` +
-    `Accept: */*\r\n` +
-    `Connection: close\r\n\r\n`
+  const method = opts?.method ?? 'GET'
+  const isHead = method.toUpperCase() === 'HEAD'
+  const bodyBuf = opts?.body !== undefined ? Buffer.from(opts.body, 'utf8') : undefined
+  const headerLines: string[] = [
+    `${method} ${requestPath} HTTP/1.1`,
+    `Host: ${hostHeader}`,
+  ]
+  const provided = opts?.headers ?? {}
+  const hasKey = (name: string): boolean => Object.keys(provided).some((k) => k.toLowerCase() === name.toLowerCase())
+  if (!hasKey('user-agent')) headerLines.push('User-Agent: curl/8.5.0')
+  if (!hasKey('accept')) headerLines.push('Accept: */*')
+  for (const [k, v] of Object.entries(provided)) {
+    if (/[\r\n]/.test(k) || /[\r\n]/.test(v)) continue
+    headerLines.push(`${k}: ${v}`)
+  }
+  if (bodyBuf !== undefined && !hasKey('content-length')) {
+    headerLines.push(`Content-Length: ${bodyBuf.length}`)
+  }
+  headerLines.push('Connection: close')
+  const rawHead = Buffer.from(`${headerLines.join('\r\n')}\r\n\r\n`, 'latin1')
+  const rawReq = bodyBuf ? Buffer.concat([rawHead, bodyBuf]) : rawHead
 
-  return await new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
+  return await new Promise<EgressProbeHttpResponse>((resolve, reject) => {
     const chunks: Buffer[] = []
     let total = 0
     let settled = false
@@ -613,6 +778,10 @@ async function sendHttpGetOverStream(
         return
       }
       chunks.push(chunk)
+      if (isHead && Buffer.concat(chunks).indexOf('\r\n\r\n') !== -1) {
+        onEnd()
+        stream.destroy()
+      }
     }
     const onEnd = (): void => {
       const full = Buffer.concat(chunks)
@@ -625,19 +794,24 @@ async function sendHttpGetOverStream(
       const headLines = headText.split('\r\n')
       const statusMatch = /^HTTP\/1\.[01]\s+(\d{3})\b/.exec(headLines[0] ?? '')
       const statusCode = statusMatch ? Number(statusMatch[1]) : 0
-      const isChunked = headLines.some((l) => /^transfer-encoding\s*:.*chunked/i.test(l))
-      let bodyBuf: Buffer = full.subarray(sep + 4)
+      const headers = parseRawHttpHeaders(headLines)
+      if (isHead) {
+        finish(() => resolve({ statusCode, headers, body: '' }))
+        return
+      }
+      const isChunked = /chunked/i.test(headers['transfer-encoding'] ?? '')
+      let resBodyBuf: Buffer = full.subarray(sep + 4)
       try {
         if (isChunked) {
-          bodyBuf = decodeChunkedBody(bodyBuf, maxBytes)
-        } else if (bodyBuf.length > maxBytes) {
+          resBodyBuf = decodeChunkedBody(resBodyBuf, maxBytes)
+        } else if (resBodyBuf.length > maxBytes) {
           throw new Error('出口探测响应体超出大小上限')
         }
       } catch (err) {
         finish(() => reject(err instanceof Error ? err : new Error(String(err))))
         return
       }
-      finish(() => resolve({ statusCode, body: bodyBuf.toString('utf8') }))
+      finish(() => resolve({ statusCode, headers, body: resBodyBuf.toString('utf8') }))
     }
 
     signal.addEventListener('abort', onAbort, { once: true })
@@ -692,7 +866,8 @@ async function fetchTextViaRoute(
   maxBytes: number,
   outerSignal?: AbortSignal,
   tlsOptions?: tls.ConnectionOptions,
-): Promise<{ statusCode: number; body: string }> {
+  reqOpts?: { method?: string; headers?: Record<string, string>; body?: string },
+): Promise<EgressProbeHttpResponse> {
   const attemptAc = new AbortController()
   const onOuterAbort = (): void => attemptAc.abort(createAbortError(outerSignal))
   if (outerSignal?.aborted) throw createAbortError(outerSignal)
@@ -726,10 +901,10 @@ async function fetchTextViaRoute(
       activeStream = isHttps
         ? await upgradeTlsOverTunnel(tunnelSocket, sniServername, attemptAc.signal, tlsOptions)
         : tunnelSocket
-      return await sendHttpGetOverStream(activeStream, hostHeader, requestPath, maxBytes, attemptAc.signal)
+      return await sendHttpRequestOverStream(activeStream, hostHeader, requestPath, maxBytes, attemptAc.signal, reqOpts)
     }
 
-    return await new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
+    return await new Promise<EgressProbeHttpResponse>((resolve, reject) => {
       let settled = false
       const done = (fn: () => void): void => {
         if (settled) return
@@ -738,11 +913,15 @@ async function fetchTextViaRoute(
         fn()
       }
 
+      const method = reqOpts?.method ?? 'GET'
+      const bodyBuf = reqOpts?.body !== undefined ? Buffer.from(reqOpts.body, 'utf8') : undefined
       const headers: Record<string, string> = {
         Host: hostHeader,
         'User-Agent': 'curl/8.5.0',
         Accept: '*/*',
         Connection: 'close',
+        ...(reqOpts?.headers ?? {}),
+        ...(bodyBuf !== undefined ? { 'Content-Length': String(bodyBuf.length) } : {}),
       }
 
       const req = isHttps
@@ -751,7 +930,7 @@ async function fetchTextViaRoute(
             hostname: targetHost,
             port: targetPort,
             path: requestPath,
-            method: 'GET',
+            method,
             headers,
             agent: false,
             ...(sniServername ? { servername: sniServername } : {}),
@@ -762,7 +941,7 @@ async function fetchTextViaRoute(
             hostname: targetHost,
             port: targetPort,
             path: requestPath,
-            method: 'GET',
+            method,
             headers,
             agent: false,
           })
@@ -789,7 +968,7 @@ async function fetchTextViaRoute(
         })
         res.once('end', () => {
           const body = Buffer.concat(chunks).toString('utf8')
-          done(() => resolve({ statusCode: res.statusCode ?? 0, body }))
+          done(() => resolve({ statusCode: res.statusCode ?? 0, headers: normalizeNodeHeaders(res.headers), body }))
         })
         res.once('error', (err) => {
           done(() => reject(new Error(`读取探测响应失败：${sanitizeDiagnosticText(err.message, 120)}`)))
@@ -800,6 +979,9 @@ async function fetchTextViaRoute(
         done(() => reject(new Error(`出口探测请求失败：${sanitizeDiagnosticText(err.message, 120)}`)))
       })
 
+      if (bodyBuf !== undefined) {
+        req.write(bodyBuf)
+      }
       req.end()
     })
   } finally {
@@ -808,6 +990,48 @@ async function fetchTextViaRoute(
     activeStream?.destroy()
     tunnelSocket?.destroy()
   }
+}
+
+/**
+ * Executes a zero-dependency HTTP(S) request honoring the account's `NO_PROXY` / `HTTPS_PROXY` /
+ * `ALL_PROXY` / `HTTP_PROXY` environment (including HTTP CONNECT Basic Auth and SOCKS5H remote DNS).
+ */
+export async function fetchViaEnvProxy(opts: {
+  url: string
+  method?: 'GET' | 'POST'
+  headers?: Record<string, string>
+  body?: string
+  env?: NodeJS.ProcessEnv
+  timeoutMs?: number
+  maxBytes?: number
+  signal?: AbortSignal
+}): Promise<{ statusCode: number; body: string }> {
+  const targetUrl = new URL(opts.url)
+  // Never allow an authenticated caller to forward the bearer to an arbitrary target.
+  // The raw HTTP client does not follow redirects; verify TLS even if the host process relaxed it.
+  const authenticated = Object.keys(opts.headers ?? {}).some(key => key.toLowerCase() === 'authorization')
+  if (authenticated && !/^https:\/\/(?:daily-)?cloudcode-pa\.googleapis\.com\/v1internal:(?:retrieveUserQuotaSummary|fetchAvailableModels)$/.test(opts.url)) {
+    throw new Error('不允许向该地址发送配额认证请求')
+  }
+  if (targetUrl.protocol !== 'https:' && targetUrl.protocol !== 'http:') throw new Error('不支持的请求协议')
+  const route = resolveProxyForUrl(targetUrl, opts.env)
+  if (route.kind === 'invalid') {
+    throw new Error(route.reason)
+  }
+  const res = await fetchTextViaRoute(
+    targetUrl,
+    route,
+    opts.timeoutMs ?? 10_000,
+    opts.maxBytes ?? 256 * 1024,
+    opts.signal,
+    { rejectUnauthorized: true },
+    {
+      method: opts.method ?? 'GET',
+      headers: opts.headers,
+      body: opts.body,
+    },
+  )
+  return { statusCode: res.statusCode, body: res.body }
 }
 
 export interface EgressGuardOptions {
@@ -955,7 +1179,9 @@ export class EgressGuard {
   ): AccountEgressSnapshot {
     const cacheKey = computeEnvCacheKey(accountId, env)
     const now = this.now()
-    const defaultProbeUrl = new URL(this.probes[0]?.url ?? 'https://cloudflare.com/cdn-cgi/trace')
+    const defaultProbeUrl = new URL(
+      this.probes[0]?.url ?? 'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist',
+    )
     const route = resolveProxyForUrl(defaultProbeUrl, env)
     const prev = this.cache.get(cacheKey)
 
@@ -982,20 +1208,24 @@ export class EgressGuard {
           if (!current || current.probeSource !== 'runtime-400') return
           const completedAt = this.now()
           if (probed.status === 'unsupported') {
+            const regionDesc = probed.country ? `不受支持地区（${probed.country}）` : '不受支持地区'
             const refined: AccountEgressSnapshot = {
               ...probed,
               checkedAt: completedAt,
               expiresAt: Math.max(current.expiresAt, completedAt + this.unsupportedTtlMs),
-              reason: `上游触发 400 地域限制，复测确认当前出口为不受支持地区（${probed.country ?? '未知'}）`,
+              reason: `上游触发 400 地域限制，复测确认当前出口位于${regionDesc}`,
             }
             this.storeSnapshot(accountId, cacheKey, refined)
             onBackgroundUpdate?.(refined)
           } else if (probed.status === 'supported') {
-            // Keep the 60s circuit breaker armed in case `*.googleapis.com` bypassed proxy split-tunnel rules!
+            // Keep the 60s circuit breaker armed in case `*.googleapis.com` diverged from the probe route!
+            const probeHint = probed.country
+              ? `探针出口为 ${probed.country}，请检查 *.googleapis.com 代理分流规则`
+              : 'Google 匿名预检正常，但 daily-cloudcode-pa.googleapis.com 返回 400（请检查 *.googleapis.com 分流策略或策略组是否切换到了受限节点）'
             const splitHint: AccountEgressSnapshot = {
               ...current,
               ipMasked: probed.ipMasked,
-              reason: `上游 Google API 返回地域不受支持（400），已本地熔断 60 秒（通用探针出口为 ${probed.country}，请检查 *.googleapis.com 代理分流规则）`,
+              reason: `上游 Google API 返回地域不受支持（400），已本地熔断 60 秒（${probeHint}）`,
             }
             this.storeSnapshot(accountId, cacheKey, splitHint)
             onBackgroundUpdate?.(splitHint)
@@ -1041,6 +1271,158 @@ export class EgressGuard {
     return snapshot
   }
 
+  private async runSingleEndpoint(
+    endpoint: Omit<EgressProbeEndpoint, 'confirm'>,
+    env?: NodeJS.ProcessEnv,
+  ): Promise<
+    | { outcome: 'fatal'; snapshot: Omit<AccountEgressSnapshot, 'checkedAt' | 'expiresAt'> }
+    | { outcome: 'supported'; snapshot: Omit<AccountEgressSnapshot, 'checkedAt' | 'expiresAt'> }
+    | { outcome: 'unsupported'; snapshot: Omit<AccountEgressSnapshot, 'checkedAt' | 'expiresAt'> }
+    | { outcome: 'unknown'; snapshot: Omit<AccountEgressSnapshot, 'checkedAt' | 'expiresAt'> }
+    | { outcome: 'retry'; proxyMode: 'proxy' | 'direct'; reason: string }
+  > {
+    let targetUrl: URL
+    try {
+      targetUrl = new URL(endpoint.url)
+    } catch {
+      return { outcome: 'retry', proxyMode: 'direct', reason: `探测源 URL 配置无效（${endpoint.id}）` }
+    }
+
+    const route = resolveProxyForUrl(targetUrl, env)
+    if (route.kind === 'invalid') {
+      return {
+        outcome: 'fatal',
+        snapshot: {
+          status: 'error',
+          country: null,
+          ipMasked: null,
+          proxyMode: 'proxy',
+          probeSource: endpoint.id,
+          reason: sanitizeDiagnosticText(route.reason, 160),
+        },
+      }
+    }
+
+    try {
+      const response = await fetchTextViaRoute(
+        targetUrl,
+        route,
+        this.probeTimeoutMs,
+        this.maxResponseBytes,
+        this.lifetime.signal,
+        this.opts.tlsOptions,
+        {
+          method: endpoint.method,
+          headers: endpoint.headers,
+          body: endpoint.body,
+        },
+      )
+
+      if (endpoint.evaluate) {
+        const evaluated = endpoint.evaluate(response)
+        if (evaluated.kind === 'retry') {
+          return {
+            outcome: 'retry',
+            proxyMode: route.proxyMode,
+            reason: sanitizeDiagnosticText(evaluated.reason, 160) || `探测源 ${endpoint.id} 返回异常`,
+          }
+        }
+        const rawMasked = evaluated.ip ? maskIpAddress(evaluated.ip) : null
+        const ipMasked = rawMasked && rawMasked !== 'unknown' ? rawMasked : null
+        if (evaluated.kind === 'unknown') {
+          return {
+            outcome: 'unknown',
+            snapshot: {
+              status: 'unknown',
+              country: null,
+              ipMasked,
+              proxyMode: route.proxyMode,
+              probeSource: endpoint.id,
+              reason: sanitizeDiagnosticText(evaluated.reason, 160),
+            },
+          }
+        }
+        const normalizedCountry = evaluated.country ? normalizeGeoCountryCode(evaluated.country) : null
+        const country = normalizedCountry?.kind === 'valid' ? normalizedCountry.country : null
+        return {
+          outcome: evaluated.kind,
+          snapshot: {
+            status: evaluated.kind,
+            country,
+            ipMasked,
+            proxyMode: route.proxyMode,
+            probeSource: endpoint.id,
+            ...(evaluated.reason ? { reason: sanitizeDiagnosticText(evaluated.reason, 160) } : {}),
+          },
+        }
+      }
+
+      if (response.statusCode !== 200) {
+        return {
+          outcome: 'retry',
+          proxyMode: route.proxyMode,
+          reason: `探测源 ${endpoint.id} 返回 HTTP ${response.statusCode}`,
+        }
+      }
+      if (!endpoint.parse) {
+        return {
+          outcome: 'retry',
+          proxyMode: route.proxyMode,
+          reason: `探测源 ${endpoint.id} 缺少解析器`,
+        }
+      }
+
+      const parsed = endpoint.parse(response.body)
+      const ipMasked = parsed.ip ? maskIpAddress(parsed.ip) : null
+      const normalized = normalizeGeoCountryCode(parsed.rawCountry)
+
+      if (normalized.kind === 'valid') {
+        const unsupported = isUnsupportedGeoCountry(normalized.country)
+        return {
+          outcome: unsupported ? 'unsupported' : 'supported',
+          snapshot: {
+            status: unsupported ? 'unsupported' : 'supported',
+            country: normalized.country,
+            ipMasked: ipMasked === 'unknown' ? null : ipMasked,
+            proxyMode: route.proxyMode,
+            probeSource: endpoint.id,
+            ...(unsupported
+              ? { reason: `当前出口位于不受 Google 支持的地区（${normalized.country}）` }
+              : {}),
+          },
+        }
+      }
+
+      if (normalized.kind === 'placeholder') {
+        return {
+          outcome: 'unknown',
+          snapshot: {
+            status: 'unknown',
+            country: null,
+            ipMasked: ipMasked === 'unknown' ? null : ipMasked,
+            proxyMode: route.proxyMode,
+            probeSource: endpoint.id,
+            reason: `出口探测返回未识别地区标识（${normalized.raw}）`,
+          },
+        }
+      }
+
+      return {
+        outcome: 'retry',
+        proxyMode: route.proxyMode,
+        reason: `探测源 ${endpoint.id} 未返回有效国家代码`,
+      }
+    } catch (err) {
+      if (this.lifetime.signal.aborted) throw err
+      const msg = err instanceof Error ? err.message : String(err)
+      return {
+        outcome: 'retry',
+        proxyMode: route.proxyMode,
+        reason: sanitizeDiagnosticText(msg, 160) || '出口探测网络请求失败',
+      }
+    }
+  }
+
   private async probeRaw(
     accountId: string,
     env?: NodeJS.ProcessEnv,
@@ -1065,77 +1447,47 @@ export class EgressGuard {
     let lastProxyMode: 'proxy' | 'direct' = 'direct'
 
     for (const endpoint of this.probes) {
-      let targetUrl: URL
-      try {
-        targetUrl = new URL(endpoint.url)
-      } catch {
-        lastFailureReason = `探测源 URL 配置无效（${endpoint.id}）`
+      const primary = await this.runSingleEndpoint(endpoint, env)
+      if (primary.outcome === 'fatal') {
+        return primary.snapshot
+      }
+      if (primary.outcome === 'unsupported') {
+        return primary.snapshot
+      }
+      if (primary.outcome === 'supported') {
+        lastProxyMode = primary.snapshot.proxyMode
+        if (!endpoint.confirm) {
+          return primary.snapshot
+        }
+        const confirm = await this.runSingleEndpoint(endpoint.confirm, env)
+        if (confirm.outcome === 'fatal') {
+          return confirm.snapshot
+        }
+        if (confirm.outcome === 'unsupported') {
+          return confirm.snapshot
+        }
+        if (confirm.outcome === 'supported') {
+          return {
+            ...primary.snapshot,
+            proxyMode: confirm.snapshot.proxyMode,
+          }
+        }
+        if (confirm.outcome === 'unknown') {
+          lastProxyMode = confirm.snapshot.proxyMode
+          unknownFallback = confirm.snapshot
+          continue
+        }
+        lastProxyMode = confirm.proxyMode
+        lastFailureReason = confirm.reason
         continue
       }
-
-      const route = resolveProxyForUrl(targetUrl, env)
-      lastProxyMode = route.proxyMode
-      if (route.kind === 'invalid') {
-        return {
-          status: 'error',
-          country: null,
-          ipMasked: null,
-          proxyMode: 'proxy',
-          probeSource: endpoint.id,
-          reason: sanitizeDiagnosticText(route.reason, 160),
-        }
+      if (primary.outcome === 'unknown') {
+        lastProxyMode = primary.snapshot.proxyMode
+        unknownFallback = primary.snapshot
+        continue
       }
-
-      try {
-        const { statusCode, body } = await fetchTextViaRoute(
-          targetUrl,
-          route,
-          this.probeTimeoutMs,
-          this.maxResponseBytes,
-          this.lifetime.signal,
-          this.opts.tlsOptions,
-        )
-        if (statusCode !== 200) {
-          lastFailureReason = `探测源 ${endpoint.id} 返回 HTTP ${statusCode}`
-          continue
-        }
-
-        const parsed = endpoint.parse(body)
-        const ipMasked = parsed.ip ? maskIpAddress(parsed.ip) : null
-        const normalized = normalizeGeoCountryCode(parsed.rawCountry)
-
-        if (normalized.kind === 'valid') {
-          const unsupported = isUnsupportedGeoCountry(normalized.country)
-          return {
-            status: unsupported ? 'unsupported' : 'supported',
-            country: normalized.country,
-            ipMasked: ipMasked === 'unknown' ? null : ipMasked,
-            proxyMode: route.proxyMode,
-            probeSource: endpoint.id,
-            ...(unsupported
-              ? { reason: `当前出口位于不受 Google 支持的地区（${normalized.country}）` }
-              : {}),
-          }
-        }
-
-        if (normalized.kind === 'placeholder') {
-          unknownFallback = {
-            status: 'unknown',
-            country: null,
-            ipMasked: ipMasked === 'unknown' ? null : ipMasked,
-            proxyMode: route.proxyMode,
-            probeSource: endpoint.id,
-            reason: `出口探测返回未识别地区标识（${normalized.raw}）`,
-          }
-          continue
-        }
-
-        lastFailureReason = `探测源 ${endpoint.id} 未返回有效国家代码`
-      } catch (err) {
-        if (this.lifetime.signal.aborted) throw err
-        const msg = err instanceof Error ? err.message : String(err)
-        lastFailureReason = sanitizeDiagnosticText(msg, 160) || '出口探测网络请求失败'
-      }
+      lastProxyMode = primary.proxyMode
+      lastFailureReason = primary.reason
     }
 
     if (unknownFallback) {

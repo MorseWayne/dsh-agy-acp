@@ -1,0 +1,6 @@
+{"expect":{"id":1,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"type":"text","text":"fixture"}]}}}
+{"emit":{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"available_commands_update","availableCommands":[]}}}}
+{"expect":{"id":2,"method":"replay/advance"}}
+{"emit":{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"usage_update","used":0,"size":1048576}}}}
+{"emit":{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"session_info_update","title":"Metadata Only"}}}}
+{"emit":{"id":2,"result":{}}}

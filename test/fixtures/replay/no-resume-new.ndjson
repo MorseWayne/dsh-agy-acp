@@ -1,0 +1,7 @@
+{"expect":{"id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"dsh-agy-acp","version":"$version"}}}}
+{"emit":{"id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"resume":false}}}}}
+{"expect":{"id":2,"method":"session/load","params":{"sessionId":"saved","cwd":"$workspace","mcpServers":[]}}}
+{"emit":{"method":"session/update","params":{"sessionId":"saved","update":{"sessionUpdate":"session_info_update","title":"stale load title"}}}}
+{"emit":{"id":2,"error":{"code":-32000,"message":"not found"}}}
+{"expect":{"id":3,"method":"session/new","params":{"cwd":"$workspace","mcpServers":[]}}}
+{"emit":{"id":3,"result":{"sessionId":"fresh"}}}

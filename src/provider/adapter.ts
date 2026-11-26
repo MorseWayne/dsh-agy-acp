@@ -10,6 +10,12 @@ import {
 import { ReasoningEffortId, type ToolCallId } from '@deepseek-ai/dsh-llm/brand'
 import { AcpProcessExitError, AcpRpcError, AcpTimeoutError } from '../acp/client.ts'
 import type { AcpToolCallUpdate } from '../acp/protocol.ts'
+import {
+  createTurnOutcomeWatcher,
+  evaluateInlineWarningFallback,
+  extractResetAtMs,
+  isInvalidThinkingSignatureError,
+} from '../acp/turn-outcome.ts'
 import { mapContextUsage } from '../acp/usage.ts'
 import { callUsageToTokenUsage, TranscriptUsageTailer } from '../acp/transcript-usage.ts'
 import { defaultEffort, effortLabel } from '../common/effort.ts'
@@ -24,10 +30,12 @@ import { isQuotaOrRateLimitError, isTosViolationError } from '../runtime/account
 import { policyKey, SessionPolicyChangedError } from '../runtime/permission-manager.ts'
 import { EgressBlockedError } from '../runtime/egress-guard.ts'
 import type { AcpSessionPool, ManagedAcpSession } from '../runtime/session-pool.ts'
-import { compactDisplayInput } from './mirror-tool.ts'
+import { createPreEditLocator, compactDisplayInput } from './mirror-tool.ts'
 import {
   buildAuxiliaryPromptBlocks,
-  buildPromptBlocks,
+  buildPromptBlocksWithAttachments,
+  type ReadPromptImage,
+  type ReadPromptFile,
   buildSystemPromptBlock,
   prepareAuxiliarySystemPrompt,
   prepareSystemPrompt,
@@ -46,12 +54,18 @@ export interface AcpAdapterDeps {
   getConfig: () => PluginConfig
   pool: AcpSessionPool
   runs: AcpRunStore
+  readImage?: ReadPromptImage
+  readFileStream?: ReadPromptFile
   log?: (msg: string) => void
 }
 
 export class AcpAdapter extends LlmAdapter {
   constructor(private readonly deps: AcpAdapterDeps) {
     super()
+  }
+
+  private inputModalities(): ('text' | 'image')[] {
+    return this.deps.readImage && this.deps.pool.supportsImageInput() ? ['text', 'image'] : ['text']
   }
 
   override providerInfo(_provider: string): LlmProviderInfo {
@@ -61,7 +75,7 @@ export class AcpAdapter extends LlmAdapter {
   override async listModels(_provider: string): Promise<LlmModelInfo[]> {
     const models = await this.deps.pool.refreshModels()
     return models.filter(m => !m.variantOf).map((m) => ({
-      provider: PROVIDER_ID, id: m.value, name: m.name, inputModalities: ['text', 'image'],
+      provider: PROVIDER_ID, id: m.value, name: m.name, inputModalities: this.inputModalities(),
     }))
   }
 
@@ -74,7 +88,7 @@ export class AcpAdapter extends LlmAdapter {
       provider: PROVIDER_ID,
       id: model,
       name: matched?.name ?? model,
-      inputModalities: ['text', 'image'],
+      inputModalities: this.inputModalities(),
       ...(contextWindow ? { context: { contextWindow } } : {}),
       ...(matched && effort
         ? {
@@ -137,6 +151,7 @@ export class AcpAdapter extends LlmAdapter {
         }
         if (recoveryPolicy && policyKey(this.deps.pool.policy(sessionKey)) === recoveryPolicy) {
           // Keep the original user input (including images). The interrupted tool never produced a result.
+          rec.releaseRecording()
           messages = messages.slice(0, callIndex)
           this.deps.log?.(`recreating ACP session "${sessionKey}" after interrupted approval (retry 1/1)`)
         } else {
@@ -155,7 +170,7 @@ export class AcpAdapter extends LlmAdapter {
     // 2. Fresh turn over persistent ACP session (with automatic 429/geo failover + 1x pre-output crash recovery).
     const cwd = this.deps.pool.policy(sessionKey).workspaceRoot
     const requestedModel = options.model || cfg.defaultModel || ''
-    const preparedSystem = prepareSystemPrompt(options.system)
+    const preparedSystem = prepareSystemPrompt(options.system, messages)
     const triedAccounts = new Set<string>()
     let crashRetried = recoveryPolicy !== undefined
     let nextBlockIndex = 0
@@ -174,7 +189,7 @@ export class AcpAdapter extends LlmAdapter {
           cwd,
           requestedModel,
           triedAccounts.size > 0 ? triedAccounts : undefined,
-          preparedSystem ?? undefined,
+          undefined,
           recoveryPolicy ? { forceNew: true } : undefined,
         ))
       } catch (err) {
@@ -237,14 +252,14 @@ export class AcpAdapter extends LlmAdapter {
       }
 
       this.deps.pool.notifyStatusChange()
-      const baseBlocks = buildPromptBlocks(messages, created)
+      const baseBlocks = await buildPromptBlocksWithAttachments(messages, created, undefined, session.promptCapabilities, this.deps.readImage, options.signal, this.deps.readFileStream)
       let pendingSystemHash: string | null = null
       let promptBlocks = baseBlocks
       if (preparedSystem) {
-        if (created && !session.supportsSystemPromptAppend) {
+        if (created || session.appliedSystemHash === null) {
           promptBlocks = [buildSystemPromptBlock(preparedSystem.append, false), ...baseBlocks]
           pendingSystemHash = preparedSystem.hash
-        } else if (!created && session.appliedSystemHash !== preparedSystem.hash) {
+        } else if (session.appliedSystemHash !== preparedSystem.hash) {
           promptBlocks = [buildSystemPromptBlock(preparedSystem.append, true), ...baseBlocks]
           pendingSystemHash = preparedSystem.hash
         }
@@ -252,7 +267,11 @@ export class AcpAdapter extends LlmAdapter {
 
       if (session.currentMode !== targetMode) throw new Error(`Antigravity did not accept permission mode ${targetMode}`)
       const turn = this.deps.pool.beginPrompt(session, options.signal)
-      const rec = this.deps.runs.create(sessionKey)
+      const outcomeWatcher = createTurnOutcomeWatcher(
+        session.acpSessionId,
+        this.deps.pool.accountEnvFor(session),
+      )
+      const rec = this.deps.runs.create(sessionKey, createPreEditLocator(cwd))
       // agy emits usage_update at the end of a prompt, so seed with the last known occupancy for mirror boundaries.
       if (typeof session.contextUsed === 'number') rec.contextUsed = session.contextUsed
       // Exact per-call usage (cache hits included) comes from agy's transcript; ACP only reports a run total.
@@ -292,8 +311,60 @@ export class AcpAdapter extends LlmAdapter {
       void client
         .sessionPrompt({ sessionId: session.acpSessionId, prompt: promptBlocks }, cfg.requestTimeoutMs)
         .then((res) => {
+          const hiddenFailure = options.signal?.aborted
+            ? undefined
+            : (outcomeWatcher.check(res) ??
+              evaluateInlineWarningFallback(res.stopReason, rec.inlineMessageText, rec.hasThoughtOrTool, res.usage))
+          if (hiddenFailure) {
+            this.deps.pool.recordTurnUsage(res.usage)
+            if (hiddenFailure.kind === 'tos') {
+              const tosErr = new LlmError(
+                `[风控熔断] 账号“${session.accountId}”触发上游服务条款/账号风控限制（TOS_VIOLATION）。已立即本地隔离该账号并中止自动切换备用账号，以防连坐封禁；请排查请求内容与账号状态后在控制台手动解除隔离。`,
+                'ACP_TOS_VIOLATION',
+              )
+              this.deps.pool.reportAccountFailure(session.accountId, targetModel, tosErr, { code: 'TOS_VIOLATION' })
+              if (this.deps.pool.owns(session)) this.deps.pool.evictSession(sessionKey)
+              cleanupTurn()
+              rec.fail(tosErr)
+              return
+            }
+            if (hiddenFailure.kind === 'geo') {
+              const snap = this.deps.pool.recordGeoRejection(session.accountId)
+              const regionHint = snap.country ? `（当前检测地区：${snap.country}）` : ''
+              const geoErr = new LlmError(
+                `[地域限制熔断] 上游 Google API 拒绝了当前网络出口地域（400 FAILED_PRECONDITION）${regionHint}。已断开当前代理长连接并在本地立即熔断该账号出口 60 秒以防连续请求触发风控；请切换至 US / JP / SG / TW 等支持区域节点后，在控制台点击「检测出口」恢复。`,
+                'ACP_GEO_UNSUPPORTED',
+              )
+              this.deps.pool.reportAccountFailure(session.accountId, targetModel, geoErr, { code: 'FAILED_PRECONDITION' })
+              if (this.deps.pool.owns(session)) this.deps.pool.invalidate(sessionKey)
+              cleanupTurn()
+              rec.fail(geoErr)
+              return
+            }
+            if (hiddenFailure.sessionBroken) {
+              // Saved thinking signature corrupted: permanently broken native session, evict so next turn rebuilds cleanly.
+              this.deps.log?.(`evicting corrupted ACP session "${sessionKey}" (${hiddenFailure.code})`)
+              if (this.deps.pool.owns(session)) this.deps.pool.evictSession(sessionKey)
+              cleanupTurn()
+              rec.fail(new LlmError(hiddenFailure.message, hiddenFailure.code))
+              return
+            }
+            const err = new LlmError(
+              hiddenFailure.kind === 'quota'
+                ? `QUOTA_EXHAUSTED: ${hiddenFailure.message}`
+                : hiddenFailure.message,
+              hiddenFailure.code,
+            )
+            this.deps.pool.reportAccountFailure(session.accountId, targetModel, err, {
+              ...(hiddenFailure.resetAt !== undefined ? { resetAt: hiddenFailure.resetAt } : {}),
+              code: hiddenFailure.code,
+            })
+            cleanupTurn()
+            rec.fail(err)
+            return
+          }
           if (pendingSystemHash) this.deps.pool.recordAppliedSystemHash(session, pendingSystemHash)
-          this.deps.pool.reportAccountSuccess(session.accountId, targetModel)
+          if (!options.signal?.aborted) this.deps.pool.reportAccountSuccess(session.accountId, targetModel)
           this.deps.pool.recordTurnUsage(res.usage)
           // Release active turn slot synchronously BEFORE waking consumers to prevent next-turn race.
           cleanupTurn()
@@ -307,6 +378,7 @@ export class AcpAdapter extends LlmAdapter {
           }
           const isCleanRpcError = err instanceof AcpRpcError
           let error = err instanceof Error ? err : new Error(String(err))
+          const parsedResetAt = extractResetAtMs(error.message)
           if (err instanceof AcpProcessExitError) {
             const { interruptedBeforeGrant, granted } = turn.permissions
             if (interruptedBeforeGrant) {
@@ -319,7 +391,14 @@ export class AcpAdapter extends LlmAdapter {
             }
           }
           let forceInvalidate = false
-          if (!(err instanceof AcpProcessExitError) && isTosViolationError(error)) {
+          let evictCorruptedSession = false
+          if (!(err instanceof AcpProcessExitError) && isInvalidThinkingSignatureError(error)) {
+            evictCorruptedSession = true
+            error = new LlmError(
+              'Antigravity 历史会话中的 thinking 签名已失效（INVALID_THINKING_SIGNATURE），已自动重置原生会话，下条消息将携带摘要重建新会话。',
+              'INVALID_THINKING_SIGNATURE',
+            )
+          } else if (!(err instanceof AcpProcessExitError) && isTosViolationError(error)) {
             this.deps.pool.reportAccountFailure(session.accountId, targetModel, error)
             forceInvalidate = true
             error = new LlmError(
@@ -329,19 +408,27 @@ export class AcpAdapter extends LlmAdapter {
           } else if (!(err instanceof AcpProcessExitError) && isGeoUnsupportedError(error)) {
             const snap = this.deps.pool.recordGeoRejection(session.accountId)
             this.deps.pool.reportAccountFailure(session.accountId, targetModel, error)
+            forceInvalidate = true
             const regionHint = snap.country ? `（当前检测地区：${snap.country}）` : ''
             error = new LlmError(
-              `[地域限制熔断] 上游 Google API 拒绝了当前网络出口地域（400 FAILED_PRECONDITION）${regionHint}。已在本地立即熔断该账号出口 60 秒以防连续请求触发风控；请切换至 US / JP / SG / TW 等支持区域节点后，在控制台点击「检测出口」恢复。`,
+              `[地域限制熔断] 上游 Google API 拒绝了当前网络出口地域（400 FAILED_PRECONDITION）${regionHint}。已断开当前代理长连接并在本地立即熔断该账号出口 60 秒以防连续请求触发风控；请切换至 US / JP / SG / TW 等支持区域节点后，在控制台点击「检测出口」恢复。`,
               'ACP_GEO_UNSUPPORTED',
             )
           } else {
-            this.deps.pool.reportAccountFailure(session.accountId, targetModel, error)
+            this.deps.pool.reportAccountFailure(
+              session.accountId,
+              targetModel,
+              error,
+              parsedResetAt !== undefined ? { resetAt: parsedResetAt } : undefined,
+            )
           }
           // Preserve healthy persistent processes on clean JSON-RPC application errors (`AcpRpcError`).
-          // Invalidate on timeout, process crash, transport failure, TOS quarantine, or dead child.
+          // Invalidate on timeout, process crash, transport failure, TOS quarantine, corrupted history, or dead child.
           const shouldInvalidate =
             forceInvalidate || !client.isRunning || err instanceof AcpTimeoutError || !isCleanRpcError
-          if (shouldInvalidate && this.deps.pool.owns(session)) {
+          if (evictCorruptedSession && this.deps.pool.owns(session)) {
+            this.deps.pool.evictSession(sessionKey)
+          } else if (shouldInvalidate && this.deps.pool.owns(session)) {
             this.deps.pool.invalidate(sessionKey)
           }
           cleanupTurn()
@@ -367,6 +454,7 @@ export class AcpAdapter extends LlmAdapter {
             this.deps.log?.(
               `account "${session.accountId}" hit ${isGeoErr ? 'geo-restriction' : 'quota/rate-limit'} on "${targetModel}", failing over (${triedAccounts.size}/${maxAccounts} tried)`,
             )
+            rec.releaseRecording()
             await this.deps.pool.closeSession(sessionKey)
             continue
           }
@@ -400,8 +488,9 @@ export class AcpAdapter extends LlmAdapter {
     }
 
     const cfg = this.deps.getConfig()
-    const { append, fallbackBlock } = prepareAuxiliarySystemPrompt(options.purpose!, options.system)
-    const prompt = buildAuxiliaryPromptBlocks(options.messages as readonly PromptMessage[])
+    const auxMessages = options.messages as readonly PromptMessage[]
+    const { append, fallbackBlock } = prepareAuxiliarySystemPrompt(options.purpose!, options.system, auxMessages)
+    const prompt = buildAuxiliaryPromptBlocks(auxMessages)
     const rec = new AcpRunRecording(undefined, options.sessionId)
     const ac = new AbortController()
     const onAbort = (): void => ac.abort()
@@ -488,7 +577,12 @@ export class AcpAdapter extends LlmAdapter {
         ...(locations ? { locations } : {}),
       }
       if (rawInput !== undefined) {
-        const inputVal = isCodeMode ? compactDisplayInput(rawInput) : rawInput
+        const isEditLike =
+          tc.kind === 'edit' ||
+          /^(?:edit|write|replace|multi_replace|apply_patch)/i.test(tc.name ?? '')
+        const inputVal = isCodeMode
+          ? compactDisplayInput(rawInput)
+          : compactDisplayInput(rawInput, isEditLike ? MAX_STANDARD_EDIT_INPUT_BYTES : MAX_STANDARD_INPUT_BYTES)
         if (inputVal !== undefined) mirrorPayload.input = inputVal
       }
 
@@ -515,6 +609,7 @@ export class AcpAdapter extends LlmAdapter {
 
     while (true) {
       if (signal?.aborted) {
+        rec.releaseRecording()
         const closed = closeOpenBlock()
         if (closed) yield closed
         yield {
@@ -526,6 +621,7 @@ export class AcpAdapter extends LlmAdapter {
 
       const item = await rec.waitFor(idx, signal)
       if (signal?.aborted) {
+        rec.releaseRecording()
         const closed = closeOpenBlock()
         if (closed) yield closed
         yield {
@@ -535,6 +631,7 @@ export class AcpAdapter extends LlmAdapter {
         return
       }
       if (!item) {
+        rec.releaseRecording()
         const closed = closeOpenBlock()
         if (closed) yield closed
         yield { type: 'finish', reason: { kind: 'stop' } }
@@ -542,18 +639,20 @@ export class AcpAdapter extends LlmAdapter {
       }
 
       if (item.kind === 'error') {
+        const mayRetry = item.error instanceof AcpProcessExitError && canRetryExit?.()
+        rec.releaseRecording()
         const closed = closeOpenBlock()
         if (closed) yield closed
         if (item.error instanceof SessionPolicyChangedError) {
           yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: item.error.message } } }
           return
         }
-        if (item.error instanceof AcpProcessExitError && canRetryExit?.()) return blockIdx
+        if (mayRetry) return blockIdx
         yield {
           type: 'finish',
           reason: {
             kind: 'error',
-            failure: { code: 'ACP_ERROR', message: item.error.message },
+            failure: { code: item.error instanceof LlmError ? item.error.code ?? 'ACP_ERROR' : 'ACP_ERROR', message: item.error.message },
           },
         }
         return
@@ -562,13 +661,27 @@ export class AcpAdapter extends LlmAdapter {
       if (item.kind === 'done') {
         const closed = closeOpenBlock()
         if (closed) yield closed
+        const priorUsageCount = rec.consumedSpanUsageCount
         const spanUsage = await takeSpanUsage(rec, FINAL_USAGE_RETRIES, signal)
         if (spanUsage) {
-          yield { type: 'usage', usage: callUsageToTokenUsage(spanUsage) }
+          // agy's transcript.jsonl PLANNER_RESPONSE currently omits thinking_tokens.
+          // When this run had a single model call, enrich with the run-level thoughtTokens safely.
+          const thought = item.usage?.thoughtTokens
+          const enriched =
+            spanUsage.reasoningTokens === undefined &&
+            priorUsageCount === 0 &&
+            typeof thought === 'number' &&
+            Number.isSafeInteger(thought) &&
+            thought > 0 &&
+            thought <= spanUsage.outputTokens
+              ? { ...spanUsage, reasoningTokens: thought }
+              : spanUsage
+          yield { type: 'usage', usage: callUsageToTokenUsage(enriched) }
         } else if (!rec.hasUsageSource) {
           const usage = mapContextUsage(item.usage, rec.contextUsed)
           if (usage) yield { type: 'usage', usage }
         }
+        rec.releaseRecording()
         yield { type: 'finish', reason: { kind: 'stop' } }
         return
       }
@@ -612,15 +725,37 @@ export class AcpAdapter extends LlmAdapter {
             const closed = closeOpenBlock()
             if (closed) yield closed
 
+            const emittedBatchIds = new Set<string>([merged.toolCallId])
             for (const c of emitToolChunks(merged, idx)) yield c
 
-            // Standard mode: batch immediately contiguous buffered ready tool calls without crossing text/thought/done/error.
+            // Standard mode: batch contiguous concurrent tool calls, including a short micro-batch window
+            // when the tool just started (not yet settled) so sibling parallel tool frames arriving over
+            // stdio land in one DSH step instead of fanning out into multiple hollow steps.
+            let sawPostToolContent = false
             if (!isCodeMode) {
-              while (idx + 1 < rec.items.length) {
-                const nextItem = rec.items[idx + 1]!
-                if (nextItem.kind !== 'update') break
+              const batchDeadline = Date.now() + TOOL_BATCH_MAX_WAIT_MS
+              while (true) {
+                let nextItem = idx + 1 < rec.items.length ? rec.items[idx + 1] : null
+                if (!nextItem && !merged.settled && !rec.isSettled && !signal?.aborted) {
+                  const waitMs = Math.min(TOOL_BATCH_COALESCE_MS, batchDeadline - Date.now())
+                  if (waitMs > 0) {
+                    nextItem = await rec.waitForWithin(idx + 1, waitMs, signal)
+                  }
+                }
+                if (!nextItem) break
+                if (nextItem.kind !== 'update') {
+                  sawPostToolContent = true
+                  break
+                }
                 const nu = nextItem.update
-                if (nu.sessionUpdate !== 'tool_call' && nu.sessionUpdate !== 'tool_call_update') break
+                if (nu.sessionUpdate === 'usage_update') {
+                  idx++
+                  continue
+                }
+                if (nu.sessionUpdate !== 'tool_call' && nu.sessionUpdate !== 'tool_call_update') {
+                  sawPostToolContent = true
+                  break
+                }
                 const nextTc = nu as AcpToolCallUpdate
                 const nextId =
                   typeof nextTc.toolCallId === 'string' && nextTc.toolCallId.trim() !== ''
@@ -633,19 +768,28 @@ export class AcpAdapter extends LlmAdapter {
                 const nextMerged = rec.getToolCall(nextId)
                 if (!nextMerged || !isToolReadyToEmit(rec, idx + 1, nextMerged)) break
                 idx++
+                emittedBatchIds.add(nextMerged.toolCallId)
                 for (const c of emitToolChunks(nextMerged, idx)) yield c
               }
             }
 
             // One DSH step = the agy model calls since the previous step. With the transcript, report their exact
-            // usage; a step without a new call (e.g. a second cut of one call) reports nothing rather than re-billing.
-            const spanUsage = await takeSpanUsage(rec, BOUNDARY_USAGE_RETRIES, signal)
+            // usage; skip the 160ms poll loop on continuation cuts of the same model call that cannot emit a new record.
+            const boundaryRetries = rec.expectsNewCallUsage(emittedBatchIds) ? BOUNDARY_USAGE_RETRIES : 0
+            const spanUsage =
+              sawPostToolContent && rec.hasPendingUsage
+                ? rec.consumeSpanUsage()
+                : await takeSpanUsage(rec, boundaryRetries, signal)
             if (spanUsage) {
               yield { type: 'usage', usage: callUsageToTokenUsage(spanUsage) }
-            } else if (!rec.hasUsageSource) {
-              // No transcript: report live context occupancy so DSH can still show context pressure.
+            } else if (!rec.hasUsageSource && rec.contextUsed !== undefined && rec.contextUsed !== rec.lastFallbackContextUsed) {
+              // No transcript: report live context occupancy once per distinct reading so DSH shows context
+              // pressure without repeatedly billing the same full context across mirrored tool spans.
               const boundaryUsage = mapContextUsage(undefined, rec.contextUsed)
-              if (boundaryUsage) yield { type: 'usage', usage: boundaryUsage }
+              if (boundaryUsage) {
+                rec.lastFallbackContextUsed = rec.contextUsed
+                yield { type: 'usage', usage: boundaryUsage }
+              }
             }
             yield { type: 'finish', reason: { kind: 'tool-calls' } }
             return
@@ -662,6 +806,10 @@ export class AcpAdapter extends LlmAdapter {
 const BOUNDARY_USAGE_RETRIES = 4
 const FINAL_USAGE_RETRIES = 6
 const USAGE_RETRY_MS = 40
+const TOOL_BATCH_COALESCE_MS = 35
+const TOOL_BATCH_MAX_WAIT_MS = 70
+const MAX_STANDARD_INPUT_BYTES = 16 * 1024
+const MAX_STANDARD_EDIT_INPUT_BYTES = 64 * 1024
 
 async function takeSpanUsage(rec: AcpRunRecording, retries: number, signal?: AbortSignal) {
   rec.flushUsage()

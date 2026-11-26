@@ -1,3 +1,6 @@
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync, statSync } from 'node:fs'
+import type { AcpToolCallUpdate } from '../acp/protocol.ts'
+import { copyBoundedText, sanitizeToolPayload } from '../acp/payload-bounds.ts'
 import path from 'node:path'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import {
@@ -127,14 +130,14 @@ const EXT_TO_LANG: Record<string, string> = {
 }
 
 const COMPACT_INPUT_KEYS = [
-  'CommandLine', 'command', 'cmd', 'script',
-  'Cwd', 'cwd', 'workdir', 'workingDirectory',
+  'CommandLine', 'command', 'cmd', 'script', 'command_line', 'commandLine',
+  'Cwd', 'cwd', 'workdir', 'workingDirectory', 'working_dir',
   'Description', 'description', 'toolSummary',
-  'Path', 'TargetFile', 'AbsolutePath', 'file_path', 'filePath', 'path', 'File', 'file', 'DirectoryPath', 'SearchPath',
-  'StartLine', 'EndLine', 'offset', 'line', 'start_line',
+  'Path', 'TargetFile', 'target_file', 'AbsolutePath', 'absolute_path', 'file_path', 'filePath', 'path', 'File', 'file', 'DirectoryPath', 'SearchPath',
+  'StartLine', 'EndLine', 'offset', 'line', 'start_line', 'end_line',
   'Query', 'query', 'Pattern', 'pattern',
   'Url', 'url',
-  'EmptyFile',
+  'EmptyFile', 'empty_file',
 ] as const
 
 const MAX_DISPLAY_INPUT_BYTES = 16 * 1024
@@ -177,39 +180,36 @@ export type LosslessJson =
   | LosslessJson[]
   | { [key: string]: LosslessJson }
 
-/** Lossless JSON clone bounded to `maxBytes` for safe embedding in mirror args and presentationMeta. */
+function fitText(text: string, maxBytes: number, json = false): string {
+  // Bound both the string inspected and its UTF-8/JSON wire representation.
+  const size = (s: string) => Buffer.byteLength(json ? JSON.stringify(s) : s)
+  let lo = 0, hi = Math.min(text.length, maxBytes)
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    if (size(text.slice(0, mid)) <= maxBytes) lo = mid
+    else hi = mid - 1
+  }
+  return copyBoundedText(text.slice(0, lo).replace(/[\uD800-\uDBFF]$/u, ''))
+}
+
+/** Preserve small JSON; for oversized input retain only useful display fields. */
 export function compactDisplayInput(raw: unknown, maxBytes = MAX_DISPLAY_INPUT_BYTES): LosslessJson | undefined {
-  if (raw === undefined) return undefined
-  try {
-    const serialized = JSON.stringify(raw)
-    if (serialized === undefined) return undefined
-    if (Buffer.byteLength(serialized, 'utf8') <= maxBytes) {
-      return JSON.parse(serialized) as LosslessJson
-    }
-  } catch {
-    return undefined
-  }
-
-  const rec = asRecord(raw)
-  if (!rec) {
-    if (typeof raw === 'string') {
-      return raw.slice(0, Math.max(0, Math.min(raw.length, maxBytes - 16))) + '...'
-    }
-    return undefined
-  }
-
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 2) return undefined
+  maxBytes = Math.min(maxBytes, 64 * 1024)
+  const safe = sanitizeToolPayload(raw, { maxTotalText: maxBytes + 1, perStringLimit: maxBytes + 1 })
+  if (safe === undefined) return undefined
+  if (Buffer.byteLength(JSON.stringify(safe)) <= maxBytes) return safe as LosslessJson
+  if (typeof raw === 'string') return fitText(raw, maxBytes, true)
+  const rec = asRecord(safe)
+  if (!rec) return undefined
   const compact: { [key: string]: LosslessJson } = {}
   for (const key of COMPACT_INPUT_KEYS) {
     const val = rec[key]
-    if (typeof val === 'string') {
-      compact[key] = val.length > 1024 ? val.slice(0, 1024) + '...' : val
-    } else if (typeof val === 'number' && Number.isFinite(val)) {
-      compact[key] = val
-    } else if (typeof val === 'boolean') {
-      compact[key] = val
-    }
+    if (typeof val === 'string') compact[key] = fitText(val, 1024, true)
+    else if (typeof val === 'number' || typeof val === 'boolean') compact[key] = val
+    if (Buffer.byteLength(JSON.stringify(compact)) > maxBytes) delete compact[key]
   }
-  return Object.keys(compact).length > 0 ? compact : undefined
+  return Object.keys(compact).length ? compact : undefined
 }
 
 function classifyToolKind(tool?: string, rawKind?: string): ToolCallKind {
@@ -241,7 +241,9 @@ function extractFilePath(input: Record<string, unknown> | null, locations?: read
     firstString(input, [
       'Path',
       'TargetFile',
+      'target_file',
       'AbsolutePath',
+      'absolute_path',
       'file_path',
       'filePath',
       'path',
@@ -253,6 +255,98 @@ function extractFilePath(input: Record<string, unknown> | null, locations?: read
   )
 }
 
+const PRE_EDIT_FILE_MAX_BYTES = 1024 * 1024
+
+interface WorkspaceIdentity { supplied: string; real: string; dev: number; ino: number }
+
+function bindWorkspace(supplied?: string): WorkspaceIdentity | undefined {
+  if (!supplied || !path.isAbsolute(supplied) || process.platform !== 'linux') return
+  try {
+    const real = realpathSync(supplied)
+    const st = statSync(real)
+    if (!st.isDirectory() || real === path.parse(real).root) return
+    return { supplied, real, dev: st.dev, ino: st.ino }
+  } catch { return }
+}
+
+function sameWorkspace(expected: WorkspaceIdentity): boolean {
+  const now = bindWorkspace(expected.supplied)
+  return now?.real === expected.real && now.dev === expected.dev && now.ino === expected.ino
+}
+
+/** Linux fd-backed verification: never follow a caller path outside the DSH workspace.
+ * Without a trustworthy local root and descriptor path, do not open any target.
+ * Presenters never call this function; a replay may already be post-edit. */
+function readPreEditSnapshot(filePath: string, workspace?: WorkspaceIdentity): string | undefined {
+  if (!workspace || !filePath || filePath.length > 4096 || !sameWorkspace(workspace)) return
+  const { supplied: workspaceRoot, real: root } = workspace
+  let fd: number | undefined
+  try {
+    const inRoot = (p: string): boolean => {
+      const rel = path.relative(root, p)
+      return !!rel && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel)
+    }
+    const candidate = path.resolve(workspaceRoot, filePath)
+    const relative = path.relative(workspaceRoot, candidate)
+    if (!relative || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) return
+    const real = realpathSync(candidate)
+    if (!inRoot(real) || !lstatSync(candidate).isFile()) return
+    // O_PATH pins even a racing special file without activating a device/FIFO.
+    // Node does not export Linux O_PATH. Reopen only a verified regular inode.
+    fd = openSync(real, 0x200000 /* Linux O_PATH */ | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    const st = fstatSync(fd)
+    const handle = `/proc/self/fd/${fd}`
+    if (!st.isFile() || st.nlink !== 1 || st.size > PRE_EDIT_FILE_MAX_BYTES || !inRoot(realpathSync(handle)) || !sameWorkspace(workspace)) return
+    const dataFd = openSync(handle, constants.O_RDONLY | constants.O_NONBLOCK)
+    try {
+      const buf = Buffer.alloc(st.size + 1)
+      let n = 0
+      while (n < buf.length) {
+        const read = readSync(dataFd, buf, n, buf.length - n, n)
+        if (!read) break
+        n += read
+      }
+      const after = fstatSync(dataFd)
+      if (n !== st.size || after.mtimeMs !== st.mtimeMs || after.ctimeMs !== st.ctimeMs || buf.subarray(0, n).includes(0)) return
+      return new TextDecoder('utf-8', { fatal: true }).decode(buf.subarray(0, n)).replaceAll('\r\n', '\n')
+    } finally { closeSync(dataFd) }
+  } catch { return } finally { if (fd !== undefined) closeSync(fd) }
+}
+
+function uniqueSnippetLine(text: string, snippet: string, from: number, to: number): number | undefined {
+  if (!snippet || !Number.isSafeInteger(from) || from < 1 || to < from || (to !== Infinity && !Number.isSafeInteger(to))) return
+  const needle = snippet.replaceAll('\r\n', '\n')
+  let start = 0
+  for (let line = 1; line < from; line++) {
+    const nl = text.indexOf('\n', start)
+    if (nl === -1) return
+    start = nl + 1
+  }
+  let end = text.length
+  if (to !== Infinity) {
+    let at = start
+    for (let line = from; line <= to; line++) {
+      const nl = text.indexOf('\n', at)
+      if (nl === -1) { at = text.length; break }
+      at = nl + 1
+    }
+    end = at
+  }
+  const window = text.slice(start, end)
+  const index = window.indexOf(needle)
+  if (index < 0 || window.indexOf(needle, index + 1) !== -1 || (index && window[index - 1] !== '\n')) return
+  const after = index + needle.length
+  if (after !== window.length && !needle.endsWith('\n') && window[after] !== '\n') return
+  let line = from
+  for (let nl = window.indexOf('\n'); nl >= 0 && nl < index; nl = window.indexOf('\n', nl + 1)) line++
+  return line
+}
+
+export function locateUniqueSnippetLine(filePath: string, snippet: string, from = 1, to = Infinity, workspaceRoot?: string): number | undefined {
+  const text = readPreEditSnapshot(filePath, bindWorkspace(workspaceRoot))
+  return text === undefined ? undefined : uniqueSnippetLine(text, snippet, from, to)
+}
+
 function extractFileDiffs(
   tool: string | undefined,
   input: Record<string, unknown> | null,
@@ -262,29 +356,33 @@ function extractFileDiffs(
   const filePath = extractFilePath(input, locations)
   if (!filePath) return []
 
-  // Multi-chunk replacement (e.g. multi_replace_file_content)
-  const chunks = input.ReplacementChunks ?? input.chunks
+  // Multi-chunk replacement (supports both PascalCase and snake_case: multi_replace_file_content)
+  const chunks = input.ReplacementChunks ?? input.replacement_chunks ?? input.chunks
   if (Array.isArray(chunks) && chunks.length > 0) {
     const diffs: FileDiff[] = []
-    for (const chunk of chunks) {
+    for (const chunk of chunks.slice(0, 32)) {
       const rec = asRecord(chunk)
       if (!rec) continue
       const oldText =
         typeof rec.TargetContent === 'string'
           ? rec.TargetContent
-          : typeof rec.oldText === 'string'
-            ? rec.oldText
-            : typeof rec.old_string === 'string'
-              ? rec.old_string
-              : null
+          : typeof rec.target_content === 'string'
+            ? rec.target_content
+            : typeof rec.oldText === 'string'
+              ? rec.oldText
+              : typeof rec.old_string === 'string'
+                ? rec.old_string
+                : null
       const newText =
         typeof rec.ReplacementContent === 'string'
           ? rec.ReplacementContent
-          : typeof rec.newText === 'string'
-            ? rec.newText
-            : typeof rec.new_string === 'string'
-              ? rec.new_string
-              : undefined
+          : typeof rec.replacement_content === 'string'
+            ? rec.replacement_content
+            : typeof rec.newText === 'string'
+              ? rec.newText
+              : typeof rec.new_string === 'string'
+                ? rec.new_string
+                : undefined
       if (newText !== undefined) {
         diffs.push({ path: filePath, oldText, newText })
       }
@@ -298,21 +396,25 @@ function extractFileDiffs(
       ? input.Target
       : typeof input.TargetContent === 'string'
         ? input.TargetContent
-        : typeof input.old_string === 'string'
-          ? input.old_string
-          : typeof input.oldText === 'string'
-            ? input.oldText
-            : undefined
+        : typeof input.target_content === 'string'
+          ? input.target_content
+          : typeof input.old_string === 'string'
+            ? input.old_string
+            : typeof input.oldText === 'string'
+              ? input.oldText
+              : undefined
   const replacement =
     typeof input.Replacement === 'string'
       ? input.Replacement
       : typeof input.ReplacementContent === 'string'
         ? input.ReplacementContent
-        : typeof input.new_string === 'string'
-          ? input.new_string
-          : typeof input.newText === 'string'
-            ? input.newText
-            : undefined
+        : typeof input.replacement_content === 'string'
+          ? input.replacement_content
+          : typeof input.new_string === 'string'
+            ? input.new_string
+            : typeof input.newText === 'string'
+              ? input.newText
+              : undefined
   if (replacement !== undefined) {
     return [{ path: filePath, oldText: target ?? null, newText: replacement }]
   }
@@ -323,29 +425,63 @@ function extractFileDiffs(
       ? input.Content
       : typeof input.CodeContent === 'string'
         ? input.CodeContent
-        : typeof input.content === 'string'
-          ? input.content
-          : undefined
+        : typeof input.code_content === 'string'
+          ? input.code_content
+          : typeof input.content === 'string'
+            ? input.content
+            : undefined
   if (content !== undefined) {
     return [{ path: filePath, oldText: null, newText: content }]
   }
 
   // Empty file creation
-  if (normalizeToolName(tool).includes('write') && input.EmptyFile === true) {
+  if (normalizeToolName(tool).includes('write') && (input.EmptyFile === true || input.empty_file === true)) {
     return [{ path: filePath, oldText: null, newText: '' }]
   }
 
   return []
 }
 
+/** Run once on sanitized start-frame input, before storing mirror locations. */
+export function createPreEditLocator(workspaceRoot?: string): (tc: AcpToolCallUpdate) => NormalizedLocation[] | undefined {
+  const workspace = bindWorkspace(workspaceRoot)
+  return tc => captureLocations(tc, workspace)
+}
+
+export function capturePreEditLocations(tc: AcpToolCallUpdate, workspaceRoot?: string): NormalizedLocation[] | undefined {
+  return captureLocations(tc, bindWorkspace(workspaceRoot))
+}
+
+function captureLocations(tc: AcpToolCallUpdate, workspace?: WorkspaceIdentity): NormalizedLocation[] | undefined {
+  if (tc.sessionUpdate !== 'tool_call' || tc.status === 'completed' || tc.status === 'failed' ||
+      !(tc.kind === 'edit' || EDIT_TOOL_NAMES.has(normalizeToolName(tc.name)))) return
+  const input = asRecord(tc.rawInput ?? tc.args)
+  if (!input) return
+  const diffs = extractFileDiffs(tc.name, input, tc.locations)
+  if (!diffs.some(d => d.oldText)) return
+  const chunks = input.ReplacementChunks ?? input.replacement_chunks ?? input.chunks
+  // Reject partial/malformed chunk lists rather than aligning hints by the wrong index.
+  if (Array.isArray(chunks) && chunks.length !== diffs.length) return
+  const text = readPreEditSnapshot(diffs[0]!.path, workspace)
+  return diffs.map((diff, i) => {
+    const hints = Array.isArray(chunks) ? asRecord(chunks[i]) : input
+    const start = firstNumber(hints, ['StartLine', 'start_line'])
+    const end = firstNumber(hints, ['EndLine', 'end_line'])
+    const exact = diff.oldText && text !== undefined ? uniqueSnippetLine(text, diff.oldText, start ?? 1, end ?? Infinity) : undefined
+    const hint = tc.locations?.[i]?.path === diff.path ? tc.locations[i]?.line : undefined
+    const line = exact ?? hint ?? start
+    return { path: diff.path, ...(line && Number.isSafeInteger(line) && line >= 1 ? { line } : {}) }
+  })
+}
+
 function buildTerminalCallView(args: MirrorToolInput): TerminalCallView | null {
   const name = normalizeToolName(args.tool)
   const input = asRecord(args.input)
-  const command = firstString(input, ['CommandLine', 'command', 'cmd', 'script'])
+  const command = firstString(input, ['CommandLine', 'command_line', 'commandLine', 'command', 'cmd', 'script'])
   const isTerminal = TERMINAL_TOOL_NAMES.has(name) || args.kind === 'execute'
   if (!isTerminal || !command) return null
 
-  const cwd = firstString(input, ['Cwd', 'cwd', 'workdir', 'workingDirectory'])
+  const cwd = firstString(input, ['Cwd', 'WorkingDirectory', 'working_dir', 'workingDir', 'cwd', 'workdir', 'workingDirectory'])
   const description = firstString(input, ['Description', 'description', 'toolSummary']) ??
     (args.title && args.title !== command ? args.title : undefined)
 
@@ -367,9 +503,15 @@ function buildDiffCallView(args: MirrorToolInput): DiffCallView | null {
   if (diffs.length === 0) return null
 
   const firstPath = diffs[0]!.path
+  const chunks = input?.ReplacementChunks ?? input?.replacement_chunks ?? input?.chunks
+  const locations: FileLocation[] = diffs.map((diff, i) => {
+    const hint = Array.isArray(chunks) ? asRecord(chunks[i]) : input
+    const line = (args.locations?.[i]?.path === diff.path ? args.locations[i]?.line : undefined) ?? firstNumber(hint, ['StartLine', 'start_line'])
+    return { path: diff.path, ...(line && Number.isSafeInteger(line) && line >= 1 ? { line } : {}) }
+  })
+  const locatedLine = locations[0]?.line
   const verb = name.includes('write') ? 'Write' : 'Edit'
-  const title = args.title || `${verb} ${firstPath}`
-  const locations: FileLocation[] = Array.from(new Set(diffs.map((d) => d.path))).map((p) => ({ path: p }))
+  const title = args.title || (locatedLine ? `${verb} ${firstPath}:${locatedLine}` : `${verb} ${firstPath}`)
 
   return {
     card: 'diff',
@@ -389,7 +531,9 @@ function buildGenericCallView(args: MirrorToolInput): GenericCallView {
 
   let title = args.title
   if (!title) {
-    if (kind === 'read' && filePath) {
+    if (kind === 'edit' && filePath) {
+      title = line ? `Edit ${filePath}:${line}` : `Edit ${filePath}`
+    } else if (kind === 'read' && filePath) {
       title = line ? `Read ${filePath}:${line}` : `Read ${filePath}`
     } else if (kind === 'search' && query) {
       title = filePath ? `Search "${query}" in ${filePath}` : `Search "${query}"`
@@ -424,6 +568,22 @@ function inferLang(filePath: string): string | undefined {
   return ext ? EXT_TO_LANG[ext] : undefined
 }
 
+const RUNTIME_TIMESTAMP_LINE_RE = /^\s*(?:Created|Completed)\s+At:\s+\S/i
+
+/** Skips leading agy runtime timestamp headers (often duplicated twice) before parsing tool output. */
+function skipLeadingRuntimeTimestamps(lines: readonly string[]): number {
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i] ?? ''
+    if (line.trim() === '' || RUNTIME_TIMESTAMP_LINE_RE.test(line)) {
+      i++
+      continue
+    }
+    break
+  }
+  return i
+}
+
 function buildReadResultView(args: MirrorToolInput, outputText: string): ReadResultView | null {
   const kind = classifyToolKind(args.tool, args.kind)
   if (kind !== 'read') return null
@@ -432,18 +592,18 @@ function buildReadResultView(args: MirrorToolInput, outputText: string): ReadRes
   if (!filePath || !outputText || outputText === '(no output)') return null
 
   const rawLines = outputText.replace(/\r\n/g, '\n').split('\n')
-  let startIdx = 0
+  let startIdx = skipLeadingRuntimeTimestamps(rawLines)
   let totalLinesHint: number | undefined
   let offsetHint = firstNumber(input, ['StartLine', 'offset', 'line', 'start_line']) ?? args.locations?.[0]?.line ?? 1
   if (!Number.isFinite(offsetHint) || offsetHint < 1) offsetHint = 1
   offsetHint = Math.floor(offsetHint)
 
   // Optional header like "Showing lines 10 to 30 of 120" or "Showing lines 10-30 of 120"
-  const headerMatch = /^\s*Showing lines\s+(\d+)\s*(?:to|-)\s*(\d+)\s+of\s+(\d+)/i.exec(rawLines[0] ?? '')
+  const headerMatch = /^\s*Showing lines\s+(\d+)\s*(?:to|-)\s*(\d+)\s+of\s+(\d+)/i.exec(rawLines[startIdx] ?? '')
   if (headerMatch) {
     offsetHint = Math.max(1, Number(headerMatch[1]))
     totalLinesHint = Math.max(1, Number(headerMatch[3]))
-    startIdx = 1
+    startIdx++
   }
 
   const bodyLines = rawLines.slice(startIdx)
@@ -507,7 +667,8 @@ function buildSearchResultView(args: MirrorToolInput, outputText: string): Searc
     let retained = 0
     let truncated = false
 
-    const lines = outputText.replace(/\r\n/g, '\n').split('\n')
+    const rawLines = outputText.replace(/\r\n/g, '\n').split('\n')
+    const lines = rawLines.slice(skipLeadingRuntimeTimestamps(rawLines))
     for (const raw of lines) {
       const line = raw.trimEnd()
       if (!line) continue
@@ -576,9 +737,12 @@ function buildSearchResultView(args: MirrorToolInput, outputText: string): Searc
     }
 
     if (paths.length === 0) {
-      for (const raw of outputText.replace(/\r\n/g, '\n').split('\n')) {
+      const rawLines = outputText.replace(/\r\n/g, '\n').split('\n')
+      const pathLines = rawLines.slice(skipLeadingRuntimeTimestamps(rawLines))
+      for (const raw of pathLines) {
         const line = raw.trim()
         if (!line) continue
+        if (RUNTIME_TIMESTAMP_LINE_RE.test(line)) continue
         if (/truncated|more files|showing\s+\d+/i.test(line)) {
           truncated = true
           continue
@@ -907,10 +1071,7 @@ export function defineAgyAcpMirrorTool(runs: AcpRunStore): ToolDefinition {
         return [{ type: 'text', text: value.output }]
       },
       presentationMeta(_args, value) {
-        const cappedOutput =
-          value.output.length > MAX_META_OUTPUT_BYTES
-            ? value.output.slice(0, MAX_META_OUTPUT_BYTES)
-            : value.output
+        const cappedOutput = fitText(value.output, MAX_META_OUTPUT_BYTES)
         return {
           output: cappedOutput,
           isError: value.isError,

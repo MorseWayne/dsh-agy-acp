@@ -708,6 +708,18 @@ async function handleRequest(id, method, params) {
       return
     }
 
+    if (promptText.includes('INLINE_GEO_400')) {
+      sendUpdate(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: {
+          type: 'text',
+          text: '\n⚠ FAILED_PRECONDITION (code 400): User location is not supported for the API use.\n',
+        },
+      })
+      send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } })
+      return
+    }
+
     if (process.env.FAKE_FORCE_GEO_400 === '1' || promptText.includes('FORCE_GEO_400')) {
       send({
         jsonrpc: '2.0',

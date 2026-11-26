@@ -2,6 +2,20 @@
 
 All notable changes to `@morsewayne/dsh-agy-acp` are documented in this file.
 
+## [0.5.0] - 2026-11-26
+
+### Added
+- **Pure Anonymous Google Egress Probing**: Replaced third-party IP probes (`cloudflare.com` / `api.ip.sb`) in `DEFAULT_EGRESS_PROBES` with strictly anonymous, zero-credential Google endpoints (`HEAD https://aistudio.google.com/` + `POST https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`), ensuring split-tunnel proxies (e.g. Clash Verge) evaluate the exact Google routing policy without leaking credentials or requiring proxy config changes.
+- **Native ACP `session/resume` & HTTP Reverse MCP**: Added capability-negotiated `session/resume` (with `session/load` fallback), native loopback HTTP reverse MCP transport (with per-session bearer auth and stdio fallback), and interactive native question delegation.
+- **Direct Upstream Quota Reader & Hardened Process Tree Management**: Added direct quota API querying alongside CLI fallback, Linux cgroup/process-group tree termination (`process-tree.ts`), private per-process temporary directory isolation (`session-cleanup.ts`), bounded payload/attachment streaming (`payload-bounds.ts`), and `THIRD-PARTY-NOTICES.md`.
+- **Hidden Turn Outcome Inspection**: Added read-only trajectory SQLite step inspection (`turn-outcome.ts`) plus a strict zero-token inline warning fallback (`evaluateInlineWarningFallback`) to classify `FAILED_PRECONDITION (400)`, `RESOURCE_EXHAUSTED (429)`, `TOS_VIOLATION`, and `INVALID_THINKING_SIGNATURE` even under read-only sandboxes (`bwrap --ro-bind / /`).
+
+### Fixed
+- **System prompt delivery stability**: Stopped injecting host system instructions via `_meta.antigravity.systemPrompt.append` (which could cause `agy acp` to hang on newer CLI builds) and standardized delivery via `<host_system_instructions>` prompt blocks.
+- **`bwrap --tmpfs /tmp` TMPDIR isolation**: Detected private `/tmp` mounts in sandboxed `argv` so `TMPDIR`/`TMP`/`TEMP` stay at `/tmp` instead of pointing to a host-only directory invisible inside the sandbox.
+- **Sticky proxy tunnel teardown on Geo 400**: Immediately invalidates the `agy acp` child process (and its pinned Go HTTP/2 connection) upon upstream 400 geo rejection while preserving `SessionIndex` for seamless `session/resume` on the next turn.
+- **gRPC status decoding & prompt inactivity watchdog**: Matched canonical gRPC status names ahead of protobuf varint length prefixes, and restricted inactivity timer resets to active model/tool progress frames rather than metadata notifications.
+
 ## [0.4.2] - 2026-11-25
 
 ### Added

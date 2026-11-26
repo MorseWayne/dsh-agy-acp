@@ -14,7 +14,9 @@ import { isGeoFenceMode } from '../common/geo.ts'
 import type { GeoFenceMode, SessionSummary, StatusSnapshot } from '../common/types.ts'
 import { AccountCard } from './account-card.ts'
 import { sessionAccountLabel } from './account-display.ts'
+import { actualTransport, accountAttention, capabilityLabel, recoveryCapability, sessionRecovery } from './runtime-display.ts'
 import { snapshotNotice, type SnapshotState } from './snapshot-state.ts'
+import { postJson, resetSessions, type SessionResetTarget } from './panel-actions.ts'
 import { getSharedStatusStore } from './status-store.ts'
 import { styles, theme } from './theme.ts'
 
@@ -34,12 +36,6 @@ interface ClientContext extends Context {
       Component: (props?: SlotOwnerProps) => unknown,
     ): () => void
   }
-}
-
-interface PostJsonResult {
-  ok: boolean
-  status?: StatusSnapshot
-  error?: string
 }
 
 function formatTokens(n: number): string {
@@ -69,29 +65,6 @@ function clampTimeoutSeconds(ms: number | undefined): number {
   return Math.min(REQUEST_TIMEOUT_MAX_MS / 1_000, Math.max(REQUEST_TIMEOUT_MIN_MS / 1_000, raw))
 }
 
-async function postJson(url: string, body: Record<string, unknown>): Promise<PostJsonResult> {
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    })
-    let data: { status?: StatusSnapshot; error?: string } = {}
-    try {
-      data = (await res.json()) as { status?: StatusSnapshot; error?: string }
-    } catch {
-      // ignore non-JSON body
-    }
-    return {
-      ok: res.ok,
-      ...(data.status ? { status: data.status } : {}),
-      ...(typeof data.error === 'string' && data.error.trim() ? { error: data.error.trim() } : {}),
-    }
-  } catch {
-    return { ok: false, error: '未能连接到插件，请重试' }
-  }
-}
-
 export interface StatusView extends SnapshotState {
   applyStatus: (next: StatusSnapshot) => void
 }
@@ -115,7 +88,7 @@ function useAgyAcpStatus(): StatusView {
 
 /** Full Settings & Plugin Configuration page (`settings.section`, `plugins.bundle.config`, `plugins.row.config`). */
 function AgyAcpSettingsSection(): unknown {
-  return React.createElement(SettingsView, useAgyAcpStatus())
+  return React.createElement(SettingsView, { ...useAgyAcpStatus(), initialPanel: 'config' })
 }
 
 interface FormBaseline {
@@ -145,8 +118,27 @@ function baselineFromStatus(status: StatusSnapshot): FormBaseline {
   }
 }
 
-export function SettingsView({ status, stream, failed, applyStatus }: StatusView): unknown {
-  const [busy, setBusy] = React.useState(false)
+type Panel = 'sessions' | 'accounts' | 'config'
+type Operation = 'save' | 'resetConfig' | 'resetSessions' | null
+
+/** Native fieldset semantics lock all descendant controls, including any future configuration fields. */
+export function ConfigFieldset({ operation, hidden, onEdit, children }: {
+  operation: Operation; hidden: boolean; onEdit: () => void; children?: unknown
+}): unknown {
+  const writing = operation === 'save' || operation === 'resetConfig'
+  return React.createElement('fieldset', {
+    disabled: writing, 'aria-busy': writing, 'aria-label': '桥接配置', hidden, onChangeCapture: onEdit,
+    style: { ...styles.card, marginInline: 0, minWidth: 0 },
+  }, children)
+}
+
+export function SettingsView({ status, stream, failed, applyStatus, initialPanel = 'sessions' }: StatusView & { initialPanel?: Panel }): unknown {
+  const [panel, setPanel] = React.useState(initialPanel)
+  const [operation, setOperation] = React.useState(null as Operation)
+  const busy = operation !== null
+  const [sessionMsg, setSessionMsg] = React.useState('')
+  const [modelMsg, setModelMsg] = React.useState('')
+  const [confirmAll, setConfirmAll] = React.useState(false)
   const [refreshingModels, setRefreshingModels] = React.useState(false)
   const [savedMsg, setSavedMsg] = React.useState('')
 
@@ -206,9 +198,10 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
   }
 
   const notice = snapshotNotice({ status, stream })
-  const connected = !notice && status.connected
+  const connected = !notice && status.enabled && status.connected
   const sessions = status.sessions
   const accounts = status.accounts
+  const attentionCount = accounts.filter(a => accountAttention(a, status.updatedAt)).length
   const models = status.models ?? []
   const trimmedModel = defaultModel.trim()
   const selected = models.find(m => m.value === trimmedModel)
@@ -263,7 +256,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
 
   const handleSaveConfig = async (): Promise<void> => {
     if (validationError) return
-    setBusy(true)
+    setOperation('save')
     setSavedMsg('')
     try {
       const res = await postJson('/plugins/agy-acp/config', {
@@ -285,12 +278,12 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
         setSavedMsg(res.error || '保存失败，请重试')
       }
     } finally {
-      setBusy(false)
+      setOperation(null)
     }
   }
 
   const handleResetConfig = async (): Promise<void> => {
-    setBusy(true)
+    setOperation('resetConfig')
     setSavedMsg('')
     try {
       const res = await postJson('/plugins/agy-acp/config/reset', {})
@@ -302,47 +295,50 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
         setSavedMsg(res.error || '恢复默认失败，请重试')
       }
     } finally {
-      setBusy(false)
+      setOperation(null)
     }
   }
 
   const handleRefreshModels = async (): Promise<void> => {
     setRefreshingModels(true)
-    setSavedMsg('')
+    setModelMsg('')
     try {
       const res = await postJson('/plugins/agy-acp/models/refresh', {})
       if (res.status) applyStatus(res.status)
-      setSavedMsg(res.ok ? `模型目录已刷新（共 ${res.status?.models.length ?? 0} 个模型）` : (res.error || '模型目录刷新失败'))
+      setModelMsg(res.ok && Array.isArray(res.status?.models) ? `模型目录已刷新（共 ${res.status.models.length} 个模型）` : (res.error || '模型目录刷新失败'))
     } finally {
       setRefreshingModels(false)
     }
   }
 
-  const handleResetSessions = async (sessionKey?: string): Promise<void> => {
-    setBusy(true)
+  const handleResetSessions = async (target: SessionResetTarget): Promise<void> => {
+    setOperation('resetSessions')
+    setConfirmAll(false)
+    setSessionMsg('')
     try {
-      const res = await postJson('/plugins/agy-acp/sessions/reset', sessionKey ? { sessionKey } : {})
+      const res = await resetSessions(target)
       if (res.status) applyStatus(res.status)
+      setSessionMsg(res.message)
     } finally {
-      setBusy(false)
+      setOperation(null)
     }
   }
 
   return React.createElement(
     'div',
-    { style: { maxWidth: '760px', padding: '8px 4px', fontSize: '13px', lineHeight: 1.5 } },
-    // Title
+    { style: { maxWidth: '760px', minWidth: 0, overflowWrap: 'anywhere', padding: '8px 4px', fontSize: '13px', lineHeight: 1.5 } },
+    // Transport freshness is independent of whether an ACP process is running.
     React.createElement(
       'div',
       { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px', marginBottom: '14px' } },
       React.createElement(
         'div',
         null,
-        React.createElement('h2', { style: { margin: 0, fontSize: '18px', fontWeight: 600 } }, 'Antigravity ACP (dsh-agy-acp)'),
+        React.createElement('h2', { style: { margin: 0, fontSize: '18px', fontWeight: 600 } }, 'Antigravity ACP'),
         React.createElement(
           'div',
           { style: { ...styles.secondaryText, marginTop: '2px' } },
-          '基于官方 agy acp 持久化 JSON-RPC 2.0 长连接的 Antigravity 桥接插件',
+          `运行控制台 · 快照更新于 ${formatTime(status.updatedAt)}`,
         ),
       ),
       React.createElement(
@@ -367,11 +363,13 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
             backgroundColor: connected ? theme.stateSuccess : theme.stateIdle,
           },
         }),
-        notice || (connected
-          ? `${status.agentName ?? 'agy acp'} ${status.agentVersion ?? ''} (${status.tierName ?? '已连接'})`
-          : '待机中（首轮对话自动建连）'),
+        notice ? (stream === 'offline' ? '实时连接中断' : '等待实时连接') : !status.enabled ? '插件已停用' : connected
+          ? `ACP 已连接 · ${[status.agentName, status.agentVersion, status.tierName].filter(Boolean).join(' · ') || 'agy acp'}`
+          : 'ACP 待机（首轮对话自动建连）',
       ),
     ),
+
+    notice ? React.createElement('p', { role: 'status', style: { ...styles.tile, borderInlineStart: `3px solid ${theme.stateWarn}` } }, notice) : null,
 
     // Diagnostic error banner (from Phase 2 sanitized lastError)
     status.lastError
@@ -411,30 +409,41 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
         )
       : null,
 
+    modelMsg ? React.createElement('p', { role: 'status', style: styles.tile }, modelMsg) : null,
+    React.createElement('div', { role: 'group', 'aria-label': '控制台分区', style: styles.panelNav },
+      ...([
+        ['sessions', `会话与用量 · ${sessions.length}${status.mcpBridge?.lastError ? '（桥接告警）' : ''}`],
+        ['accounts', `账号与配额 · ${accounts.length}${attentionCount ? `（${attentionCount} 个快照告警）` : ''}`],
+        ['config', `桥接配置${dirty ? ' · 未保存' : ''}`],
+      ] as const).map(([key, label]) => React.createElement('button', {
+        key, type: 'button', 'aria-pressed': panel === key, onClick: () => setPanel(key),
+        style: panel === key ? styles.primaryButton : styles.ghostButton,
+      }, label))),
+
     // Usage overview card
     React.createElement(
       'div',
-      { style: styles.card },
-      React.createElement('div', { style: { fontWeight: 600, marginBottom: '10px' } }, '运行概览与 Token 用量'),
+      { style: styles.card, hidden: panel !== 'sessions' },
+      React.createElement('h3', { style: styles.sectionHeading }, '运行概览与 Token 用量'),
       React.createElement(
         'div',
-        { style: { display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '8px', textAlign: 'center' } },
-        React.createElement('div', null, React.createElement('div', { style: { ...styles.secondaryText, fontSize: '11px' } }, '活跃会话'), String(sessions.length)),
-        React.createElement('div', null, React.createElement('div', { style: { ...styles.secondaryText, fontSize: '11px' } }, 'Input'), formatTokens(totals.inputTokens)),
+        { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 6.5rem), 1fr))', gap: '8px', textAlign: 'center' } },
+        React.createElement('div', null, React.createElement('div', { style: { ...styles.secondaryText, fontSize: '11px' } }, notice ? '快照会话' : '活跃会话'), String(sessions.length)),
+        React.createElement('div', null, React.createElement('div', { style: { ...styles.secondaryText, fontSize: '11px' } }, '输入'), formatTokens(totals.inputTokens)),
         React.createElement('div', null, React.createElement('div', { style: { ...styles.secondaryText, fontSize: '11px' } }, '缓存读 / 写'), `${formatTokens(totals.cachedReadTokens)} / ${formatTokens(totals.cachedWriteTokens ?? 0)}`),
-        React.createElement('div', null, React.createElement('div', { style: { ...styles.secondaryText, fontSize: '11px' } }, 'Output'), formatTokens(totals.outputTokens)),
-        React.createElement('div', null, React.createElement('div', { style: { ...styles.secondaryText, fontSize: '11px' } }, 'Thinking'), formatTokens(totals.reasoningTokens)),
+        React.createElement('div', null, React.createElement('div', { style: { ...styles.secondaryText, fontSize: '11px' } }, '输出'), formatTokens(totals.outputTokens)),
+        React.createElement('div', null, React.createElement('div', { style: { ...styles.secondaryText, fontSize: '11px' } }, '推理'), formatTokens(totals.reasoningTokens)),
       ),
     ),
 
     // Runtime settings card
     React.createElement(
-      'div',
-      { style: styles.card },
+      ConfigFieldset,
+      { operation, hidden: panel !== 'config', onEdit: () => setSavedMsg('') },
       React.createElement(
         'div',
         { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', gap: '8px', flexWrap: 'wrap' } },
-        React.createElement('div', { style: { fontWeight: 600 } }, '桥接配置'),
+        React.createElement('h3', { style: styles.sectionHeading }, '桥接配置'),
         React.createElement(
           'button',
           {
@@ -448,7 +457,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
       ),
 
       React.createElement('p', { style: { ...styles.secondaryText, marginTop: 0, marginBottom: '10px' } },
-        '权限跟随当前 DSH 会话，需要确认时请在对应对话中处理。此处配置会持久化到本机并在重启后生效。'),
+        '配置保存在本机。权限跟随 DSH 会话；如需批准工具调用，请返回对应对话。'),
 
       // Reverse MCP bridge toggle
       React.createElement(
@@ -462,7 +471,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
             borderRadius: '8px',
             border: theme.borderPrimary,
             backgroundColor: theme.surfaceTile,
-            marginBottom: status.mcpBridge && (status.mcpBridge.enabled || status.mcpBridge.totalCalls > 0) ? '6px' : '12px',
+            marginBottom: '12px',
             cursor: 'pointer',
           },
         },
@@ -483,26 +492,6 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
           style: { width: '16px', height: '16px', cursor: 'pointer' },
         }),
       ),
-      status.mcpBridge && (status.mcpBridge.enabled || status.mcpBridge.totalCalls > 0)
-        ? React.createElement(
-            'div',
-            { style: { ...styles.secondaryText, fontSize: '11px', padding: '0 4px', marginBottom: '12px' } },
-            [
-              `桥接运行态：挂载会话 ${status.mcpBridge.activeBridges}`,
-              `在途调用 ${status.mcpBridge.inFlightCalls}`,
-              `累计调用 ${status.mcpBridge.totalCalls}`,
-              status.mcpBridge.failedCalls > 0 && `失败/超时 ${status.mcpBridge.failedCalls}`,
-              status.mcpBridge.lastToolName && `最近工具 ${status.mcpBridge.lastToolName}`,
-            ].filter(Boolean).join(' · '),
-            status.mcpBridge.lastError
-              ? React.createElement(
-                  'div',
-                  { style: { color: theme.stateWarn, marginTop: '2px', overflowWrap: 'anywhere' } },
-                  `最近桥接告警：${status.mcpBridge.lastError}`,
-                )
-              : null,
-          )
-        : null,
 
       // Opt-in quota-aware scheduling toggle
       React.createElement(
@@ -538,6 +527,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
         }),
       ),
 
+      models.length === 0 ? React.createElement('p', { style: styles.secondaryText }, '模型目录为空。可点击「刷新模型目录」探测；也可留空使用 ACP 默认模型。') : null,
       // Model / effort / paths / timeouts grid
       React.createElement(
         'div',
@@ -610,6 +600,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
           React.createElement('div', { style: { ...styles.secondaryText, marginBottom: '4px' } }, 'agy 可执行文件路径（留空自动探测）'),
           React.createElement('input', {
             type: 'text',
+            'aria-label': 'agy 可执行文件路径',
             value: agyBin,
             placeholder: '/home/user/.local/bin/agy',
             onChange: (e: { target: { value: string } }) => setAgyBin(e.target.value),
@@ -622,6 +613,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
           React.createElement('div', { style: { ...styles.secondaryText, marginBottom: '4px' } }, '模型探测目录（不改变会话工作区）'),
           React.createElement('input', {
             type: 'text',
+            'aria-label': '模型探测目录',
             value: workspaceRoot,
             placeholder: '留空使用默认探测目录',
             onChange: (e: { target: { value: string } }) => setWorkspaceRoot(e.target.value),
@@ -637,6 +629,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
             min: SESSION_IDLE_TTL_MIN_MS / 60_000,
             max: SESSION_IDLE_TTL_MAX_MS / 60_000,
             step: 1,
+            'aria-label': '空闲会话回收（分钟）',
             value: idleMinutes,
             onChange: (e: { target: { value: string } }) => setIdleMinutes(e.target.value),
             style: styles.input,
@@ -645,12 +638,13 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
         React.createElement(
           'div',
           null,
-          React.createElement('div', { style: { ...styles.secondaryText, marginBottom: '4px' } }, '单次请求超时（秒，10–3600）'),
+          React.createElement('div', { style: { ...styles.secondaryText, marginBottom: '4px' } }, `单次请求超时（秒，${REQUEST_TIMEOUT_MIN_MS / 1_000}–${REQUEST_TIMEOUT_MAX_MS / 1_000}）`),
           React.createElement('input', {
             type: 'number',
             min: REQUEST_TIMEOUT_MIN_MS / 1_000,
             max: REQUEST_TIMEOUT_MAX_MS / 1_000,
             step: 10,
+            'aria-label': '单次请求超时（秒）',
             value: timeoutSeconds,
             onChange: (e: { target: { value: string } }) => setTimeoutSeconds(e.target.value),
             style: styles.input,
@@ -692,7 +686,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
             onClick: () => void handleSaveConfig(),
             style: { ...styles.primaryButton, opacity: busy || validationError ? 0.55 : 1 },
           },
-          busy ? '保存中…' : '保存并应用',
+          operation === 'save' ? '保存中…' : '保存并应用',
         ),
         React.createElement(
           'button',
@@ -702,34 +696,34 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
             onClick: () => void handleResetConfig(),
             style: { ...styles.ghostButton, opacity: busy || !status.hasPersistedConfig ? 0.5 : 1 },
           },
-          '恢复默认',
+          operation === 'resetConfig' ? '恢复中…' : '恢复默认',
         ),
         validationError
           ? React.createElement('span', { role: 'alert', style: { fontSize: '12px', color: theme.stateError } }, validationError)
           : dirty
             ? React.createElement('span', { style: { fontSize: '12px', color: theme.stateWarn } }, '有未保存的修改')
-            : savedMsg
-              ? React.createElement('span', { role: 'status', style: { fontSize: '12px' } }, savedMsg)
-              : null,
+            : null,
+        savedMsg ? React.createElement('span', { role: 'status', style: styles.secondaryText }, savedMsg) : null,
       ),
     ),
 
     // Active ACP sessions card
     React.createElement(
-      'div',
-      { style: styles.card },
+      'section',
+      { style: styles.card, hidden: panel !== 'sessions' },
       React.createElement(
         'div',
         { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', gap: '8px', flexWrap: 'wrap' } },
         React.createElement(
           'div',
           null,
-          React.createElement('div', { style: { fontWeight: 600 } }, `活跃 ACP 长连接会话 (${sessions.length})`),
+          React.createElement('h3', { style: styles.sectionHeading }, `${notice ? '快照中的会话' : '活跃 ACP 会话'} (${sessions.length})`),
+          React.createElement('div', { style: styles.secondaryText }, `上次握手的恢复能力 · ${recoveryCapability(status.capabilities)}`),
           typeof status.persistedSessions === 'number' && status.persistedSessions > 0
             ? React.createElement(
                 'div',
                 { style: { ...styles.secondaryText, fontSize: '11px' } },
-                `已索引可恢复会话 ${status.persistedSessions} 个（空闲回收或重启后自动通过 session/load 原生恢复）`,
+                `恢复索引：${status.persistedSessions} 个 · 下次建连时尝试恢复，索引并非活跃会话。`,
               )
             : null,
         ),
@@ -739,19 +733,53 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
               {
                 type: 'button',
                 disabled: busy,
-                onClick: () => void handleResetSessions(),
+                onClick: () => setConfirmAll(true),
                 style: styles.dangerButton,
               },
               '重置全部会话',
             )
           : null,
       ),
+      React.createElement('details', { style: { marginBottom: '10px' } },
+        React.createElement('summary', { style: { cursor: 'pointer' } }, '上次握手的输入与工具能力'),
+        React.createElement('div', { style: styles.secondaryText },
+          ([['HTTP MCP', 'mcpHttp'], ['图像', 'image'], ['音频', 'audio'], ['嵌入上下文', 'embeddedContext'], ['系统提示追加', 'systemPromptAppend']] as const)
+            .map(([label, key]) => `${label}：${capabilityLabel(status.capabilities?.[key])}`).join(' · '))),
+      status.mcpBridge
+        ? React.createElement(
+            'div',
+            { style: { ...styles.secondaryText, fontSize: '11px', padding: '0 4px', marginBottom: '12px' } },
+            [
+              `桥接运行态：挂载会话 ${status.mcpBridge.activeBridges}`,
+              `在途调用 ${status.mcpBridge.inFlightCalls}`,
+              `累计调用 ${status.mcpBridge.totalCalls}`,
+              status.mcpBridge.failedCalls > 0 && `失败/超时 ${status.mcpBridge.failedCalls}`,
+              status.mcpBridge.lastToolName && `最近工具 ${status.mcpBridge.lastToolName}`,
+              `实际传输：${status.mcpBridge.activeBridges > 0 ? actualTransport(status.mcpBridge.transport) : '未挂载'}`,
+            ].filter(Boolean).join(' · '),
+            status.mcpBridge.lastError
+              ? React.createElement(
+                  'div',
+                  { style: { color: theme.stateWarn, marginTop: '2px', overflowWrap: 'anywhere' } },
+                  `最近桥接告警：${status.mcpBridge.lastError}`,
+                )
+              : null,
+          )
+        : React.createElement('div', { style: styles.secondaryText }, '桥接运行态：未上报'),
+      confirmAll ? React.createElement('div', { style: styles.tile },
+        React.createElement('p', { style: { margin: '0 0 6px' } }, '关闭全部 ACP 会话并清除恢复索引？此操作不能撤销。'),
+        React.createElement('div', { style: styles.panelNav },
+          React.createElement('button', { type: 'button', style: styles.ghostButton, onClick: () => setConfirmAll(false) }, '取消'),
+          React.createElement('button', { type: 'button', style: styles.dangerButton, disabled: busy, onClick: () => void handleResetSessions({ kind: 'all' }) }, '确认重置全部')),
+      ) : null,
+      operation === 'resetSessions' || sessionMsg ? React.createElement('p', { role: 'status' }, operation === 'resetSessions' ? '正在关闭会话…' : sessionMsg) : null,
       sessions.length === 0
-        ? React.createElement('div', { style: styles.secondaryText }, '暂无活跃 ACP 会话（在对话中选择 Antigravity (ACP) 模型后自动建立）。')
+        ? React.createElement('div', { style: styles.secondaryText }, notice ? '此快照没有会话。等待实时连接后可确认当前状态。' : '暂无活跃 ACP 会话。在对话中选择 Antigravity (ACP) 模型并发送消息即可建立。')
         : sessions.map((s: SessionSummary) => {
             const pct = s.contextUsed != null && s.contextSize > 0
               ? Math.min(100, Math.max(0, (100 * s.contextUsed) / s.contextSize))
               : null
+            const recovery = sessionRecovery(s)
             const barColor = pct == null ? theme.stateIdle : pct > 92 ? theme.stateError : pct > 80 ? theme.stateWarn : theme.brandPrimary
             return React.createElement(
               'div',
@@ -760,6 +788,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
                 style: {
                   ...styles.tile,
                   display: 'flex',
+                  flexWrap: 'wrap',
                   justifyContent: 'space-between',
                   alignItems: 'center',
                   gap: '12px',
@@ -767,12 +796,12 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
               },
               React.createElement(
                 'div',
-                { style: { flex: 1, minWidth: 0 } },
+                { style: { flex: '1 1 15rem', minWidth: 0 } },
                 React.createElement(
                   'div',
                   { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap', fontWeight: 500 } },
                   `${s.currentModel || 'default'} · ${s.currentMode}`,
-                  s.resumed
+                  recovery
                     ? React.createElement(
                         'span',
                         {
@@ -785,7 +814,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
                             color: theme.stateSuccess,
                           },
                         },
-                        'session/load 已恢复',
+                        recovery,
                       )
                     : null,
                 ),
@@ -798,6 +827,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
                   { style: { ...styles.secondaryText, fontSize: '11px' } },
                   `会话 ${s.dshSessionKey} · 推理强度 ${s.currentEffort ? effortLabel(s.currentEffort) : '未报告'} · ACP 上下文 ${contextLabel(s)} · 活跃于 ${formatTime(s.lastActiveAt)}`,
                 ),
+                React.createElement('div', { style: styles.secondaryText }, `MCP 实际传输：${actualTransport(s.mcpTransport)}`),
                 pct != null
                   ? React.createElement(
                       'div',
@@ -811,7 +841,7 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
                           marginTop: '6px',
                           height: '4px',
                           borderRadius: '999px',
-                          backgroundColor: 'rgba(127, 127, 127, 0.2)',
+                          backgroundColor: theme.surfaceCard,
                           overflow: 'hidden',
                         },
                       },
@@ -830,7 +860,8 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
                 {
                   type: 'button',
                   disabled: busy,
-                  onClick: () => void handleResetSessions(s.dshSessionKey),
+                  onClick: () => void handleResetSessions({ kind: 'one', sessionKey: s.dshSessionKey }),
+                  'aria-label': `关闭会话 ${s.title || s.dshSessionKey}`,
                   style: styles.ghostButton,
                 },
                 '关闭',
@@ -841,14 +872,13 @@ export function SettingsView({ status, stream, failed, applyStatus }: StatusView
 
     React.createElement(
       'section',
-      { style: styles.card },
-      React.createElement('h3', { style: { fontSize: '14px', margin: 0 } }, `账号状态 (${accounts.length})`),
-      notice ? React.createElement('div', { role: 'status', style: { marginTop: '4px', fontWeight: 550 } }, notice) : null,
+      { style: styles.card, hidden: panel !== 'accounts' },
+      React.createElement('h3', { style: styles.sectionHeading }, `账号状态 (${accounts.length})`),
       React.createElement('p', { style: { margin: '4px 0 10px', ...styles.secondaryText } },
         '配额仅在手动刷新时向上游查询，不按 Token 用量推算。清除本地冷却不会恢复上游额度。'),
       accounts.length
-        ? accounts.map(account => React.createElement(AccountCard, { key: account.id, account, applyStatus }))
-        : React.createElement('div', null, '暂无账号状态。'),
+        ? accounts.map(account => React.createElement(AccountCard, { key: account.id, account, geoFenceMode: status.config?.geoFenceMode, applyStatus }))
+        : React.createElement('div', null, '尚未收到账号状态。请检查账号配置及插件是否启用；收到快照后将自动显示。'),
     ),
   )
 }
