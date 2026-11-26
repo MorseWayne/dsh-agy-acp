@@ -2,6 +2,16 @@
 
 All notable changes to `@morsewayne/dsh-agy-acp` are documented in this file.
 
+## [0.8.0] - 2026-11-27
+
+### Added
+- **Native Conversation-Panel Visualization for `agy_acp_tool`**: Registered a keyed DSH `tool.call.toolview` renderer (`mirror-tool-view.ts`, `mirror-tool-model.ts`, `mirror-presentation.ts`) reusing DSH Web's native UI primitives (`DisclosureRow`, `TerminalBlock`, `DiffBlock` + `diffTotals`, `ReadBlock`, `SearchBlock`, `WebBlock`, `Tag`, `TextShimmer`, and native icons). Replaces generic `agy_acp_tool · <runId>` rows for both live calls and previously recorded sessions with readable per-tool rows (Read with clickable file/line links, Edit/Write with inline `+N -M` diff stats, Terminal with cleaned output and exit-code badges, Grep/Glob search, Web search/fetch, `update_steps` checklists, and unwrapped IN/OUT cards).
+- **ACP Diff & Command Exit Code Extraction**: Enhanced `mirror-tool.ts` to extract ACP standard `content: [{ type: 'diff', path, oldText, newText }]` changes into bounded `output.diffs` / `presentationMeta.diffs`, and parse exit codes from `Command exited with code N.` command headers.
+- **Modular Console UI & MCP Policy Presets**: Refactored the Web Console into modular panels (`sessions-panel.ts`, `accounts-panel.ts`, `config-panel.ts`, `ui-primitives.ts`) with batch all-account egress checks, 3 one-click MCP tool policy presets (`balanced`, `dsh_first`, `minimal`), and unified DSH light/dark scoped styling.
+
+### Changed
+- **SSE Throttling & Tool Catalog Caching**: Detached `pool.on('status')` listeners automatically when no SSE clients are connected, throttled status broadcasts, and cached `collectMcpToolCatalog()` by policy key until `tools/change` or policy updates occur.
+
 ## [0.7.0] - 2026-11-27
 
 ### Added
