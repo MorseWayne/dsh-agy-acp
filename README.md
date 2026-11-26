@@ -1,55 +1,143 @@
+<div align="center">
+
+<img src="docs/images/hero-banner.png" alt="dsh-agy-acp — DeepSeek Harness × Google Antigravity ACP Bridge" width="100%" />
+
 # dsh-agy-acp
 
-新一代 **DeepSeek Harness (DSH) × Google Antigravity (`agy acp`)** 桥接插件，基于官方持久化 ACP JSON-RPC 2.0 长连接协议构建，提供实时原生工具卡片镜像、会话级权限沙箱对齐、出口地域合规防风控熔断、按能力协商的跨重启会话恢复、反向 MCP 桥接与多账号配额感知运维闭环。
+**新一代 DeepSeek Harness (DSH) × Google Antigravity (`agy acp`) 持久长连接桥接插件**
 
-## 安装与本地联调
+[![npm version](https://img.shields.io/npm/v/@morsewayne/dsh-agy-acp?style=flat-square&color=38bdf8)](https://www.npmjs.com/package/@morsewayne/dsh-agy-acp)
+[![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A5%2024-34d399?style=flat-square)](https://nodejs.org/)
+[![Antigravity CLI](https://img.shields.io/badge/agy%20acp-%E2%89%A5%201.5-818cf8?style=flat-square)](#快速开始)
+[![License](https://img.shields.io/badge/License-MIT-f59e0b?style=flat-square)](package.json)
 
-需要 **Node.js >= 24** 以及已登录的 Antigravity CLI（`agy >= 1.5`）。
+持久 ACP JSON-RPC 2.0 长连接 · 分级反向 MCP 网关 · 原生工具卡片实时镜像 · 进程沙箱权限对齐 · 纯匿名出口合规硬熔断 · 多账号 5h/7d 配额调度
 
-从 npm 安装到 DSH Web 配置：
+[快速开始](#快速开始) · [系统架构](#系统架构) · [控制台预览](#控制台预览) · [核心能力](#核心能力) · [权限与安全不变量](#权限与安全不变量) · [诊断与排查](#诊断与排查)
+
+</div>
+
+---
+
+## 为什么选择 `dsh-agy-acp`
+
+| 维度 | 核心亮点 |
+| --- | --- |
+| **零冷启动长连接** | 按 DSH 会话与权限指纹池化长驻 `agy acp` 进程；跨空闲与重启优先 `session/resume` → `session/load` → 24K 摘要重建，最大程度保留服务端 Prompt Cache。 |
+| **分级反向 MCP 网关** | 内置 **7 组补充能力 + 5 组原生替换**策略、3 档快捷预设与 `dsh_discover_tools` / `dsh_call_tool` 按需元工具网关，配合 **52 KB 预算安全网**，在远低于 `agy acp` 64 KiB 上限的同时无缝复用 DSH 记忆、子代理、文档、工作流与原生审批。 |
+| **原生对话工具卡片与精准缓存计量** | 注册 DSH 原生 `tool.call.toolview` 渲染器，直接以 `ReadBlock`（可点击文件/行号）、`DiffBlock`（`+N -M` 变更统计）、`TerminalBlock`（清理输出与退出码徽章）、`SearchBlock`、`WebBlock` 与任务清单呈现每一步工具调用（兼容实时与历史回放）；增量尾随 `transcript.jsonl` 精确还原每步缓存命中率与实时上下文占用。 |
+| **纯匿名出口合规硬熔断** | 零第三方 IP 服务依赖，直接通过匿名 Google 端点与 Go `agy` 同源代理路由探测出口；受限地域（如 `HK` / `CN`）在本地 **零发包硬熔断**，漏网 `400` 即时拆旧连并自动切号。 |
+| **多账号配额观测与 TOS 隔离** | 支持 5 小时 / 7 天双窗口配额可视化、可选配额权重调度与 ≤15% 低配额预警；命中 `TOS_VIOLATION` 即刻全模型族隔离并阻断自动故障转移，防止连锁风控。 |
+| **低开销 DSH 原生控制台** | 后端按需监听 + 180ms SSE 合并节流 + 工具目录缓存；前端条件挂载与浅/深色 `--dsw-alias-*` 主题原生融合。 |
+
+---
+
+## 系统架构
+
+<p align="center">
+  <img src="docs/images/architecture.svg" alt="dsh-agy-acp 系统架构与双向桥接全景" width="100%" />
+</p>
+
+<details>
+<summary>查看核心源码模块布局</summary>
+
+```text
+src/
+├── index.ts                  # 插件入口、HTTP/SSE 挂载、工具目录缓存与生命周期协调
+├── acp/                      # 持久 agy acp JSON-RPC 2.0 客户端、进程树与单轮 stderr 切片
+├── common/                   # 配置常量、分级 MCP 工具策略 (mcp-tool-policy.ts)、地域与共享类型
+├── mcp/                      # 会话级回环 HTTP/stdio 反向 MCP 服务端与按需元工具网关
+├── provider/                 # DSH LLM Provider 适配器、工具镜像聚合、Transcript 用量尾随与自动审查路由
+├── runtime/                  # 会话池、session/resume 索引、出口合规围栏、多账号配额池、TOS 隔离与 /agy-acp doctor
+├── transport/                # SSE 广播节流器与控制台 REST API
+└── client/                   # DSH Web 控制台 UI（会话与用量 / 账号与配额 / 桥接配置与 MCP 策略面板）
+```
+
+</details>
+
+---
+
+## 控制台预览
+
+插件深度集成至 DSH Web 顶栏状态胶囊与设置面板，完整适配浅色 / 深色主题（`--dsw-alias-*`）。
+
+### 1. 会话与用量监控
+实时呈现活跃会话数、可恢复索引、反向 MCP 调用统计、累计输入/输出/缓存命中率、协商能力胶囊，以及每个会话的实际恢复方式（`session/resume` / `session/load` / 新建）、MCP 传输通道与上下文占用进度。
+
+<p align="center">
+  <img src="docs/images/console-sessions.png" alt="Antigravity ACP 控制台 — 会话与用量" width="92%" />
+</p>
+
+### 2. 多账号池、出口合规与 5h/7d 配额观测
+支持一键检测全部启用账号的代理出口合规状态，展示 5 小时 / 7 天双列可视化配额进度条、≤15% 低配额提醒、冷却倒计时与 TOS 隔离手动解除。
+
+<p align="center">
+  <img src="docs/images/console-accounts.png" alt="Antigravity ACP 控制台 — 账号与配额" width="92%" />
+</p>
+
+### 3. 桥接配置、自动审查路由与反向 MCP 分级策略
+高频设置与高级运维项分层组织：支持默认模型/推理强度配置、跨 Provider 自动审查转发、**省 Token 平衡 / 深度 DSH 接管 / 最小补充**一键预设、实时 **52 KB 字节预算仪表**、12 组三段式策略分段器、受控展开逐工具精细覆写，以及防误操作的底部 Sticky 保存栏。
+
+<p align="center">
+  <img src="docs/images/console-mcp-config.png" alt="Antigravity ACP 控制台 — 桥接配置与反向 MCP 策略" width="92%" />
+</p>
+
+---
+
+## 快速开始
+
+### 环境要求
+- **Node.js `>= 24`**
+- 已安装并完成登录的 Antigravity CLI（**`agy >= 1.5`**）
+
+### 从 npm 安装
 
 ```bash
 dsh plugin --profile web add @morsewayne/dsh-agy-acp --registry=https://registry.npmjs.org
 ```
 
-本地联调先构建，再使用 DSH 插件管理器安装本项目目录（不需要打包 `.tgz`）：
+### 本地源码联调
+
+先执行构建，再通过 DSH 插件管理器直接安装本项目目录（无需手动打包 `.tgz`）：
 
 ```bash
 pnpm install
 pnpm run verify
 npm run build
-# DSH → 插件管理 → 安装本地项目目录
+# 打开 DSH Web → 插件管理 → 安装本地项目目录
 ```
 
-启动或重启 `dsh web` 后，可在聊天框输入 `/agy-acp` 查看运行状态，或输入 `/agy-acp doctor` 执行一键只读环境自检。
+启动或重启 `dsh web` 后，在任意聊天框输入：
+- `/agy-acp`（或 `/agy-acp status`）：查看活跃连接、恢复索引、反向 MCP 统计、出口合规与 Token 概览
+- `/agy-acp doctor`：执行 5 步只读、沙箱隔离且自动脱敏的环境自检
 
 ---
 
-## 核心特性
+## 核心能力
 
-### 1. 持久 `agy acp` 长连接与 会话原生连续性
-- **零冷启动长连接**（`src/acp/` + `src/runtime/session-pool.ts`）：按 DSH 会话与权限指纹维护长驻 `agy acp` 进程，动态同步 `model` / `thought_level` / `mode` 及 `config_option_update`、`session_info_update` 实时通知，支持 `AbortSignal` 毫秒级 `session/cancel`。
-- **跨空闲与重启恢复**（`src/runtime/session-index.ts`）：轻量级索引持久化于 `~/.dsh/agy-acp/sessions.json`（`0600` 权限，上限 200 条、7 天自动过期，**不落盘任何对话正文或凭据**）。当空闲 TTL 回收或 DSH 重启后，若账号、工作目录与权限指纹未变，优先使用 `session/resume` 恢复原生上下文；老版本回退 `session/load`，只保留模型、标题和用量元数据，不向对话重放历史。两者均不可用时改用 `session/new` + 24K 预算制 `<prior_conversation_digest>` 摘要。
-- **`options.system` 与只读辅助调用**：优先通过 `_meta.antigravity.systemPrompt.append` 注入宿主系统提示词并按哈希增量更新；针对标题生成、上下文压缩等 `options.purpose` 请求，使用独立只读沙箱、拒绝全部工具审批且不污染主会话池。
+### 1. 持久 `agy acp` 长连接与会话原生连续性
+- **会话池化与实时协议同步**（`src/acp/`、`src/runtime/session-pool.ts`）：按 DSH 会话与权限指纹复用长驻子进程，实时消费 `config_option_update` 与 `session_info_update`，支持 `AbortSignal` 毫秒级 `session/cancel`。
+- **三级无感恢复**（`src/runtime/session-index.ts`）：轻量索引原子持久化于 `~/.dsh/agy-acp/sessions.json`（`0600` 权限，上限 200 条、7 天过期，**绝不落盘对话正文或凭据**）。空闲回收或 DSH 重启后按能力协商依次尝试 `session/resume` → `session/load`（保留元数据而不重放历史）→ `session/new` + 24K 预算 `<prior_conversation_digest>`。
+- **跨 Provider 自动审查路由**：通过 `autoReviewProvider` / `autoReviewModel` / `autoReviewEffort` 可将 DSH 的 `purpose: 'auto-review'` 请求直连转发到任意已注册 DSH Provider（零 `agy acp` 冷启动），或在指定 Antigravity 模型上以自动最低推理档位执行；所有辅助调用均运行在独立只读沙箱中，不污染主会话池。
 
-### 2. 实时工具流式镜像与全系原生卡片
-- **增量工具聚合**（`src/provider/run-store.ts` + `src/provider/mirror-tool.ts`）：在工具进入 `in_progress` 时即向前端发射实时运行卡片，支持同轮并发工具批量发射与无序完成合并，原生投影 `terminal`、`diff`、`read`、`search`、`web`、`generic` 卡片。
+### 2. 分级反向 MCP 网关与原生委托
+- **紧凑常驻 + 按需发现**（`src/common/mcp-tool-policy.ts`、`src/mcp/server.ts`）：
+  - **7 组补充能力**：核心记忆（`memory_core`）与交付技能（`delivery_skills`）默认常驻直出；文档办公、目标工作流、记忆管理、图像系统等低频扩展默认按需加载。
+  - **5 组原生替换**：子代理（`subagents`）默认由 DSH 替代以保留宿主的跨模型路由策略；联网搜索、文件读写、终端任务、计划定时默认保留 `agy` 原生实现，可一键切换为「由 DSH 替代」或「按需并存」。
+  - **元工具网关 & 52 KB 安全网**：低频工具通过 `dsh_discover_tools` + `dsh_call_tool` 按需查询完整 schema 与执行调用，复用 DSH 原生审批卡片并在等待审批期间自动暂停 ACP 空闲超时；若自定义常驻配置超限，52 KB 预算安全网会自动降级兜底并告警。
+- **回环传输与代理免疫**：优先使用原生回环 HTTP MCP（`127.0.0.1` + 会话级 Bearer 鉴权，旧版自动回退 stdio），不污染全局 `~/.gemini/config/mcp_config.json`；内置代理环境变量免疫、`NO_PROXY` 回环加固、单调用超时中止（`-32001`）与单会话并发上限（`-32005`）。
 
-### 3. 网络出口合规探测与防风控硬熔断（Egress Probe & GeoFence Guard）
-- **与 Go `agy` 一致的代理探测**（`src/runtime/egress-guard.ts`）：零外部依赖，严格按 `NO_PROXY` → `HTTPS_PROXY` → `ALL_PROXY` → `HTTP_PROXY` 解析路由，原生支持 HTTP `CONNECT`（含 Basic Auth）、SOCKS5/SOCKS5H（RFC 1928/1929，`ATYP=0x03` 远端域名解析防本地 DNS 泄露）及直连/TUN 模式。
-- **全 4 条出站链路统一守门**：覆盖主对话（含新建与长连接复用防漂移）、辅助调用、启动模型目录探测（地域阻断时自动暂停后台重试）与配额查询；当出口落入 `HK` / `CN` 等受限地区时**在本地直接硬熔断，零子进程启动、零流量发往 Google**。
-- **多模式与漏网 400 瞬时熔断**：支持 `block`（默认）、`strict`、`warn`、`off` 四档策略；若缓存期内 VPN 瞬时漂移触发上游 Google `400 FAILED_PRECONDITION` 地域错误，立即作废缓存并触发 60 秒本地保护熔断与多账号池自动故障转移。
+### 3. 原生对话工具卡片渲染与精准缓存计量
+- **DSH 原生 `tool.call.toolview` 渲染**（`src/provider/mirror-tool.ts`、`src/client/mirror-tool-view.ts`）：工具进入 `in_progress` 即并发推送状态更新，直接复用 DSH Web 原生组件将 `agy_acp_tool` 渲染为可读的步级卡片（含 Read 可点击文件行号、Edit/Write 的 `+N -M` 差异块、Terminal 退出码徽章、Grep/Glob 搜索、Web 检索抓取与 `update_steps` 清单），同时支持实时流与历史会话回放。
+- **Transcript 步级用量归因**：直接增量尾随账号目录下的 `transcript.jsonl`（`PLANNER_RESPONSE` 记录），在每个工具边界准确上报实时上下文压力与真实缓存命中率；无 transcript 时平滑回退到按比例缩放的占用估算。
 
-### 4. 配置原子持久化、多账号池与控制台 UI
-- **配置持久化**（`src/runtime/config-store.ts`）：控制台修改的白名单运行项原子写入 `~/.dsh/agy-acp/config.json`（`0600` 权限），支持一键恢复默认。多账号敏感目录与代理（`accounts`、`credentialSlotDir`）仅由宿主配置只读管理。
-- **多账号配额观测与可选配额感知调度**（`src/runtime/account-pool.ts` + `src/runtime/account-quota.ts`）：支持在只读沙箱中手动刷新 5 小时 / 7 天双窗口配额并展示 ≤15% 低配额预警；开启「配额感知多账号调度」开关后，将采集到的配额样本映射至 `MultiAccountPool` 权重，优先调度高余量账号。
-- **前端单例 SSE 与主题适配**（`src/client/`）：模块级共享单条 `/plugins/agy-acp/events` 连接，全面接入 DSH `--dsw-alias-*` 浅色/深色主题令牌。
+### 4. 纯匿名出口合规探测与防风控熔断（GeoFence Guard）
+- **零第三方依赖纯匿名探测**（`src/runtime/egress-guard.ts`）：直接探测 `HEAD https://aistudio.google.com/` 与匿名 `POST https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`，不发送任何凭据，严格对齐 Go `agy` 的代理路由规则（`NO_PROXY` → `HTTPS_PROXY` → `ALL_PROXY` → `HTTP_PROXY`），原生支持 HTTP `CONNECT`、SOCKS5/SOCKS5H（`ATYP=0x03` 远端解析防 DNS 泄露）及直连/TUN，完美适配 Clash Verge 等分流代理。
+- **4 链路统一守门与漏网 400 瞬时熔断**：覆盖主对话（新建与长连接复用）、辅助调用、模型目录探测与配额查询。支持 `block`（默认）/ `strict` / `warn` / `off` 四档策略；一旦代理漂移触发上游 `400 FAILED_PRECONDITION`，立即销毁旧子进程（释放固定 Go HTTP/2 连接）、触发 60 秒本地熔断并保留 `SessionIndex` 供多账号无缝切号恢复。
 
-### 5. 会话级反向 MCP 桥接与 `/agy-acp` 诊断工具箱
-- **反向 MCP 桥接加固**（`src/mcp/server.ts`）：优先使用对端声明的 HTTP MCP 能力，旧版用 stdio 转发；创建和恢复会话时动态注入本机 `127.0.0.1` Bearer 鉴权桥接，不污染全局 `~/.gemini/config/mcp_config.json`；内置单次工具调用超时（触发 `AbortSignal` 中断慢工具并返回 `-32001`）与单会话并发上限保护（`-32005`）。
-- **斜杠命令诊断**（`src/runtime/doctor.ts`）：
-  - `/agy-acp`（或 `/agy-acp status`）：输出连接套餐、活跃/已索引会话、地域防护与配额调度状态、反向 MCP 统计、账号出口与 Token 概览；
-  - `/agy-acp doctor`：执行只读 5 步自检（`agy` 可执行文件与版本、宿主只读沙箱强制约束、启用账号出口地域合规性、ACP 模型目录握手、本机持久化文件状态），全量输出经凭据与 IP 脱敏处理。
+### 5. 多账号配额池、隐藏异常识别与 TOS 隔离
+- **独立凭据槽与配额权重调度**（`src/runtime/account-pool.ts`、`src/runtime/account-quota.ts`）：非阻塞异步凭据槽租约，支持直连上游配额接口 + 只读 CLI 兜底，开启「配额感知调度」后优先分配高余量账号。
+- **隐藏异常与 TOS 保护**：通过只读 SQLite 轨迹步骤识别伪装成 `end_turn` 的上游错误（`400` / `429` / `TOS_VIOLATION` / `INVALID_THINKING_SIGNATURE`）。命中 `TOS_VIOLATION` 时以最高优先级隔离全模型族并阻断自动故障转移，避免牵连池内其他账号。
 
 ---
 
@@ -57,38 +145,44 @@ npm run build
 
 权限策略始终归属发起请求的 DSH 会话（旧 `permissionMode` 已废弃，HTTP 接口不可覆盖会话权限）：
 
-| 主会话选择 | `agy` 的执行与审批 |
+| DSH 主会话权限 | `agy acp` 执行边界与审批策略 |
 | --- | --- |
-| 仅可查看 | 从启动起使用 DSH 只读文件沙箱。已上报的读、搜索请求可放行，修改、命令和未知请求拒绝。 |
-| 工作区内修改 | 使用会话的 `full` 工作区进程沙箱。经路径与 `realpathSync` 防软链逃逸校验的工作区内编辑/删除/移动，以及沙箱内常规终端命令自动放行；命中高危命令拦截（提权、高危删除、`git push`/`reset --hard`/`clean -f`、远端脚本执行、外网上传/远端主机、凭据读取、发包/部署等）、超长/未知命令或越界路径时交由 DSH 审批。 |
-| 自动审查 | CLI 和账号提供原生 `auto` 时使用它；它仍上报的请求交给 DSH。没有原生 `auto` 时用 `default`，由 DSH 处理请求，不降级为自动同意。 |
-| 完全权限 | 不包文件沙箱，但保留 ACP 权限回调，只批准本次操作，不写入 `always allow`。 |
+| **仅可查看** | 进程启动即进入 DSH 只读文件沙箱；仅放行读/搜索类回调，修改、命令和未知请求一律拒绝。 |
+| **工作区内修改** | 运行在会话级 `full` 工作区进程沙箱内。经路径归一化与 `realpathSync` 防软链逃逸校验的工作区编辑/删除/移动及常规终端命令智能放行；命中高危命令护栏（提权、危险删除、`git push`/`reset --hard`/`clean -f`、远端脚本、外网上传、凭据读取、发包/部署等）、超长/未知命令或越界路径时升级交由 DSH 人工审批。 |
+| **自动审查** | CLI 与账号支持原生 `auto` 时启用之，仍上报的请求交由 DSH；不支持时严格使用 `default` 交由 DSH 审批，绝不静默降级为自动同意。 |
+| **完全权限** | 不附加文件沙箱，但保留 ACP 权限回调通道，仅单次放行当次操作，绝不写入 `always allow`。 |
 
-受限模式（含目录探测、辅助调用、配额查询、`doctor` 自检）必须由宿主 `sandbox.confine` 返回 `enforcement === 'full'`；无法提供时直接拒绝启动，绝不无沙箱降级执行。
+> **强沙箱不变量**：所有受限模式调用（模型目录探测、辅助调用、配额查询、`/agy-acp doctor`）要求宿主 `sandbox.confine` 返回 `enforcement === 'full'`；不满足时直接拒绝启动，绝不无沙箱降级执行。
 
 ---
 
-## 面板与故障排查
+## 诊断与排查
 
-- **会话与用量**：看该会话实际使用的恢复方式和 MCP 传输，而不是仅看对端声称支持的能力。SSE 中断时展示最后快照，不表示仍在线。
-- **账号与配额**：显示读数来源与采样时间。只有明确属于该隔离账号、尚未过期的文件凭据才尝试配额接口；不续签 OAuth，不读取机器默认账号的共享令牌。不具备条件时使用只读 CLI。`3p` 为共享额度，不把满额滚动窗口的占位时间当作真实倒计时。
-- **桥接配置**：`requestTimeoutMs` 对 `session/prompt` 表示空闲超时，而不是整轮最长运行时间。属于本会话的活动会重置计时；权限等待、长工具及取消有单独的生命周期处理。
-- **异常完成**：按本轮新增的原生 SQLite 步骤识别伪装成 `end_turn` 的错误；不可读时仅依据 ACP 结果，不猜测普通消息。配额错误优先采用有效的上游重试时间，已损坏的 thinking 签名会使旧会话索引失效，下轮用摘要新建，不自动重跑已执行的工具。
-- **原生提问与工具卡片**：业务选择只接受该会话用户明确选中的选项；不以「允许一次」代选。工具镜像对输入、输出和内联数据有预算，工作区外或匹配不唯一时不推测编辑行号。
-- **隔离边界**：只清理本插件创建且可核实归属的私有临时目录。不递归清除共享账号的会话数据库，不向真实 HOME 创建可写规则/技能链接，也不冒用其他客户端标识解锁老版本模型。
+### 控制台与运行时说明
+- **配置持久化**：控制台白名单配置原子写入 `~/.dsh/agy-acp/config.json`（`0600`），支持一键「放弃修改」与二次确认「恢复默认」；多账号敏感目录与代理环境变量（`accounts`、`credentialSlotDir`）仅由宿主配置只读管理。
+- **超时语义**：`requestTimeoutMs` 对 `session/prompt` 表示**活跃空闲超时**而非整轮硬上限；有效模型输出与工具进展会重置计时，等待人工审批、长耗时反向 MCP 工具与主动取消均有独立生命周期处理。
+- **配额与隔离边界**：仅针对明确归属隔离账号且未过期的文件凭据尝试直连配额 API（不续签 OAuth、不读取机器默认共享令牌）；`3P` 为共享额度，满额滚动窗口的占位时间不会被误判为真实倒计时。插件仅清理可核实归属的私有临时目录，不触碰真实 HOME 中的共享会话数据库或规则目录。
+- **异常自愈**：若检测到已损坏的 `thinking` 签名，插件会自动作废对应会话索引并在下轮以摘要重建，不会盲目重跑已执行过的工具；SSE 断连时控制台会明确提示当前展示的是最后快照。
 
-## 开发与验证
+---
+
+## 开发、验证与发布
 
 ```bash
+# 安装依赖
 pnpm install
-pnpm run verify   # lint:arch && tsc --noEmit && tsdown && node --test
+
+# 全量校验：架构依赖检查 + TypeScript 类型检查 + tsdown 构建 + 全套单元测试
+pnpm run verify
 ```
 
-## 发布到 npm
-
-在准备发布的 `main` 分支上运行以下命令，GitHub Actions 将校验版本标签、执行 `pnpm run verify` 并发布构建包：
+在准备发布的 `main` 分支执行以下命令，GitHub Actions 将自动校验标签、运行 `pnpm run verify` 并发布至 npm：
 
 ```bash
 npm version patch   # 或 minor / major
 git push --atomic origin main "v$(node -p "require('./package.json').version")"
 ```
+
+## License
+
+[MIT](package.json) · Third-party notices in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)

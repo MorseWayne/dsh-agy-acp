@@ -1,0 +1,323 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 760" width="1320" height="760" role="img" aria-label="dsh-agy-acp Architecture Diagram">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#090e1a"/>
+      <stop offset="50%" stop-color="#0d1528"/>
+      <stop offset="100%" stop-color="#090e1a"/>
+    </linearGradient>
+    <radialGradient id="glowCyan" cx="18%" cy="12%" r="48%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowIndigo" cx="84%" cy="88%" r="48%">
+      <stop offset="0%" stop-color="#818cf8" stop-opacity="0.24"/>
+      <stop offset="100%" stop-color="#818cf8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="titleGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="58%" stop-color="#bae6fd"/>
+      <stop offset="100%" stop-color="#c7d2fe"/>
+    </linearGradient>
+    <linearGradient id="bridgePanel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#111d3a" stop-opacity="0.92"/>
+      <stop offset="100%" stop-color="#0f172a" stop-opacity="0.92"/>
+    </linearGradient>
+    <linearGradient id="flowLineCyan" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#818cf8"/>
+    </linearGradient>
+    <linearGradient id="flowLineGreen" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="1.5" cy="1.5" r="1" fill="#94a3b8" fill-opacity="0.16"/>
+    </pattern>
+    <marker id="arrowCyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 1 1 L 9 5 L 1 9 z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 1 1 L 9 5 L 1 9 z" fill="#34d399"/>
+    </marker>
+    <style>
+      .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace; }
+      .title { font-size: 24px; font-weight: 700; fill: url(#titleGrad); }
+      .subtitle { font-size: 13px; fill: #94a3b8; }
+      .col-title { font-size: 16px; font-weight: 700; fill: #f8fafc; }
+      .col-sub { font-size: 11.5px; fill: #94a3b8; }
+      .badge-text { font-size: 10.5px; font-weight: 600; letter-spacing: 0.4px; }
+      .card-title { font-size: 13px; font-weight: 700; fill: #f8fafc; }
+      .card-tag { font-size: 10px; fill: #93c5fd; }
+      .card-body { font-size: 11.5px; fill: #cbd5e1; }
+      .step-title { font-size: 12px; font-weight: 700; fill: #f8fafc; }
+      .step-desc { font-size: 11px; fill: #94a3b8; }
+      .legend-text { font-size: 11px; fill: #cbd5e1; }
+      .link-label { font-size: 10px; font-weight: 600; fill: #bae6fd; }
+    </style>
+  </defs>
+
+  <!-- Canvas Background -->
+  <rect width="1320" height="760" rx="20" fill="url(#bg)"/>
+  <rect width="1320" height="760" rx="20" fill="url(#glowCyan)"/>
+  <rect width="1320" height="760" rx="20" fill="url(#glowIndigo)"/>
+  <rect width="1320" height="760" rx="20" fill="url(#dots)"/>
+  <rect x="0.75" y="0.75" width="1318.5" height="758.5" rx="19.25" fill="none" stroke="#94a3b8" stroke-opacity="0.22" stroke-width="1.5"/>
+
+  <!-- Header -->
+  <text x="36" y="48" class="sans title">dsh-agy-acp 系统架构与双向桥接全景</text>
+  <text x="36" y="70" class="sans subtitle">DeepSeek Harness (DSH) × Google Antigravity (agy acp) · 持久长连接 · 分级反向 MCP · 权限沙箱对齐 · 出口硬熔断</text>
+
+  <!-- Legend -->
+  <g transform="translate(804, 34)">
+    <rect x="0" y="0" width="128" height="26" rx="13" fill="#0f172a" fill-opacity="0.82" stroke="#38bdf8" stroke-opacity="0.35"/>
+    <circle cx="14" cy="13" r="4" fill="#38bdf8"/>
+    <text x="24" y="17" class="sans legend-text">ACP JSON-RPC</text>
+
+    <rect x="136" y="0" width="118" height="26" rx="13" fill="#0f172a" fill-opacity="0.82" stroke="#34d399" stroke-opacity="0.35"/>
+    <circle cx="150" cy="13" r="4" fill="#34d399"/>
+    <text x="160" y="17" class="sans legend-text">反向 MCP 网关</text>
+
+    <rect x="262" y="0" width="116" height="26" rx="13" fill="#0f172a" fill-opacity="0.82" stroke="#f59e0b" stroke-opacity="0.35"/>
+    <circle cx="276" cy="13" r="4" fill="#f59e0b"/>
+    <text x="286" y="17" class="sans legend-text">安全与出口围栏</text>
+
+    <rect x="386" y="0" width="94" height="26" rx="13" fill="#0f172a" fill-opacity="0.82" stroke="#a78bfa" stroke-opacity="0.35"/>
+    <circle cx="400" cy="13" r="4" fill="#a78bfa"/>
+    <text x="410" y="17" class="sans legend-text">SSE 状态流</text>
+  </g>
+  <line x1="36" y1="88" x2="1284" y2="88" stroke="#94a3b8" stroke-opacity="0.18"/>
+
+  <!-- COLUMN 1: DeepSeek Harness Host -->
+  <g transform="translate(36, 108)">
+    <rect width="308" height="534" rx="16" fill="#0f172a" fill-opacity="0.8" stroke="#94a3b8" stroke-opacity="0.22"/>
+    <text x="18" y="32" class="sans col-title">DeepSeek Harness</text>
+    <rect x="210" y="15" width="82" height="22" rx="11" fill="#818cf8" fill-opacity="0.16" stroke="#818cf8" stroke-opacity="0.4"/>
+    <text x="251" y="30" text-anchor="middle" class="sans badge-text" fill="#c7d2fe">HOST</text>
+    <text x="18" y="52" class="sans col-sub">Web 控制台 · 对话流 · 权限审批 · 宿主工具</text>
+
+    <!-- Card 1 -->
+    <g transform="translate(16, 70)">
+      <rect width="276" height="98" rx="11" fill="#1e293b" fill-opacity="0.62" stroke="#94a3b8" stroke-opacity="0.16"/>
+      <rect x="0" y="0" width="4" height="98" rx="2" fill="#a78bfa"/>
+      <text x="14" y="24" class="sans card-title">Web GUI 实时控制台</text>
+      <rect x="192" y="10" width="72" height="19" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <text x="228" y="23" text-anchor="middle" class="mono card-tag">SSE 180ms</text>
+      <text x="14" y="47" class="sans card-body">• 会话与用量 5 格 KPI / 条件挂载</text>
+      <text x="14" y="66" class="sans card-body">• 多账号 5h/7d 配额条与一键出口检测</text>
+      <text x="14" y="85" class="sans card-body">• MCP 分级策略面板与 Sticky 保存栏</text>
+    </g>
+
+    <!-- Card 2 -->
+    <g transform="translate(16, 180)">
+      <rect width="276" height="98" rx="11" fill="#1e293b" fill-opacity="0.62" stroke="#94a3b8" stroke-opacity="0.16"/>
+      <rect x="0" y="0" width="4" height="98" rx="2" fill="#38bdf8"/>
+      <text x="14" y="24" class="sans card-title">对话流与原生卡片镜像</text>
+      <rect x="198" y="10" width="66" height="19" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <text x="231" y="23" text-anchor="middle" class="mono card-tag">dsh-llm</text>
+      <text x="14" y="47" class="sans card-body">• 流式正文 / 思考链 / 实时用量占用</text>
+      <text x="14" y="66" class="sans card-body">• 并发投影 terminal / diff / read / web</text>
+      <text x="14" y="85" class="sans card-body">• 交互式权限审批与原生多选提问</text>
+    </g>
+
+    <!-- Card 3 -->
+    <g transform="translate(16, 290)">
+      <rect width="276" height="104" rx="11" fill="#1e293b" fill-opacity="0.62" stroke="#94a3b8" stroke-opacity="0.16"/>
+      <rect x="0" y="0" width="4" height="104" rx="2" fill="#34d399"/>
+      <text x="14" y="24" class="sans card-title">DSH 宿主工具生态</text>
+      <rect x="190" y="10" width="74" height="19" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <text x="227" y="23" text-anchor="middle" class="mono card-tag">dsh-tools</text>
+      <text x="14" y="47" class="sans card-body">• Mnemon 记忆检索与项目文档</text>
+      <text x="14" y="66" class="sans card-body">• 跨模型 Subagent 路由与技能加载</text>
+      <text x="14" y="85" class="sans card-body">• Goal / Workflow / 图像生成 / 插件管理</text>
+    </g>
+
+    <!-- Card 4 -->
+    <g transform="translate(16, 406)">
+      <rect width="276" height="110" rx="11" fill="#1e293b" fill-opacity="0.62" stroke="#94a3b8" stroke-opacity="0.16"/>
+      <rect x="0" y="0" width="4" height="110" rx="2" fill="#f59e0b"/>
+      <text x="14" y="24" class="sans card-title">斜杠诊断与跨模型审查</text>
+      <rect x="192" y="10" width="72" height="19" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <text x="228" y="23" text-anchor="middle" class="mono card-tag">/agy-acp</text>
+      <text x="14" y="47" class="sans card-body">• /agy-acp status 全链路状态速览</text>
+      <text x="14" y="66" class="sans card-body">• /agy-acp doctor 5 步只读脱敏自检</text>
+      <text x="14" y="85" class="sans card-body">• auto-review 跨 Provider 直连免冷启</text>
+    </g>
+  </g>
+
+  <!-- COLUMN 2: dsh-agy-acp Bridge Core -->
+  <g transform="translate(384, 108)">
+    <rect width="552" height="534" rx="16" fill="url(#bridgePanel)" stroke="#38bdf8" stroke-opacity="0.42" stroke-width="1.4"/>
+    <text x="20" y="32" class="sans col-title">dsh-agy-acp Bridge Core</text>
+    <rect x="424" y="15" width="108" height="22" rx="11" fill="#38bdf8" fill-opacity="0.16" stroke="#38bdf8" stroke-opacity="0.45"/>
+    <text x="478" y="30" text-anchor="middle" class="sans badge-text" fill="#7dd3fc">PLUGIN CORE</text>
+    <text x="20" y="52" class="sans col-sub">持久池化 · 分级反向 MCP · 权限沙箱对齐 · 出口围栏 · 多账号配额调度</text>
+
+    <!-- Top-Left: Session Pool -->
+    <g transform="translate(18, 70)">
+      <rect width="250" height="156" rx="11" fill="#1e293b" fill-opacity="0.68" stroke="#94a3b8" stroke-opacity="0.18"/>
+      <rect x="0" y="0" width="4" height="156" rx="2" fill="#38bdf8"/>
+      <text x="14" y="24" class="sans card-title">持久会话池 &amp; 恢复引擎</text>
+      <rect x="164" y="10" width="76" height="18" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <text x="202" y="22" text-anchor="middle" class="mono card-tag">session-pool</text>
+      <text x="14" y="50" class="sans card-body">• 按会话与权限指纹复用长驻进程</text>
+      <text x="14" y="71" class="sans card-body">• 跨重启优先 session/resume</text>
+      <text x="14" y="92" class="sans card-body">• 回退 session/load → 24K 摘要新建</text>
+      <text x="14" y="113" class="sans card-body">• 同步 model / effort / title 通知</text>
+      <text x="14" y="134" class="sans card-body">• AbortSignal 毫秒级 session/cancel</text>
+    </g>
+
+    <!-- Top-Right: Tiered Reverse MCP -->
+    <g transform="translate(284, 70)">
+      <rect width="250" height="156" rx="11" fill="#1e293b" fill-opacity="0.68" stroke="#94a3b8" stroke-opacity="0.18"/>
+      <rect x="0" y="0" width="4" height="156" rx="2" fill="#34d399"/>
+      <text x="14" y="24" class="sans card-title">分级反向 MCP 网关</text>
+      <rect x="168" y="10" width="72" height="18" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <text x="204" y="22" text-anchor="middle" class="mono card-tag">52 KB 护栏</text>
+      <text x="14" y="50" class="sans card-body">• 7 组补充能力 + 5 组原生替换策略</text>
+      <text x="14" y="71" class="sans card-body">• 3 档快捷预设 + 逐工具精细覆写</text>
+      <text x="14" y="92" class="sans card-body">• dsh_discover_tools / call_tool 网关</text>
+      <text x="14" y="113" class="sans card-body">• 127.0.0.1 Bearer 鉴权 + 代理免疫</text>
+      <text x="14" y="134" class="sans card-body">• 复用 DSH 原生审批与超时并发保护</text>
+    </g>
+
+    <!-- Mid-Left: Permissions & Sandbox -->
+    <g transform="translate(18, 240)">
+      <rect width="250" height="148" rx="11" fill="#1e293b" fill-opacity="0.68" stroke="#94a3b8" stroke-opacity="0.18"/>
+      <rect x="0" y="0" width="4" height="148" rx="2" fill="#f59e0b"/>
+      <text x="14" y="24" class="sans card-title">权限对齐与进程沙箱</text>
+      <rect x="168" y="10" width="72" height="18" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <text x="204" y="22" text-anchor="middle" class="mono card-tag">bwrap full</text>
+      <text x="14" y="50" class="sans card-body">• 策略严格归属发起会话，不可覆盖</text>
+      <text x="14" y="71" class="sans card-body">• 工作区内安全操作智能放行</text>
+      <text x="14" y="92" class="sans card-body">• realpathSync 防软链逃逸 + 高危拦截</text>
+      <text x="14" y="113" class="sans card-body">• 受限调用强制 full 沙箱绝不降级</text>
+      <text x="14" y="134" class="sans card-body">• Linux 进程树隔离与私有临时目录</text>
+    </g>
+
+    <!-- Mid-Right: Egress GeoFence -->
+    <g transform="translate(284, 240)">
+      <rect width="250" height="148" rx="11" fill="#1e293b" fill-opacity="0.68" stroke="#94a3b8" stroke-opacity="0.18"/>
+      <rect x="0" y="0" width="4" height="148" rx="2" fill="#fb7185"/>
+      <text x="14" y="24" class="sans card-title">出口合规与风控熔断</text>
+      <rect x="170" y="10" width="70" height="18" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <text x="205" y="22" text-anchor="middle" class="mono card-tag">GeoFence</text>
+      <text x="14" y="50" class="sans card-body">• 纯匿名 Google 探测，零凭据泄露</text>
+      <text x="14" y="71" class="sans card-body">• 代理路由与 Go agy 完全一致</text>
+      <text x="14" y="92" class="sans card-body">• 守卫主对话 / 辅助 / 目录 / 配额 4 路</text>
+      <text x="14" y="113" class="sans card-body">• HK/CN 受限地域零发包本地硬熔断</text>
+      <text x="14" y="134" class="sans card-body">• 400 漂移拆旧连 + 60s 保护与切号</text>
+    </g>
+
+    <!-- Bottom Wide: Multi-Account & Usage -->
+    <g transform="translate(18, 402)">
+      <rect width="516" height="114" rx="11" fill="#1e293b" fill-opacity="0.72" stroke="#a78bfa" stroke-opacity="0.32"/>
+      <rect x="0" y="0" width="4" height="114" rx="2" fill="#a78bfa"/>
+      <text x="14" y="24" class="sans card-title">多账号配额池、TOS 隔离与精准缓存归因</text>
+      <rect x="330" y="10" width="174" height="18" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <text x="417" y="22" text-anchor="middle" class="mono card-tag">account-pool · transcript</text>
+      <text x="14" y="50" class="sans card-body">• 独立凭据槽异步租约 + 可选 5h/7d 配额权重调度 + ≤15% 低配额预警</text>
+      <text x="14" y="72" class="sans card-body">• TOS 违约全模型族即时隔离（阻断自动切号防连坐），支持手动解除</text>
+      <text x="14" y="94" class="sans card-body">• 尾随 transcript.jsonl 精确统计步级缓存命中率与实时上下文压力</text>
+    </g>
+  </g>
+
+  <!-- COLUMN 3: Antigravity & Upstream -->
+  <g transform="translate(976, 108)">
+    <rect width="308" height="534" rx="16" fill="#0f172a" fill-opacity="0.8" stroke="#94a3b8" stroke-opacity="0.22"/>
+    <text x="18" y="32" class="sans col-title">Antigravity &amp; Cloud</text>
+    <rect x="200" y="15" width="92" height="22" rx="11" fill="#34d399" fill-opacity="0.16" stroke="#34d399" stroke-opacity="0.4"/>
+    <text x="246" y="30" text-anchor="middle" class="sans badge-text" fill="#6ee7b7">AGY ≥ 1.5</text>
+    <text x="18" y="52" class="sans col-sub">本地持久化子进程 · 安全存储 · Google 云端</text>
+
+    <!-- Card 1 -->
+    <g transform="translate(16, 70)">
+      <rect width="276" height="98" rx="11" fill="#1e293b" fill-opacity="0.62" stroke="#94a3b8" stroke-opacity="0.16"/>
+      <rect x="0" y="0" width="4" height="98" rx="2" fill="#38bdf8"/>
+      <text x="14" y="24" class="sans card-title">持久 agy acp 子进程</text>
+      <rect x="190" y="10" width="74" height="19" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <text x="227" y="23" text-anchor="middle" class="mono card-tag">stdio RPC</text>
+      <text x="14" y="47" class="sans card-body">• 双向 JSON-RPC 2.0 持久会话</text>
+      <text x="14" y="66" class="sans card-body">• 增量工具状态帧与权限请求回调</text>
+      <text x="14" y="85" class="sans card-body">• 单轮 stderr 切片精准归因故障</text>
+    </g>
+
+    <!-- Card 2 -->
+    <g transform="translate(16, 180)">
+      <rect width="276" height="98" rx="11" fill="#1e293b" fill-opacity="0.62" stroke="#94a3b8" stroke-opacity="0.16"/>
+      <rect x="0" y="0" width="4" height="98" rx="2" fill="#34d399"/>
+      <text x="14" y="24" class="sans card-title">回环 MCP 工具回调</text>
+      <rect x="190" y="10" width="74" height="19" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <text x="227" y="23" text-anchor="middle" class="mono card-tag">127.0.0.1</text>
+      <text x="14" y="47" class="sans card-body">• 优先原生 HTTP MCP，旧版 stdio 兜底</text>
+      <text x="14" y="66" class="sans card-body">• 会话级动态注入，不污染全局配置</text>
+      <text x="14" y="85" class="sans card-body">• 等待审批期间自动暂停空闲计时器</text>
+    </g>
+
+    <!-- Card 3 -->
+    <g transform="translate(16, 290)">
+      <rect width="276" height="104" rx="11" fill="#1e293b" fill-opacity="0.62" stroke="#94a3b8" stroke-opacity="0.16"/>
+      <rect x="0" y="0" width="4" height="104" rx="2" fill="#f59e0b"/>
+      <text x="14" y="24" class="sans card-title">本地持久化与故障识别</text>
+      <rect x="190" y="10" width="74" height="19" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <text x="227" y="23" text-anchor="middle" class="mono card-tag">0600 原子写</text>
+      <text x="14" y="47" class="sans card-body">• config.json / sessions.json 脱敏存储</text>
+      <text x="14" y="66" class="sans card-body">• 只读轨迹 SQLite 识别伪装 end_turn</text>
+      <text x="14" y="85" class="sans card-body">• 自动检测坏 thinking 签名并自愈重建</text>
+    </g>
+
+    <!-- Card 4 -->
+    <g transform="translate(16, 406)">
+      <rect width="276" height="110" rx="11" fill="#1e293b" fill-opacity="0.62" stroke="#94a3b8" stroke-opacity="0.16"/>
+      <rect x="0" y="0" width="4" height="110" rx="2" fill="#a78bfa"/>
+      <text x="14" y="24" class="sans card-title">Google Antigravity 云端</text>
+      <rect x="184" y="10" width="80" height="19" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <text x="224" y="23" text-anchor="middle" class="mono card-tag">Multi-Model</text>
+      <text x="14" y="47" class="sans card-body">• Gemini / Claude / 3P 全系模型推理</text>
+      <text x="14" y="66" class="sans card-body">• 服务端 Prompt Cache 跨轮复用</text>
+      <text x="14" y="85" class="sans card-body">• 直连配额 API + 只读 CLI 兜底读取</text>
+    </g>
+  </g>
+
+  <!-- Bi-directional Connector Arrows -->
+  <line x1="344" y1="265" x2="384" y2="265" stroke="url(#flowLineCyan)" stroke-width="2.2" marker-start="url(#arrowCyan)" marker-end="url(#arrowCyan)"/>
+  <line x1="344" y1="450" x2="384" y2="450" stroke="url(#flowLineGreen)" stroke-width="2.2" marker-start="url(#arrowGreen)" marker-end="url(#arrowGreen)"/>
+
+  <line x1="936" y1="265" x2="976" y2="265" stroke="url(#flowLineCyan)" stroke-width="2.2" marker-start="url(#arrowCyan)" marker-end="url(#arrowCyan)"/>
+  <line x1="936" y1="450" x2="976" y2="450" stroke="url(#flowLineGreen)" stroke-width="2.2" marker-start="url(#arrowGreen)" marker-end="url(#arrowGreen)"/>
+
+  <!-- Bottom 4-Step Lifecycle Strip -->
+  <g transform="translate(36, 662)">
+    <g transform="translate(0, 0)">
+      <rect width="300" height="64" rx="12" fill="#0f172a" fill-opacity="0.86" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <rect x="12" y="19" width="26" height="26" rx="8" fill="#38bdf8" fill-opacity="0.18"/>
+      <text x="25" y="36" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#7dd3fc">1</text>
+      <text x="48" y="29" class="sans step-title">出口预检 &amp; 配额路由</text>
+      <text x="48" y="48" class="sans step-desc">合规放行 / 高余量优先 / 受限硬熔断</text>
+    </g>
+
+    <g transform="translate(316, 0)">
+      <rect width="300" height="64" rx="12" fill="#0f172a" fill-opacity="0.86" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <rect x="12" y="19" width="26" height="26" rx="8" fill="#34d399" fill-opacity="0.18"/>
+      <text x="25" y="36" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#6ee7b7">2</text>
+      <text x="48" y="29" class="sans step-title">长连接复用 &amp; 无感恢复</text>
+      <text x="48" y="48" class="sans step-desc">resume → load → 24K 摘要无缝续接</text>
+    </g>
+
+    <g transform="translate(632, 0)">
+      <rect width="300" height="64" rx="12" fill="#0f172a" fill-opacity="0.86" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <rect x="12" y="19" width="26" height="26" rx="8" fill="#f59e0b" fill-opacity="0.18"/>
+      <text x="25" y="36" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#fcd34d">3</text>
+      <text x="48" y="29" class="sans step-title">实时镜像 &amp; 反向委托</text>
+      <text x="48" y="48" class="sans step-desc">原生卡片投影 + DSH 工具审批闭环</text>
+    </g>
+
+    <g transform="translate(948, 0)">
+      <rect width="300" height="64" rx="12" fill="#0f172a" fill-opacity="0.86" stroke="#94a3b8" stroke-opacity="0.2"/>
+      <rect x="12" y="19" width="26" height="26" rx="8" fill="#a78bfa" fill-opacity="0.18"/>
+      <text x="25" y="36" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#ddd6fe">4</text>
+      <text x="48" y="29" class="sans step-title">精准计量 &amp; 异常自愈</text>
+      <text x="48" y="48" class="sans step-desc">Transcript 缓存归因 + 400/429/TOS 隔离</text>
+    </g>
+  </g>
+</svg>
