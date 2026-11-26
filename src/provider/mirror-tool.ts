@@ -11,9 +11,7 @@ import {
   type FileLocation,
   type GenericCallView,
   type GenericResultView,
-  type ReadFileLine,
   type ReadResultView,
-  type SearchFileMatches,
   type SearchResultView,
   type TerminalCallView,
   type TerminalResultView,
@@ -27,6 +25,31 @@ import {
   type WebSearchResultView,
   type WebSource,
 } from '@deepseek-ai/dsh-tools'
+import {
+  asRecord,
+  classifyMirrorToolKind,
+  EDIT_TOOL_NAMES,
+  extractAcpContentDiffs,
+  extractCommandDescription,
+  extractCommandFromInput,
+  extractCwdFromInput,
+  extractExitCodeFromText,
+  extractHttpStatusFromText,
+  extractInputFileDiffs,
+  extractMirrorFilePath,
+  firstNumber,
+  firstString,
+  MAX_DIFF_FILES,
+  MAX_WEB_SOURCES,
+  normalizeMirrorToolName,
+  parseReadOutputData,
+  parseSearchOutputData,
+  parseWebSourcesArray,
+  parseWebSourcesFromText,
+  TERMINAL_TOOL_NAMES,
+  WEB_FETCH_TOOL_NAMES,
+  WEB_SEARCH_TOOL_NAMES,
+} from '../common/mirror-presentation.ts'
 import { MIRROR_TOOL_NAME } from '../common/types.ts'
 import {
   normalizeLocations,
@@ -56,77 +79,9 @@ interface MirrorResultMeta {
   kind?: string
   input?: unknown
   locations?: NormalizedLocation[]
+  diffs?: FileDiff[]
   httpStatus?: number
   webSources?: WebSource[]
-}
-
-const TERMINAL_TOOL_NAMES = new Set([
-  'run_command',
-  'bash',
-  'shell',
-  'execute_command',
-  'terminal',
-  'command_status',
-])
-
-const EDIT_TOOL_NAMES = new Set([
-  'edit_file',
-  'edit',
-  'write_file',
-  'write',
-  'write_to_file',
-  'replace_file_content',
-  'multi_replace_file_content',
-  'apply_patch',
-])
-
-const READ_TOOL_NAMES = new Set(['read_file', 'read', 'view_file', 'view_file_outline', 'view_code_item'])
-const SEARCH_TOOL_NAMES = new Set(['grep_search', 'grep', 'glob', 'find_by_name', 'list_dir', 'search_files'])
-const CONTENT_SEARCH_TOOL_NAMES = new Set(['grep_search', 'grep'])
-const PATH_SEARCH_TOOL_NAMES = new Set(['glob', 'find_by_name', 'list_dir', 'search_files'])
-const FETCH_TOOL_NAMES = new Set(['search_web', 'web_search', 'web_fetch', 'read_url_content'])
-const WEB_SEARCH_TOOL_NAMES = new Set(['search_web', 'web_search'])
-const WEB_FETCH_TOOL_NAMES = new Set(['web_fetch', 'read_url_content'])
-const DELETE_TOOL_NAMES = new Set(['delete_file', 'remove_file'])
-const MOVE_TOOL_NAMES = new Set(['move_file', 'rename_file'])
-
-const EXT_TO_LANG: Record<string, string> = {
-  '.ts': 'ts',
-  '.tsx': 'tsx',
-  '.mts': 'ts',
-  '.cts': 'ts',
-  '.js': 'js',
-  '.jsx': 'jsx',
-  '.mjs': 'js',
-  '.cjs': 'js',
-  '.json': 'json',
-  '.md': 'md',
-  '.py': 'py',
-  '.sh': 'sh',
-  '.bash': 'sh',
-  '.zsh': 'sh',
-  '.yml': 'yaml',
-  '.yaml': 'yaml',
-  '.toml': 'toml',
-  '.css': 'css',
-  '.scss': 'scss',
-  '.html': 'html',
-  '.xml': 'xml',
-  '.go': 'go',
-  '.rs': 'rs',
-  '.java': 'java',
-  '.kt': 'kt',
-  '.c': 'c',
-  '.h': 'c',
-  '.cpp': 'cpp',
-  '.cc': 'cpp',
-  '.hpp': 'cpp',
-  '.sql': 'sql',
-  '.rb': 'rb',
-  '.php': 'php',
-  '.swift': 'swift',
-  '.vue': 'vue',
-  '.svelte': 'svelte',
 }
 
 const COMPACT_INPUT_KEYS = [
@@ -142,35 +97,7 @@ const COMPACT_INPUT_KEYS = [
 
 const MAX_DISPLAY_INPUT_BYTES = 16 * 1024
 const MAX_META_OUTPUT_BYTES = 64 * 1024
-const MAX_READ_CARD_LINES = 500
-const MAX_SEARCH_ITEMS = 200
-const MAX_WEB_SOURCES = 20
-
-function asRecord(v: unknown): Record<string, unknown> | null {
-  return v !== null && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null
-}
-
-function firstString(obj: Record<string, unknown> | null, keys: readonly string[]): string | undefined {
-  if (!obj) return undefined
-  for (const key of keys) {
-    const val = obj[key]
-    if (typeof val === 'string' && val.length > 0) return val
-  }
-  return undefined
-}
-
-function firstNumber(obj: Record<string, unknown> | null, keys: readonly string[]): number | undefined {
-  if (!obj) return undefined
-  for (const key of keys) {
-    const val = obj[key]
-    if (typeof val === 'number' && Number.isFinite(val)) return val
-  }
-  return undefined
-}
-
-function normalizeToolName(tool?: string): string {
-  return (tool ?? '').trim().toLowerCase()
-}
+const MAX_META_DIFF_BYTES = 48 * 1024
 
 export type LosslessJson =
   | string
@@ -213,46 +140,11 @@ export function compactDisplayInput(raw: unknown, maxBytes = MAX_DISPLAY_INPUT_B
 }
 
 function classifyToolKind(tool?: string, rawKind?: string): ToolCallKind {
-  if (
-    rawKind === 'read' ||
-    rawKind === 'edit' ||
-    rawKind === 'delete' ||
-    rawKind === 'move' ||
-    rawKind === 'search' ||
-    rawKind === 'execute' ||
-    rawKind === 'fetch' ||
-    rawKind === 'other'
-  ) {
-    return rawKind
-  }
-  const name = normalizeToolName(tool)
-  if (TERMINAL_TOOL_NAMES.has(name)) return 'execute'
-  if (EDIT_TOOL_NAMES.has(name)) return 'edit'
-  if (READ_TOOL_NAMES.has(name)) return 'read'
-  if (SEARCH_TOOL_NAMES.has(name)) return 'search'
-  if (FETCH_TOOL_NAMES.has(name)) return 'fetch'
-  if (DELETE_TOOL_NAMES.has(name)) return 'delete'
-  if (MOVE_TOOL_NAMES.has(name)) return 'move'
-  return 'other'
+  return classifyMirrorToolKind(tool, rawKind)
 }
 
 function extractFilePath(input: Record<string, unknown> | null, locations?: readonly NormalizedLocation[]): string | undefined {
-  return (
-    firstString(input, [
-      'Path',
-      'TargetFile',
-      'target_file',
-      'AbsolutePath',
-      'absolute_path',
-      'file_path',
-      'filePath',
-      'path',
-      'File',
-      'file',
-      'DirectoryPath',
-      'SearchPath',
-    ]) ?? locations?.[0]?.path
-  )
+  return extractMirrorFilePath(input, locations)
 }
 
 const PRE_EDIT_FILE_MAX_BYTES = 1024 * 1024
@@ -352,94 +244,40 @@ function extractFileDiffs(
   input: Record<string, unknown> | null,
   locations?: readonly NormalizedLocation[],
 ): FileDiff[] {
-  if (!input) return []
-  const filePath = extractFilePath(input, locations)
-  if (!filePath) return []
+  return extractInputFileDiffs(tool, input, locations)
+}
 
-  // Multi-chunk replacement (supports both PascalCase and snake_case: multi_replace_file_content)
-  const chunks = input.ReplacementChunks ?? input.replacement_chunks ?? input.chunks
-  if (Array.isArray(chunks) && chunks.length > 0) {
-    const diffs: FileDiff[] = []
-    for (const chunk of chunks.slice(0, 32)) {
-      const rec = asRecord(chunk)
-      if (!rec) continue
-      const oldText =
-        typeof rec.TargetContent === 'string'
-          ? rec.TargetContent
-          : typeof rec.target_content === 'string'
-            ? rec.target_content
-            : typeof rec.oldText === 'string'
-              ? rec.oldText
-              : typeof rec.old_string === 'string'
-                ? rec.old_string
-                : null
-      const newText =
-        typeof rec.ReplacementContent === 'string'
-          ? rec.ReplacementContent
-          : typeof rec.replacement_content === 'string'
-            ? rec.replacement_content
-            : typeof rec.newText === 'string'
-              ? rec.newText
-              : typeof rec.new_string === 'string'
-                ? rec.new_string
-                : undefined
-      if (newText !== undefined) {
-        diffs.push({ path: filePath, oldText, newText })
-      }
-    }
-    if (diffs.length > 0) return diffs
+function boundDiffsForMeta(
+  diffs: readonly FileDiff[],
+): Array<{ path: string; oldText: string | null; newText: string }> | undefined {
+  if (diffs.length === 0) return undefined
+  const out: FileDiff[] = []
+  let budget = MAX_META_DIFF_BYTES
+  for (const d of diffs.slice(0, MAX_DIFF_FILES)) {
+    if (budget < 128) break
+    const pathText = fitText(d.path, Math.min(1024, budget))
+    budget -= Buffer.byteLength(pathText)
+    const half = Math.max(64, Math.floor(budget / 2))
+    const oldText = d.oldText === null ? null : fitText(d.oldText, half)
+    if (oldText !== null) budget -= Buffer.byteLength(oldText)
+    const newText = fitText(d.newText, Math.max(64, budget))
+    budget -= Buffer.byteLength(newText)
+    out.push({ path: pathText, oldText, newText })
   }
+  return out.length > 0 ? out : undefined
+}
 
-  // Single replacement (e.g. edit_file, replace_file_content, edit)
-  const target =
-    typeof input.Target === 'string'
-      ? input.Target
-      : typeof input.TargetContent === 'string'
-        ? input.TargetContent
-        : typeof input.target_content === 'string'
-          ? input.target_content
-          : typeof input.old_string === 'string'
-            ? input.old_string
-            : typeof input.oldText === 'string'
-              ? input.oldText
-              : undefined
-  const replacement =
-    typeof input.Replacement === 'string'
-      ? input.Replacement
-      : typeof input.ReplacementContent === 'string'
-        ? input.ReplacementContent
-        : typeof input.replacement_content === 'string'
-          ? input.replacement_content
-          : typeof input.new_string === 'string'
-            ? input.new_string
-            : typeof input.newText === 'string'
-              ? input.newText
-              : undefined
-  if (replacement !== undefined) {
-    return [{ path: filePath, oldText: target ?? null, newText: replacement }]
+function parseMetaDiffs(raw: unknown): FileDiff[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined
+  const out: FileDiff[] = []
+  for (const item of raw.slice(0, MAX_DIFF_FILES)) {
+    const rec = asRecord(item)
+    if (!rec || typeof rec.path !== 'string' || !rec.path) continue
+    if (rec.oldText !== null && typeof rec.oldText !== 'string') continue
+    if (typeof rec.newText !== 'string') continue
+    out.push({ path: rec.path, oldText: rec.oldText, newText: rec.newText })
   }
-
-  // Whole-file write (e.g. write_file, write_to_file, write)
-  const content =
-    typeof input.Content === 'string'
-      ? input.Content
-      : typeof input.CodeContent === 'string'
-        ? input.CodeContent
-        : typeof input.code_content === 'string'
-          ? input.code_content
-          : typeof input.content === 'string'
-            ? input.content
-            : undefined
-  if (content !== undefined) {
-    return [{ path: filePath, oldText: null, newText: content }]
-  }
-
-  // Empty file creation
-  if (normalizeToolName(tool).includes('write') && (input.EmptyFile === true || input.empty_file === true)) {
-    return [{ path: filePath, oldText: null, newText: '' }]
-  }
-
-  return []
+  return out.length > 0 ? out : undefined
 }
 
 /** Run once on sanitized start-frame input, before storing mirror locations. */
@@ -454,7 +292,7 @@ export function capturePreEditLocations(tc: AcpToolCallUpdate, workspaceRoot?: s
 
 function captureLocations(tc: AcpToolCallUpdate, workspace?: WorkspaceIdentity): NormalizedLocation[] | undefined {
   if (tc.sessionUpdate !== 'tool_call' || tc.status === 'completed' || tc.status === 'failed' ||
-      !(tc.kind === 'edit' || EDIT_TOOL_NAMES.has(normalizeToolName(tc.name)))) return
+      !(tc.kind === 'edit' || EDIT_TOOL_NAMES.has(normalizeMirrorToolName(tc.name)))) return
   const input = asRecord(tc.rawInput ?? tc.args)
   if (!input) return
   const diffs = extractFileDiffs(tc.name, input, tc.locations)
@@ -475,15 +313,14 @@ function captureLocations(tc: AcpToolCallUpdate, workspace?: WorkspaceIdentity):
 }
 
 function buildTerminalCallView(args: MirrorToolInput): TerminalCallView | null {
-  const name = normalizeToolName(args.tool)
+  const name = normalizeMirrorToolName(args.tool)
   const input = asRecord(args.input)
-  const command = firstString(input, ['CommandLine', 'command_line', 'commandLine', 'command', 'cmd', 'script'])
+  const command = extractCommandFromInput(input)
   const isTerminal = TERMINAL_TOOL_NAMES.has(name) || args.kind === 'execute'
   if (!isTerminal || !command) return null
 
-  const cwd = firstString(input, ['Cwd', 'WorkingDirectory', 'working_dir', 'workingDir', 'cwd', 'workdir', 'workingDirectory'])
-  const description = firstString(input, ['Description', 'description', 'toolSummary']) ??
-    (args.title && args.title !== command ? args.title : undefined)
+  const cwd = extractCwdFromInput(input)
+  const description = extractCommandDescription(input, args.title, command)
 
   return {
     card: 'terminal',
@@ -493,13 +330,13 @@ function buildTerminalCallView(args: MirrorToolInput): TerminalCallView | null {
   }
 }
 
-function buildDiffCallView(args: MirrorToolInput): DiffCallView | null {
-  const name = normalizeToolName(args.tool)
+function buildDiffCallView(args: MirrorToolInput, overrideDiffs?: readonly FileDiff[]): DiffCallView | null {
+  const name = normalizeMirrorToolName(args.tool)
   const input = asRecord(args.input)
-  const isEdit = EDIT_TOOL_NAMES.has(name) || args.kind === 'edit'
+  const isEdit = EDIT_TOOL_NAMES.has(name) || args.kind === 'edit' || Boolean(overrideDiffs?.length)
   if (!isEdit) return null
 
-  const diffs = extractFileDiffs(args.tool, input, args.locations)
+  const diffs = overrideDiffs?.length ? [...overrideDiffs] : extractFileDiffs(args.tool, input, args.locations)
   if (diffs.length === 0) return null
 
   const firstPath = diffs[0]!.path
@@ -563,226 +400,53 @@ function buildGenericCallView(args: MirrorToolInput): GenericCallView {
   }
 }
 
-function inferLang(filePath: string): string | undefined {
-  const ext = path.extname(filePath).toLowerCase()
-  return ext ? EXT_TO_LANG[ext] : undefined
-}
-
-const RUNTIME_TIMESTAMP_LINE_RE = /^\s*(?:Created|Completed)\s+At:\s+\S/i
-
-/** Skips leading agy runtime timestamp headers (often duplicated twice) before parsing tool output. */
-function skipLeadingRuntimeTimestamps(lines: readonly string[]): number {
-  let i = 0
-  while (i < lines.length) {
-    const line = lines[i] ?? ''
-    if (line.trim() === '' || RUNTIME_TIMESTAMP_LINE_RE.test(line)) {
-      i++
-      continue
-    }
-    break
-  }
-  return i
-}
-
 function buildReadResultView(args: MirrorToolInput, outputText: string): ReadResultView | null {
   const kind = classifyToolKind(args.tool, args.kind)
   if (kind !== 'read') return null
   const input = asRecord(args.input)
   const filePath = extractFilePath(input, args.locations)
-  if (!filePath || !outputText || outputText === '(no output)') return null
+  if (!filePath) return null
+  const offsetHint = firstNumber(input, ['StartLine', 'offset', 'line', 'start_line']) ?? args.locations?.[0]?.line
+  const parsed = parseReadOutputData(filePath, outputText, offsetHint)
+  if (!parsed) return null
 
-  const rawLines = outputText.replace(/\r\n/g, '\n').split('\n')
-  let startIdx = skipLeadingRuntimeTimestamps(rawLines)
-  let totalLinesHint: number | undefined
-  let offsetHint = firstNumber(input, ['StartLine', 'offset', 'line', 'start_line']) ?? args.locations?.[0]?.line ?? 1
-  if (!Number.isFinite(offsetHint) || offsetHint < 1) offsetHint = 1
-  offsetHint = Math.floor(offsetHint)
-
-  // Optional header like "Showing lines 10 to 30 of 120" or "Showing lines 10-30 of 120"
-  const headerMatch = /^\s*Showing lines\s+(\d+)\s*(?:to|-)\s*(\d+)\s+of\s+(\d+)/i.exec(rawLines[startIdx] ?? '')
-  if (headerMatch) {
-    offsetHint = Math.max(1, Number(headerMatch[1]))
-    totalLinesHint = Math.max(1, Number(headerMatch[3]))
-    startIdx++
-  }
-
-  const bodyLines = rawLines.slice(startIdx)
-  if (bodyLines.length > 0 && bodyLines[bodyLines.length - 1] === '') {
-    bodyLines.pop()
-  }
-  if (bodyLines.length === 0) return null
-
-  // Detect uniform line-number prefix (`12: code` or `12\tcode` or `  12| code`)
-  const numberedRe = /^\s*(\d+)(?::\s?|\t|\s*\|\s?)(.*)$/
-  const nonEmptyCount = bodyLines.filter(l => l.trim() !== '').length
-  const numberedMatches = bodyLines.map(l => numberedRe.exec(l))
-  const numberedHitCount = numberedMatches.filter(Boolean).length
-  const isNumbered = nonEmptyCount > 0 && numberedHitCount >= Math.ceil(nonEmptyCount * 0.8)
-
-  const parsed: ReadFileLine[] = []
-  let runningLine = offsetHint
-  for (let i = 0; i < bodyLines.length && parsed.length < MAX_READ_CARD_LINES; i++) {
-    const m = isNumbered ? numberedMatches[i] : null
-    if (m) {
-      const n = Math.max(1, Number(m[1]))
-      runningLine = n + 1
-      parsed.push({ number: n, text: m[2] ?? '' })
-    } else {
-      parsed.push({ number: runningLine++, text: bodyLines[i]! })
-    }
-  }
-  if (parsed.length === 0) return null
-
-  const offset = parsed[0]!.number
-  const totalLines = Math.max(totalLinesHint ?? 0, offset + bodyLines.length - 1)
-  const lang = inferLang(filePath)
   const generic = buildGenericCallView(args)
-
   return {
     card: 'read',
     title: generic.title,
-    path: filePath,
-    offset,
-    lines: parsed,
-    totalLines,
-    ...(lang ? { lang } : {}),
-    content: [{ type: 'text', text: parsed.map(l => l.text).join('\n') }],
+    path: parsed.path,
+    offset: parsed.offset,
+    lines: parsed.lines,
+    totalLines: parsed.totalLines,
+    ...(parsed.lang ? { lang: parsed.lang } : {}),
+    content: [{ type: 'text', text: parsed.lines.map(l => l.text).join('\n') }],
   }
 }
 
 function buildSearchResultView(args: MirrorToolInput, outputText: string): SearchResultView | null {
-  const name = normalizeToolName(args.tool)
   const kind = classifyToolKind(args.tool, args.kind)
-  if (kind !== 'search') return null
-  if (!outputText || outputText === '(no output)') return null
-
   const input = asRecord(args.input)
-  const hasQuery = Boolean(firstString(input, ['Query', 'query', 'Pattern', 'pattern']))
+  const parsed = parseSearchOutputData(args.tool, kind, input, outputText)
+  if (!parsed) return null
   const generic = buildGenericCallView(args)
-
-  // 1. Content search (grep / grep_search)
-  if (CONTENT_SEARCH_TOOL_NAMES.has(name) || (hasQuery && !PATH_SEARCH_TOOL_NAMES.has(name))) {
-    const fileMap = new Map<string, SearchFileMatches>()
-    let total = 0
-    let retained = 0
-    let truncated = false
-
-    const rawLines = outputText.replace(/\r\n/g, '\n').split('\n')
-    const lines = rawLines.slice(skipLeadingRuntimeTimestamps(rawLines))
-    for (const raw of lines) {
-      const line = raw.trimEnd()
-      if (!line) continue
-      if (/truncated|showing\s+\d+\s+of/i.test(line)) {
-        truncated = true
-        continue
-      }
-      const m = /^([^:\s][^:]*):(\d+):(.*)$/.exec(line)
-      if (!m) continue
-      const filePath = m[1]!
-      const lineNumber = Number(m[2])
-      if (!Number.isInteger(lineNumber) || lineNumber < 1) continue
-      total++
-      if (retained >= MAX_SEARCH_ITEMS) {
-        truncated = true
-        continue
-      }
-      let group = fileMap.get(filePath)
-      if (!group) {
-        group = { path: filePath, matches: [] }
-        fileMap.set(filePath, group)
-      }
-      group.matches.push({ lineNumber, line: m[3] ?? '' })
-      retained++
-    }
-
-    if (fileMap.size > 0) {
-      return {
-        card: 'search',
-        shape: 'matches',
-        title: generic.title,
-        files: [...fileMap.values()],
-        truncated,
-        total,
-      }
-    }
-    return null
-  }
-
-  // 2. Path search (glob / find_by_name / list_dir / search_files)
-  if (PATH_SEARCH_TOOL_NAMES.has(name) || kind === 'search') {
-    const paths: string[] = []
-    let truncated = false
-    let total = 0
-
-    // Support JSON array of paths or entries with `path`/`name`
-    const trimmed = outputText.trim()
-    if (trimmed.startsWith('[')) {
-      try {
-        const parsed: unknown = JSON.parse(trimmed)
-        if (Array.isArray(parsed)) {
-          for (const item of parsed) {
-            const p =
-              typeof item === 'string'
-                ? item.trim()
-                : firstString(asRecord(item), ['path', 'Path', 'filePath', 'name', 'Name'])
-            if (!p) continue
-            total++
-            if (paths.length < MAX_SEARCH_ITEMS) paths.push(p)
-            else truncated = true
-          }
-        }
-      } catch {
-        // fall through to line parser
-      }
-    }
-
-    if (paths.length === 0) {
-      const rawLines = outputText.replace(/\r\n/g, '\n').split('\n')
-      const pathLines = rawLines.slice(skipLeadingRuntimeTimestamps(rawLines))
-      for (const raw of pathLines) {
-        const line = raw.trim()
-        if (!line) continue
-        if (RUNTIME_TIMESTAMP_LINE_RE.test(line)) continue
-        if (/truncated|more files|showing\s+\d+/i.test(line)) {
-          truncated = true
-          continue
-        }
-        // Reject prose lines that clearly aren't paths
-        if (line.length > 260 || /\s{2,}/.test(line)) continue
-        total++
-        if (paths.length < MAX_SEARCH_ITEMS) paths.push(line)
-        else truncated = true
-      }
-    }
-
-    if (paths.length > 0) {
-      return {
-        card: 'search',
-        shape: 'paths',
-        title: generic.title,
-        paths,
-        truncated,
-        total,
-      }
+  if (parsed.shape === 'matches') {
+    return {
+      card: 'search',
+      shape: 'matches',
+      title: generic.title,
+      files: parsed.files,
+      truncated: parsed.truncated,
+      total: parsed.total,
     }
   }
-
-  return null
-}
-
-function parseWebSourcesFromText(text: string): WebSource[] {
-  const sources: WebSource[] = []
-  const seen = new Set<string>()
-  const mdLinkRe = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g
-  for (const m of text.matchAll(mdLinkRe)) {
-    const title = m[1]?.trim()
-    const url = m[2]?.trim()
-    if (!url || seen.has(url)) continue
-    seen.add(url)
-    sources.push({ url, ...(title ? { title } : {}) })
-    if (sources.length >= MAX_WEB_SOURCES) break
+  return {
+    card: 'search',
+    shape: 'paths',
+    title: generic.title,
+    paths: parsed.paths,
+    truncated: parsed.truncated,
+    total: parsed.total,
   }
-  return sources
 }
 
 function buildWebResultView(
@@ -790,7 +454,7 @@ function buildWebResultView(
   outputText: string,
   meta: MirrorResultMeta | null,
 ): WebResultView | null {
-  const name = normalizeToolName(args.tool)
+  const name = normalizeMirrorToolName(args.tool)
   const kind = classifyToolKind(args.tool, args.kind)
   if (kind !== 'fetch') return null
 
@@ -838,32 +502,12 @@ function extractResultText(content: readonly ContentBlock[]): string {
   return parts.join('\n')
 }
 
-function parseWebSources(raw: unknown): WebSource[] | undefined {
-  if (!Array.isArray(raw) || raw.length === 0) return undefined
-  const out: WebSource[] = []
-  for (const item of raw) {
-    const rec = asRecord(item)
-    const url = firstString(rec, ['url', 'Url', 'link', 'href'])
-    if (!url) continue
-    const title = firstString(rec, ['title', 'Title', 'name'])
-    const snippet = firstString(rec, ['snippet', 'Snippet', 'summary', 'description'])
-    const publishedAt = firstString(rec, ['publishedAt', 'published_at', 'date'])
-    out.push({
-      url,
-      ...(title ? { title } : {}),
-      ...(snippet ? { snippet } : {}),
-      ...(publishedAt ? { publishedAt } : {}),
-    })
-    if (out.length >= MAX_WEB_SOURCES) break
-  }
-  return out.length > 0 ? out : undefined
-}
-
 function parseResultMeta(meta: unknown): MirrorResultMeta | null {
   const rec = asRecord(meta)
   if (!rec || typeof rec.output !== 'string') return null
   const locations = normalizeLocations(rec.locations)
-  const webSources = parseWebSources(rec.webSources)
+  const diffs = parseMetaDiffs(rec.diffs)
+  const webSources = parseWebSourcesArray(rec.webSources)
   const httpStatus =
     typeof rec.httpStatus === 'number' && Number.isInteger(rec.httpStatus) && rec.httpStatus >= 100 && rec.httpStatus <= 599
       ? rec.httpStatus
@@ -878,6 +522,7 @@ function parseResultMeta(meta: unknown): MirrorResultMeta | null {
     ...(typeof rec.kind === 'string' && rec.kind ? { kind: rec.kind } : {}),
     ...(rec.input !== undefined ? { input: rec.input } : {}),
     ...(locations ? { locations } : {}),
+    ...(diffs ? { diffs } : {}),
     ...(httpStatus !== undefined ? { httpStatus } : {}),
     ...(webSources ? { webSources } : {}),
   }
@@ -917,7 +562,7 @@ export function presentMirrorResult(args: MirrorToolInput, result: ToolResult): 
     return view
   }
 
-  const diffCall = buildDiffCallView(effectiveArgs)
+  const diffCall = buildDiffCallView(effectiveArgs, meta?.diffs)
   if (diffCall) {
     const view: DiffResultView = {
       card: 'diff',
@@ -968,22 +613,17 @@ function formatToolOutput(update: Pick<MergedToolCall, 'content' | 'rawOutput'>)
   return '(no output)'
 }
 
-function extractExitCode(update: Pick<MergedToolCall, 'rawOutput'>): number | undefined {
+function extractExitCode(update: Pick<MergedToolCall, 'rawOutput'>, outputText: string, isExecute: boolean): number | undefined {
   const raw = asRecord(update.rawOutput)
   const code = firstNumber(raw, ['exit_code', 'exitCode', 'code'])
-  return code !== undefined && Number.isInteger(code) ? code : undefined
+  if (code !== undefined && Number.isInteger(code)) return code
+  if (isExecute) return extractExitCodeFromText(outputText)
+  return undefined
 }
 
 function extractSignal(update: Pick<MergedToolCall, 'rawOutput'>): string | undefined {
   const raw = asRecord(update.rawOutput)
   return firstString(raw, ['signal'])
-}
-
-function extractHttpStatusFromText(text: string): number | undefined {
-  const m = /(?:^|\n)\s*(?:HTTP\/[\d.]+\s+|Status(?:\s+Code)?:\s*)([1-5]\d{2})\b/i.exec(text)
-  if (!m) return undefined
-  const n = Number(m[1])
-  return Number.isInteger(n) && n >= 100 && n <= 599 ? n : undefined
 }
 
 function extractHttpStatus(update: Pick<MergedToolCall, 'rawOutput'>, outputText: string): number | undefined {
@@ -996,9 +636,9 @@ function extractHttpStatus(update: Pick<MergedToolCall, 'rawOutput'>, outputText
 function extractWebSources(update: Pick<MergedToolCall, 'rawOutput'>, outputText: string): WebSource[] | undefined {
   const raw = asRecord(update.rawOutput)
   const fromRaw =
-    parseWebSources(raw?.sources) ??
-    parseWebSources(raw?.results) ??
-    parseWebSources(raw?.items)
+    parseWebSourcesArray(raw?.sources) ??
+    parseWebSourcesArray(raw?.results) ??
+    parseWebSourcesArray(raw?.items)
   if (fromRaw?.length) return fromRaw
   const fromText = parseWebSourcesFromText(outputText)
   return fromText.length > 0 ? fromText : undefined
@@ -1012,6 +652,19 @@ const LOCATION_ARRAY_SCHEMA = {
     properties: {
       path: { type: 'string' as const, required: true as const },
       line: { type: 'integer' as const },
+    },
+  },
+}
+
+const DIFF_ARRAY_SCHEMA = {
+  type: 'array' as const,
+  items: {
+    type: 'object' as const,
+    additionalProperties: false as const,
+    properties: {
+      path: { type: 'string' as const, required: true as const },
+      oldText: { oneOf: [{ type: 'string' as const }, { type: 'null' as const }] as const, required: true as const },
+      newText: { type: 'string' as const, required: true as const },
     },
   },
 }
@@ -1063,6 +716,7 @@ export function defineAgyAcpMirrorTool(runs: AcpRunStore): ToolDefinition {
           kind: { type: 'string' },
           input: { type: 'json' },
           locations: LOCATION_ARRAY_SCHEMA,
+          diffs: DIFF_ARRAY_SCHEMA,
           httpStatus: { type: 'integer' },
           webSources: WEB_SOURCES_SCHEMA,
         },
@@ -1072,6 +726,7 @@ export function defineAgyAcpMirrorTool(runs: AcpRunStore): ToolDefinition {
       },
       presentationMeta(_args, value) {
         const cappedOutput = fitText(value.output, MAX_META_OUTPUT_BYTES)
+        const boundedDiffs = value.diffs ? boundDiffsForMeta(value.diffs) : undefined
         return {
           output: cappedOutput,
           isError: value.isError,
@@ -1082,6 +737,7 @@ export function defineAgyAcpMirrorTool(runs: AcpRunStore): ToolDefinition {
           ...(value.kind !== undefined ? { kind: value.kind } : {}),
           ...(value.input !== undefined ? { input: value.input } : {}),
           ...(value.locations !== undefined ? { locations: value.locations } : {}),
+          ...(boundedDiffs ? { diffs: boundedDiffs } : {}),
           ...(value.httpStatus !== undefined ? { httpStatus: value.httpStatus } : {}),
           ...(value.webSources !== undefined ? { webSources: value.webSources } : {}),
         }
@@ -1127,16 +783,24 @@ export function defineAgyAcpMirrorTool(runs: AcpRunStore): ToolDefinition {
         }
       }
 
-      const exitCode = extractExitCode(merged)
-      const signal = extractSignal(merged)
+      const kind = classifyToolKind(merged.name ?? args.tool, merged.kind ?? args.kind)
       const output = !merged.settled && completion.runError ? completion.runError : formatToolOutput(merged)
+      const exitCode = extractExitCode(merged, output, kind === 'execute')
+      const signal = extractSignal(merged)
       const isError =
         merged.status === 'failed' ||
         Boolean(completion.runError && !merged.settled) ||
         (exitCode !== undefined && exitCode !== 0)
       const compactInput = compactDisplayInput(merged.rawInput ?? merged.args)
       const locations = normalizeLocations(merged.locations)
-      const kind = classifyToolKind(merged.name ?? args.tool, merged.kind ?? args.kind)
+      const acpDiffs = extractAcpContentDiffs(merged.content)
+      const rawDiffs =
+        acpDiffs.length > 0
+          ? acpDiffs
+          : kind === 'edit'
+            ? extractFileDiffs(merged.name ?? args.tool, asRecord(merged.rawInput ?? merged.args), locations)
+            : []
+      const diffs = rawDiffs.length > 0 ? boundDiffsForMeta(rawDiffs) : undefined
       const httpStatus = kind === 'fetch' ? extractHttpStatus(merged, output) : undefined
       const webSources = kind === 'fetch' ? extractWebSources(merged, output) : undefined
 
@@ -1150,6 +814,7 @@ export function defineAgyAcpMirrorTool(runs: AcpRunStore): ToolDefinition {
         ...(merged.kind ? { kind: merged.kind } : {}),
         ...(compactInput !== undefined ? { input: compactInput } : {}),
         ...(locations ? { locations } : {}),
+        ...(diffs ? { diffs } : {}),
         ...(httpStatus !== undefined ? { httpStatus } : {}),
         ...(webSources ? { webSources } : {}),
       }

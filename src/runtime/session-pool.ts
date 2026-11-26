@@ -1506,6 +1506,7 @@ export class AcpSessionPool extends EventEmitter {
   }
 
   private emitStatus(): void {
+    if (this.listenerCount('status') === 0) return
     this.emit('status', this.getStatus())
   }
 }

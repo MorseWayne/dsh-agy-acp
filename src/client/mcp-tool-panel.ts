@@ -2,19 +2,26 @@
 import React from 'react'
 import {
   DEFAULT_MAX_EAGER_SCHEMA_BYTES,
+  matchMcpPolicyPreset,
+  MCP_TOOL_POLICY_PRESETS,
   META_GATEWAY_ESTIMATED_BYTES,
   REPLACE_GROUPS,
+  resolveEffectiveMcpToolPolicy,
   resolveToolExposure,
   SUPPLEMENT_GROUPS,
   type EffectiveMcpToolPolicy,
+  type McpToolPolicyConfig,
   type ReplaceGroupId,
   type ReplaceGroupMode,
   type SupplementGroupId,
   type SupplementGroupMode,
   type ToolExposureMode,
 } from '../common/mcp-tool-policy.ts'
-import type { McpToolCatalogSnapshot } from '../common/types.ts'
-import { styles, theme } from './theme.ts'
+import type { McpToolCatalogEntry, McpToolCatalogSnapshot } from '../common/types.ts'
+import { theme } from './theme.ts'
+import { ProgressBar, SegmentedControl, type SegmentOption } from './ui-primitives.ts'
+
+const h = React.createElement
 
 export interface LivePolicyBudget {
   eagerCount: number
@@ -75,6 +82,75 @@ function modeLabel(mode: ToolExposureMode): string {
   return '关闭'
 }
 
+const SUPPLEMENT_OPTIONS: readonly SegmentOption<SupplementGroupMode>[] = [
+  { value: 'eager', label: '直出', title: '直出（无损常驻）', accent: true },
+  { value: 'lazy', label: '按需', title: '按需发现（网关）' },
+  { value: 'off', label: '关闭', title: '关闭' },
+]
+
+const REPLACE_OPTIONS: readonly SegmentOption<ReplaceGroupMode>[] = [
+  { value: 'native', label: '原生', title: '使用 agy 原生' },
+  { value: 'replace', label: 'DSH 替代', title: '用 DSH 替代（直出+引导）', accent: true },
+  { value: 'lazy', label: '按需并存', title: '两者并存（DSH 按需）' },
+]
+
+interface ToolOverrideRowProps {
+  tool: McpToolCatalogEntry
+  explicit: ToolExposureMode | ''
+  inheritedMode: ToolExposureMode
+  onChangeOverride: (toolName: string, mode: ToolExposureMode | '') => void
+}
+
+const ToolOverrideRow = React.memo(function ToolOverrideRow({
+  tool,
+  explicit,
+  inheritedMode,
+  onChangeOverride,
+}: ToolOverrideRowProps): unknown {
+  return h(
+    'div',
+    { className: 'agy-acp-list-row', style: { padding: '7px 10px' } },
+    h(
+      'div',
+      { style: { flex: '1 1 220px', minWidth: 0 } },
+      h(
+        'div',
+        { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } },
+        h('code', { style: { fontSize: '12px', fontWeight: 500 } }, tool.name),
+        h('span', { className: 'agy-acp-caption', style: { fontVariantNumeric: 'tabular-nums' } }, formatKb(tool.estimatedBytes)),
+        explicit
+          ? h('span', { className: 'agy-acp-pill agy-acp-pill--sm agy-acp-pill--info' }, '已覆写')
+          : null,
+      ),
+      tool.description
+        ? h(
+            'div',
+            {
+              className: 'agy-acp-caption',
+              style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: '1px' },
+            },
+            tool.description,
+          )
+        : null,
+    ),
+    h(
+      'select',
+      {
+        'aria-label': `工具 ${tool.name} 暴露模式`,
+        value: explicit,
+        onChange: (e: { target: { value: string } }) =>
+          onChangeOverride(tool.name, e.target.value as ToolExposureMode | ''),
+        className: 'agy-acp-select agy-acp-select--sm',
+        style: { width: 'auto', minWidth: '132px' },
+      },
+      h('option', { value: '' }, `跟随分组（${modeLabel(inheritedMode)}）`),
+      h('option', { value: 'eager' }, '强制直出'),
+      h('option', { value: 'lazy' }, '强制按需'),
+      h('option', { value: 'off' }, '强制关闭'),
+    ),
+  )
+})
+
 export interface McpToolPolicyPanelProps {
   enabled: boolean
   policy: EffectiveMcpToolPolicy
@@ -82,101 +158,129 @@ export interface McpToolPolicyPanelProps {
   onChangeGroup: (groupId: SupplementGroupId, mode: SupplementGroupMode) => void
   onChangeReplace: (groupId: ReplaceGroupId, mode: ReplaceGroupMode) => void
   onChangeOverride: (toolName: string, mode: ToolExposureMode | '') => void
+  onApplyPreset?: (policy: EffectiveMcpToolPolicy) => void
   onClearOverrides: () => void
   onResetPolicyDefaults: () => void
 }
 
-export function McpToolPolicyPanel({
+export const McpToolPolicyPanel = React.memo(function McpToolPolicyPanel({
   enabled,
   policy,
   catalog,
   onChangeGroup,
   onChangeReplace,
   onChangeOverride,
+  onApplyPreset,
   onClearOverrides,
   onResetPolicyDefaults,
 }: McpToolPolicyPanelProps): unknown {
+  const [overridesExpanded, setOverridesExpanded] = React.useState(false)
   const [filter, setFilter] = React.useState('')
+  const deferredFilter: string =
+    typeof React.useDeferredValue === 'function' ? React.useDeferredValue(filter) : filter
+
+  const live = React.useMemo(() => computeLivePolicyBudget(catalog, policy), [catalog, policy])
+  const activePresetId = React.useMemo(() => matchMcpPolicyPreset(policy), [policy])
+  const policyWithoutOverrides = React.useMemo(
+    () => ({ groups: policy.groups, replace: policy.replace, overrides: {} }),
+    [policy.groups, policy.replace],
+  )
+
+  const visibleTools: McpToolCatalogEntry[] = React.useMemo(() => {
+    if (!overridesExpanded) return []
+    const all = catalog?.tools ?? []
+    const q = deferredFilter.trim().toLowerCase()
+    if (!q) return all
+    return all.filter(
+      (t) =>
+        t.name.toLowerCase().includes(q) ||
+        t.description.toLowerCase().includes(q) ||
+        t.groupId.toLowerCase().includes(q),
+    )
+  }, [overridesExpanded, catalog, deferredFilter])
 
   if (!enabled) return null
 
-  const live = computeLivePolicyBudget(catalog, policy)
   const hasLiveCatalog = Boolean(catalog && catalog.tools.length > 0)
   const pct = live.budgetBytes > 0 ? Math.min(100, (100 * live.estimatedEagerBytes) / live.budgetBytes) : 0
   const barColor = live.willCompact
     ? theme.stateError
     : pct > 80
       ? theme.stateWarn
-      : theme.brandPrimary
+      : theme.accentBlue
 
-  const overrideEntries = Object.entries(policy.overrides)
-  const normalizedFilter = filter.trim().toLowerCase()
-  const visibleTools = (catalog?.tools ?? []).filter((t) => {
-    if (!normalizedFilter) return true
-    return (
-      t.name.toLowerCase().includes(normalizedFilter) ||
-      t.description.toLowerCase().includes(normalizedFilter) ||
-      t.groupId.toLowerCase().includes(normalizedFilter)
-    )
-  })
+  const overrideCount = Object.keys(policy.overrides).length
 
-  return React.createElement(
+  const applyPreset = (presetPolicy: McpToolPolicyConfig): void => {
+    const resolved = resolveEffectiveMcpToolPolicy(presetPolicy)
+    if (onApplyPreset) {
+      onApplyPreset(resolved)
+    } else {
+      onResetPolicyDefaults()
+    }
+  }
+
+  return h(
     'div',
-    {
-      style: {
-        padding: '10px 12px',
-        borderRadius: '8px',
-        border: theme.borderPrimary,
-        backgroundColor: theme.surfaceTile,
-        marginBottom: '12px',
-      },
-    },
-    React.createElement(
+    { style: { marginTop: '12px' } },
+    // Header + quick presets
+    h(
       'div',
-      {
-        style: {
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-          gap: '8px',
-          flexWrap: 'wrap',
-          marginBottom: '6px',
-        },
-      },
-      React.createElement(
+      { className: 'agy-acp-section-head', style: { marginBottom: '8px' } },
+      h(
         'div',
         null,
-        React.createElement('div', { style: { fontWeight: 500 } }, '反向 MCP 工具策略（补充与替代原生能力）'),
-        React.createElement(
+        h('div', { style: { fontWeight: 600, fontSize: '13px' } }, '反向 MCP 工具策略'),
+        h(
           'div',
-          { style: { ...styles.secondaryText, fontSize: '11px' } },
-          '高频工具保持无损直出，低频与扩展插件默认通过 dsh_discover_tools / dsh_call_tool 按需发现调用。',
+          { className: 'agy-acp-caption' },
+          '高频工具无损直出，低频与扩展工具通过 dsh_discover_tools / dsh_call_tool 按需发现。',
         ),
       ),
-      React.createElement(
+      h(
         'button',
         {
           type: 'button',
           onClick: onResetPolicyDefaults,
-          style: styles.ghostButton,
+          className: 'agy-acp-btn agy-acp-btn--sm',
         },
         '恢复推荐默认',
       ),
     ),
 
+    // Quick preset chips
+    h(
+      'div',
+      { className: 'agy-acp-preset-bar', role: 'group', 'aria-label': '工具策略快捷预设' },
+      ...MCP_TOOL_POLICY_PRESETS.map((preset) =>
+        h(
+          'button',
+          {
+            key: preset.id,
+            type: 'button',
+            'aria-pressed': activePresetId === preset.id,
+            title: preset.description,
+            className: 'agy-acp-preset-chip',
+            onClick: () => applyPreset(preset.policy),
+          },
+          preset.label,
+        ),
+      ),
+    ),
+
     // Live Eager schema budget bar
-    React.createElement(
+    h(
       'div',
       {
         style: {
-          padding: '8px 10px',
-          borderRadius: '6px',
-          border: theme.borderPrimary,
-          backgroundColor: theme.surfaceCard,
-          marginBottom: '10px',
+          padding: '10px 12px',
+          borderRadius: '10px',
+          border: theme.borderSubtle,
+          backgroundColor: theme.surfaceTile,
+          marginBottom: '12px',
         },
       },
-      React.createElement(
+      h(
         'div',
         {
           style: {
@@ -188,273 +292,194 @@ export function McpToolPolicyPanel({
             fontSize: '12px',
           },
         },
-        React.createElement(
+        h(
           'span',
           null,
           hasLiveCatalog
-            ? `当前宿主共检测到 ${catalog!.tools.length} 个工具：直出 ${live.eagerCount} · 按需 ${live.lazyCount} · 关闭 ${live.offCount}`
+            ? `已检测 ${catalog!.tools.length} 个宿主工具：直出 ${live.eagerCount} · 按需 ${live.lazyCount} · 关闭 ${live.offCount}`
             : '尚未读取到宿主工具清单（DSH 工具服务就绪后自动更新预算估算）',
         ),
         hasLiveCatalog
-          ? React.createElement(
+          ? h(
               'span',
               {
                 style: {
-                  fontWeight: 500,
+                  fontWeight: 600,
+                  fontVariantNumeric: 'tabular-nums',
                   color: live.willCompact ? theme.stateError : pct > 80 ? theme.stateWarn : theme.stateSuccess,
                 },
               },
-              `预计直出体积 ${formatKb(live.estimatedEagerBytes)} / ${formatKb(live.budgetBytes)} 安全线`,
+              `${formatKb(live.estimatedEagerBytes)} / ${formatKb(live.budgetBytes)} 安全线`,
             )
           : null,
       ),
       hasLiveCatalog
-        ? React.createElement(
-            'div',
-            {
-              role: 'progressbar',
-              'aria-label': '直出工具 Schema 安全预算占用',
-              'aria-valuenow': Math.round(pct),
-              'aria-valuemin': 0,
-              'aria-valuemax': 100,
-              style: {
-                marginTop: '6px',
-                height: '5px',
-                borderRadius: '999px',
-                backgroundColor: theme.surfaceTile,
-                overflow: 'hidden',
-              },
-            },
-            React.createElement('div', {
-              style: {
-                width: `${pct.toFixed(1)}%`,
-                height: '100%',
-                backgroundColor: barColor,
-              },
-            }),
-          )
+        ? h(ProgressBar, {
+            valuePct: pct,
+            ariaLabel: '直出工具 Schema 安全预算占用',
+            color: barColor,
+            style: { marginTop: '7px' },
+          })
         : null,
       live.willCompact
-        ? React.createElement(
+        ? h(
             'div',
-            { style: { fontSize: '11px', color: theme.stateWarn, marginTop: '5px' } },
-            '已超出无损安全线，运行时将自动触发兜底描述裁剪以防止 agy 静默丢弃工具；建议将部分低频分组改回“按需发现”。',
+            { style: { fontSize: '11px', color: theme.stateWarn, marginTop: '6px' } },
+            '已超出无损安全线，运行时将自动触发兜底描述裁剪以防止 agy 静默丢弃工具；建议将部分低频分组改回「按需」。',
           )
         : null,
     ),
 
     // Section A: Supplement groups
-    React.createElement(
+    h(
       'div',
-      { style: { marginBottom: '10px' } },
-      React.createElement('div', { style: { fontSize: '12px', fontWeight: 600, marginBottom: '6px' } }, '补充能力（agy 原生没有的 DSH 工具）'),
-      React.createElement(
+      { style: { marginBottom: '12px' } },
+      h(
         'div',
-        { style: { display: 'grid', gap: '6px' } },
+        { style: { fontSize: '12px', fontWeight: 600, marginBottom: '6px', color: theme.textSecondary } },
+        '补充能力（agy 原生没有的 DSH 工具）',
+      ),
+      h(
+        'div',
+        { className: 'agy-acp-list' },
         ...SUPPLEMENT_GROUPS.map((g) => {
           const count = live.countsByGroup[g.id] ?? 0
-          return React.createElement(
+          return h(
             'div',
-            {
-              key: g.id,
-              style: {
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                gap: '10px',
-                flexWrap: 'wrap',
-                padding: '6px 8px',
-                borderRadius: '6px',
-                border: theme.borderPrimary,
-                backgroundColor: theme.surfaceCard,
-              },
-            },
-            React.createElement(
+            { key: g.id, className: 'agy-acp-list-row' },
+            h(
               'div',
-              { style: { flex: '1 1 260px', minWidth: 0 } },
-              React.createElement(
+              { style: { flex: '1 1 240px', minWidth: 0 } },
+              h(
                 'div',
-                { style: { fontSize: '12px', fontWeight: 500 } },
+                { style: { fontSize: '12.5px', fontWeight: 500 } },
                 `${g.label}${hasLiveCatalog ? ` (${count})` : ''}`,
               ),
-              React.createElement('div', { style: { ...styles.secondaryText, fontSize: '11px' } }, g.description),
+              h('div', { className: 'agy-acp-caption' }, g.description),
             ),
-            React.createElement(
-              'select',
-              {
-                'aria-label': `补充能力分组 ${g.label}`,
-                value: policy.groups[g.id],
-                onChange: (e: { target: { value: string } }) =>
-                  onChangeGroup(g.id, e.target.value as SupplementGroupMode),
-                style: { ...styles.input, width: 'auto', minWidth: '150px', fontSize: '12px', padding: '4px 8px' },
-              },
-              React.createElement('option', { value: 'eager' }, '直出（无损常驻）'),
-              React.createElement('option', { value: 'lazy' }, '按需发现（网关）'),
-              React.createElement('option', { value: 'off' }, '关闭'),
-            ),
+            h(SegmentedControl<SupplementGroupMode>, {
+              ariaLabel: `补充能力分组 ${g.label}`,
+              value: policy.groups[g.id],
+              options: SUPPLEMENT_OPTIONS,
+              onChange: (mode: SupplementGroupMode) => onChangeGroup(g.id, mode),
+            }),
           )
         }),
       ),
     ),
 
     // Section B: Replace native agy groups
-    React.createElement(
+    h(
       'div',
-      { style: { marginBottom: '10px' } },
-      React.createElement('div', { style: { fontSize: '12px', fontWeight: 600, marginBottom: '2px' } }, '替代能力（与 agy 原生工具重叠）'),
-      React.createElement(
+      { style: { marginBottom: '12px' } },
+      h(
         'div',
-        { style: { ...styles.secondaryText, fontSize: '11px', marginBottom: '6px' } },
-        '选择“用 DSH 替代”会直出对应 DSH 工具并注入优先路由指令（软替代；agy 协议层仍保留原生工具声明）。',
+        { style: { fontSize: '12px', fontWeight: 600, marginBottom: '2px', color: theme.textSecondary } },
+        '替代能力（与 agy 原生工具重叠）',
       ),
-      React.createElement(
+      h(
         'div',
-        { style: { display: 'grid', gap: '6px' } },
+        { className: 'agy-acp-caption', style: { marginBottom: '6px' } },
+        '选择「DSH 替代」会直出对应 DSH 工具并注入优先路由引导（软替代；agy 协议层仍保留原生工具声明）。',
+      ),
+      h(
+        'div',
+        { className: 'agy-acp-list' },
         ...REPLACE_GROUPS.map((g) => {
           const count = live.countsByGroup[g.id] ?? 0
-          return React.createElement(
+          return h(
             'div',
-            {
-              key: g.id,
-              style: {
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                gap: '10px',
-                flexWrap: 'wrap',
-                padding: '6px 8px',
-                borderRadius: '6px',
-                border: theme.borderPrimary,
-                backgroundColor: theme.surfaceCard,
-              },
-            },
-            React.createElement(
+            { key: g.id, className: 'agy-acp-list-row' },
+            h(
               'div',
-              { style: { flex: '1 1 260px', minWidth: 0 } },
-              React.createElement(
+              { style: { flex: '1 1 240px', minWidth: 0 } },
+              h(
                 'div',
-                { style: { fontSize: '12px', fontWeight: 500 } },
+                { style: { fontSize: '12.5px', fontWeight: 500 } },
                 `${g.label}${hasLiveCatalog ? ` (${count})` : ''}`,
               ),
-              React.createElement(
-                'div',
-                { style: { ...styles.secondaryText, fontSize: '11px' } },
-                `${g.description} · 对应 agy 原生：${g.nativeLabel}`,
-              ),
+              h('div', { className: 'agy-acp-caption' }, `${g.description} · 原生：${g.nativeLabel}`),
             ),
-            React.createElement(
-              'select',
-              {
-                'aria-label': `替代能力分组 ${g.label}`,
-                value: policy.replace[g.id],
-                onChange: (e: { target: { value: string } }) =>
-                  onChangeReplace(g.id, e.target.value as ReplaceGroupMode),
-                style: { ...styles.input, width: 'auto', minWidth: '170px', fontSize: '12px', padding: '4px 8px' },
-              },
-              React.createElement('option', { value: 'native' }, '使用 agy 原生'),
-              React.createElement('option', { value: 'replace' }, '用 DSH 替代（直出+引导）'),
-              React.createElement('option', { value: 'lazy' }, '两者并存（DSH 按需）'),
-            ),
+            h(SegmentedControl<ReplaceGroupMode>, {
+              ariaLabel: `替代能力分组 ${g.label}`,
+              value: policy.replace[g.id],
+              options: REPLACE_OPTIONS,
+              onChange: (mode: ReplaceGroupMode) => onChangeReplace(g.id, mode),
+            }),
           )
         }),
       ),
     ),
 
-    // Section C: Advanced per-tool overrides
-    React.createElement(
-      'details',
-      null,
-      React.createElement(
-        'summary',
-        { style: { cursor: 'pointer', fontSize: '12px', fontWeight: 500 } },
-        `高级：逐工具精细覆写${overrideEntries.length > 0 ? `（已覆写 ${overrideEntries.length} 项）` : ''}`,
-      ),
-      React.createElement(
-        'div',
-        { style: { marginTop: '8px' } },
-        React.createElement(
-          'div',
-          { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '8px' } },
-          React.createElement('input', {
-            type: 'text',
-            'aria-label': '筛选宿主工具',
-            value: filter,
-            placeholder: '按工具名、分组或说明筛选…',
-            onChange: (e: { target: { value: string } }) => setFilter(e.target.value),
-            style: { ...styles.input, flex: '1 1 200px', fontSize: '12px', padding: '5px 8px' },
-          }),
-          overrideEntries.length > 0
-            ? React.createElement(
-                'button',
-                { type: 'button', onClick: onClearOverrides, style: styles.ghostButton },
-                '清除全部覆写',
-              )
+    // Section C: Controlled lazy-rendered per-tool overrides (ZERO DOM rows while collapsed!)
+    h(
+      'div',
+      { className: 'agy-acp-collapsible' },
+      h(
+        'button',
+        {
+          type: 'button',
+          'aria-expanded': overridesExpanded,
+          className: 'agy-acp-collapse-trigger',
+          onClick: () => setOverridesExpanded((v: boolean) => !v),
+        },
+        h(
+          'span',
+          { style: { display: 'inline-flex', alignItems: 'center', gap: '8px' } },
+          h('span', { style: { fontSize: '10px', opacity: 0.7 } }, overridesExpanded ? '▼' : '▶'),
+          '高级：逐工具精细覆写',
+          overrideCount > 0
+            ? h('span', { className: 'agy-acp-pill agy-acp-pill--sm agy-acp-pill--info' }, `已覆写 ${overrideCount} 项`)
             : null,
         ),
-        !hasLiveCatalog
-          ? React.createElement('div', { style: { ...styles.secondaryText, fontSize: '11px' } }, '暂未读取到已注册的 DSH 工具列表。')
-          : visibleTools.length === 0
-            ? React.createElement('div', { style: { ...styles.secondaryText, fontSize: '11px' } }, '没有匹配当前筛选条件的工具。')
-            : React.createElement(
-                'div',
-                { style: { display: 'grid', gap: '4px', maxHeight: '260px', overflowY: 'auto', paddingRight: '2px' } },
-                ...visibleTools.map((t) => {
-                  const explicit = Object.hasOwn(policy.overrides, t.name) ? policy.overrides[t.name]! : ''
-                  const withoutOverride = resolveToolExposure(t.name, { ...policy, overrides: {} })
-                  return React.createElement(
-                    'div',
-                    {
-                      key: t.name,
-                      style: {
-                        display: 'flex',
-                        justifyContent: 'space-between',
-                        alignItems: 'center',
-                        gap: '8px',
-                        padding: '5px 8px',
-                        borderRadius: '6px',
-                        border: theme.borderPrimary,
-                        backgroundColor: theme.surfaceCard,
-                      },
-                    },
-                    React.createElement(
-                      'div',
-                      { style: { flex: '1 1 220px', minWidth: 0 } },
-                      React.createElement(
-                        'div',
-                        { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } },
-                        React.createElement('code', { style: { fontSize: '12px', fontWeight: 500 } }, t.name),
-                        React.createElement(
-                          'span',
-                          { style: { ...styles.secondaryText, fontSize: '10px' } },
-                          formatKb(t.estimatedBytes),
-                        ),
-                      ),
-                      t.description
-                        ? React.createElement(
-                            'div',
-                            { style: { ...styles.secondaryText, fontSize: '11px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-                            t.description,
-                          )
-                        : null,
-                    ),
-                    React.createElement(
-                      'select',
-                      {
-                        'aria-label': `工具 ${t.name} 暴露模式`,
-                        value: explicit,
-                        onChange: (e: { target: { value: string } }) =>
-                          onChangeOverride(t.name, e.target.value as ToolExposureMode | ''),
-                        style: { ...styles.input, width: 'auto', minWidth: '140px', fontSize: '11px', padding: '3px 6px' },
-                      },
-                      React.createElement('option', { value: '' }, `跟随分组（${modeLabel(withoutOverride.mode)}）`),
-                      React.createElement('option', { value: 'eager' }, '强制直出'),
-                      React.createElement('option', { value: 'lazy' }, '强制按需'),
-                      React.createElement('option', { value: 'off' }, '强制关闭'),
-                    ),
-                  )
-                }),
-              ),
+        h('span', { className: 'agy-acp-caption' }, overridesExpanded ? '收起' : `展开${hasLiveCatalog ? ` (${catalog!.tools.length})` : ''}`),
       ),
+      overridesExpanded
+        ? h(
+            'div',
+            { className: 'agy-acp-collapsible-body' },
+            h(
+              'div',
+              { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '8px' } },
+              h('input', {
+                type: 'text',
+                'aria-label': '筛选宿主工具',
+                'data-agy-ignore-edit': 'true',
+                value: filter,
+                placeholder: '按工具名、分组或说明筛选…',
+                onChange: (e: { target: { value: string } }) => setFilter(e.target.value),
+                className: 'agy-acp-input agy-acp-input--sm',
+                style: { flex: '1 1 200px' },
+              }),
+              overrideCount > 0
+                ? h(
+                    'button',
+                    { type: 'button', onClick: onClearOverrides, className: 'agy-acp-btn agy-acp-btn--sm' },
+                    '清除全部覆写',
+                  )
+                : null,
+            ),
+            !hasLiveCatalog
+              ? h('div', { className: 'agy-acp-caption' }, '暂未读取到已注册的 DSH 工具列表。')
+              : visibleTools.length === 0
+                ? h('div', { className: 'agy-acp-caption' }, '没有匹配当前筛选条件的工具。')
+                : h(
+                    'div',
+                    { className: 'agy-acp-list', style: { maxHeight: '280px', overflowY: 'auto' } },
+                    ...visibleTools.map((t) => {
+                      const explicit = Object.hasOwn(policy.overrides, t.name) ? policy.overrides[t.name]! : ''
+                      const withoutOverride = resolveToolExposure(t.name, policyWithoutOverrides)
+                      return h(ToolOverrideRow, {
+                        key: t.name,
+                        tool: t,
+                        explicit,
+                        inheritedMode: withoutOverride.mode,
+                        onChangeOverride,
+                      })
+                    }),
+                  ),
+          )
+        : null,
     ),
   )
-}
+})

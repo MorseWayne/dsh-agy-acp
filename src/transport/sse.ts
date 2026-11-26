@@ -11,6 +11,8 @@ export interface ReviewModelChoice {
 
 export interface AcpRoutesOptions {
   listReviewModels?: (provider: string) => Promise<ReviewModelChoice[] | null>
+  /** Coalesce bursty SSE status broadcasts within this window (ms). Defaults to 180ms; 0 disables throttling. */
+  sseThrottleMs?: number
 }
 
 export interface ExactRouteSpec {
@@ -114,8 +116,36 @@ export function registerAcpRoutes(
 ): () => void {
   const disposers: Array<() => void> = []
   const sseClients = new Set<ServerResponse>()
+  const throttleMs = Math.max(0, opts?.sseThrottleMs ?? 180)
+  let listeningPoolStatus = false
+  let lastPushAt = 0
+  let pendingSnapshot: StatusSnapshot | null = null
+  let flushTimer: ReturnType<typeof setTimeout> | null = null
 
-  const pushSnapshot = (snap: StatusSnapshot): void => {
+  const clearPendingBroadcast = (): void => {
+    if (flushTimer !== null) {
+      clearTimeout(flushTimer)
+      flushTimer = null
+    }
+    pendingSnapshot = null
+  }
+
+  const detachStatusListenerIfIdle = (): void => {
+    if (sseClients.size > 0 || !listeningPoolStatus) return
+    pool.off('status', pushSnapshot)
+    listeningPoolStatus = false
+    clearPendingBroadcast()
+  }
+
+  const attachStatusListener = (): void => {
+    if (listeningPoolStatus) return
+    pool.on('status', pushSnapshot)
+    listeningPoolStatus = true
+  }
+
+  const broadcastNow = (snap: StatusSnapshot): void => {
+    if (sseClients.size === 0) return
+    lastPushAt = Date.now()
     const payload = `event: status\ndata: ${JSON.stringify(snap)}\n\n`
     for (const res of sseClients) {
       try {
@@ -124,9 +154,35 @@ export function registerAcpRoutes(
         sseClients.delete(res)
       }
     }
+    detachStatusListenerIfIdle()
   }
 
-  pool.on('status', pushSnapshot)
+  const pushSnapshot = (snap: StatusSnapshot): void => {
+    if (sseClients.size === 0) {
+      detachStatusListenerIfIdle()
+      return
+    }
+    if (throttleMs <= 0) {
+      broadcastNow(snap)
+      return
+    }
+    const elapsed = Date.now() - lastPushAt
+    if (flushTimer === null && elapsed >= throttleMs) {
+      broadcastNow(snap)
+      return
+    }
+    pendingSnapshot = snap
+    if (flushTimer === null) {
+      const delay = Math.max(1, throttleMs - elapsed)
+      flushTimer = setTimeout(() => {
+        flushTimer = null
+        const next = pendingSnapshot
+        pendingSnapshot = null
+        if (next) broadcastNow(next)
+      }, delay)
+      flushTimer.unref?.()
+    }
+  }
 
   const addRoute = (
     method: string,
@@ -196,6 +252,7 @@ export function registerAcpRoutes(
     })
     res.write(`event: status\ndata: ${JSON.stringify(pool.getStatus())}\n\n`)
     sseClients.add(res)
+    attachStatusListener()
 
     const heartbeat = setInterval(() => {
       try {
@@ -203,6 +260,7 @@ export function registerAcpRoutes(
       } catch {
         clearInterval(heartbeat)
         sseClients.delete(res)
+        detachStatusListenerIfIdle()
       }
     }, 25_000)
     heartbeat.unref?.()
@@ -210,6 +268,7 @@ export function registerAcpRoutes(
     req.on('close', () => {
       clearInterval(heartbeat)
       sseClients.delete(res)
+      detachStatusListenerIfIdle()
     })
   })
 
@@ -362,7 +421,11 @@ export function registerAcpRoutes(
   })
 
   return () => {
-    pool.off('status', pushSnapshot)
+    if (listeningPoolStatus) {
+      pool.off('status', pushSnapshot)
+      listeningPoolStatus = false
+    }
+    clearPendingBroadcast()
     for (const res of sseClients) {
       try {
         res.end()

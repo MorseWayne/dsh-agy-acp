@@ -8,6 +8,9 @@ import {
   compactMcpToolPolicy,
   DSH_CALL_TOOL_NAME,
   DSH_DISCOVER_TOOLS_NAME,
+  equalEffectiveMcpToolPolicy,
+  matchMcpPolicyPreset,
+  MCP_TOOL_POLICY_PRESETS,
   META_GATEWAY_ESTIMATED_BYTES,
   resolveEffectiveMcpToolPolicy,
   resolveToolExposure,
@@ -362,4 +365,17 @@ test('computeLivePolicyBudget reflects group and override changes in real time',
   assert.equal(heavyBudget.offCount, 0)
   assert.equal(heavyBudget.estimatedEagerBytes, 2_500 + 3_000 + 1_200)
   assert.equal(heavyBudget.willCompact, true)
+})
+
+test('MCP_TOOL_POLICY_PRESETS round-trip cleanly with matchMcpPolicyPreset and equalEffectiveMcpToolPolicy', () => {
+  assert.equal(MCP_TOOL_POLICY_PRESETS.length, 3)
+  for (const preset of MCP_TOOL_POLICY_PRESETS) {
+    const resolved = resolveEffectiveMcpToolPolicy(preset.policy)
+    assert.equal(matchMcpPolicyPreset(resolved), preset.id)
+    assert.equal(equalEffectiveMcpToolPolicy(resolved, resolveEffectiveMcpToolPolicy(preset.policy)), true)
+  }
+
+  const customized = resolveEffectiveMcpToolPolicy({ overrides: { workflow: 'eager' } })
+  assert.equal(matchMcpPolicyPreset(customized), null)
+  assert.equal(equalEffectiveMcpToolPolicy(customized, resolveEffectiveMcpToolPolicy()), false)
 })

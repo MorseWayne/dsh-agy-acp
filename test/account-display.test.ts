@@ -7,10 +7,11 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import type { AccountHealthSnapshot, StatusSnapshot } from '../src/common/types.ts'
 import { initialSnapshot, reduceSnapshot, snapshotNotice } from '../src/client/snapshot-state.ts'
 import { AccountCard } from '../src/client/account-card.ts'
-import { activeCooldowns, bucketDisplay, lowQuotaWarnings, nextAccountExpiry, requestAccountAction, sessionAccountLabel } from '../src/client/account-display.ts'
+import { activeCooldowns, bucketDisplay, lowQuotaWarnings, nextAccountExpiry, requestAccountAction, requestAllAccountsEgressCheck, sessionAccountLabel } from '../src/client/account-display.ts'
 import { resetSessions, type SessionResetTarget } from '../src/client/panel-actions.ts'
 import { ConfigFieldset, SettingsView } from '../src/client/index.ts'
 import { createStatusStore, type EventSourceLike } from '../src/client/status-store.ts'
+import { styles, theme } from '../src/client/theme.ts'
 
 const account: AccountHealthSnapshot = {
   id: 'default', label: '本机默认账号', enabled: true, hasSandboxHome: false,
@@ -301,32 +302,57 @@ function panelFixture(): StatusSnapshot {
   }
 }
 
-test('SettingsView renders model select, lastError banner, timeout inputs, context progressbar, and uses DSH theme tokens', () => {
+test('SettingsView conditionally mounts tabs, renders model select, lastError banner, timeout inputs, context progressbar, and uses light/dark-safe DSH theme tokens', () => {
   const snap = panelFixture()
 
-  const html = renderToStaticMarkup(
-    React.createElement(SettingsView, { status: snap, stream: 'live', failed: false, applyStatus: () => {} }),
+  // Sessions tab: renders sessions, bridge runtime, context progressbar, and does NOT mount config fieldset
+  const sessionsHtml = renderToStaticMarkup(
+    React.createElement(SettingsView, { status: snap, stream: 'live', failed: false, initialPanel: 'sessions', applyStatus: () => {} }),
   )
-  assert.match(html, /<select/)
-  assert.match(html, /Gemini 4 Neon \(gemini-4-neon\)/)
-  assert.match(html, /legacy-custom-model（当前已存，不在目录中）/)
-  assert.match(html, /目录\/连接诊断/)
-  assert.match(html, /重新探测目录/)
-  assert.match(html, /空闲会话回收/)
-  assert.match(html, /单次请求超时/)
-  assert.match(html, /地域合规防护（防封号拦截）/)
-  assert.match(html, /拦截受限地区（推荐，默认）/)
-  assert.match(html, /严格模式（受限与未知均拦截）/)
-  assert.match(html, /桥接运行态：挂载会话 1 · 在途调用 0 · 累计调用 4 · 失败\/超时 1 · 最近工具 search_docs/)
-  assert.match(html, /最近桥接告警/)
-  assert.match(html, /恢复索引：2 个/)
-  assert.match(html, /已恢复（方式未上报）/)
-  assert.match(html, /标题：修复鉴权缓存逻辑/)
-  assert.match(html, /配额感知多账号调度（Quota-Aware Scheduling）/)
-  assert.match(html, /恢复默认/)
-  assert.match(html, /role="progressbar"/)
-  assert.match(html, /--dsw-alias-/)
-  assert.doesNotMatch(html, /#18181b/)
+  assert.match(sessionsHtml, /目录\/连接诊断/)
+  assert.match(sessionsHtml, /重新探测目录/)
+  assert.match(sessionsHtml, /桥接运行态：挂载会话 1 · 在途调用 0 · 累计调用 4 · 失败\/超时 1 · 最近工具 search_docs/)
+  assert.match(sessionsHtml, /最近桥接告警/)
+  assert.match(sessionsHtml, /恢复索引：2 个/)
+  assert.match(sessionsHtml, /已恢复（方式未上报）/)
+  assert.match(sessionsHtml, /标题：修复鉴权缓存逻辑/)
+  assert.match(sessionsHtml, /role="progressbar"/)
+  assert.match(sessionsHtml, /--dsw-alias-/)
+  assert.doesNotMatch(sessionsHtml, /#18181b/)
+  assert.doesNotMatch(sessionsHtml, /<fieldset[^>]*aria-label="桥接配置"/)
+
+  // Config tab: renders model select, MCP presets, switches, collapsible advanced settings, sticky actions, and does NOT mount sessions list
+  const configHtml = renderToStaticMarkup(
+    React.createElement(SettingsView, { status: snap, stream: 'live', failed: false, initialPanel: 'config', applyStatus: () => {} }),
+  )
+  assert.match(configHtml, /<select/)
+  assert.match(configHtml, /Gemini 4 Neon \(gemini-4-neon\)/)
+  assert.match(configHtml, /legacy-custom-model（当前已存，不在目录中）/)
+  assert.match(configHtml, /省 Token 平衡（推荐）/)
+  assert.match(configHtml, /深度 DSH 接管/)
+  assert.match(configHtml, /最小补充/)
+  assert.match(configHtml, /role="switch"/)
+  assert.match(configHtml, /高级与环境设置/)
+  assert.match(configHtml, /空闲会话回收/)
+  assert.match(configHtml, /单次请求超时/)
+  assert.match(configHtml, /地域合规防护（防封号拦截）/)
+  assert.match(configHtml, /拦截受限地区（推荐，默认）/)
+  assert.match(configHtml, /严格模式（受限与未知均拦截）/)
+  assert.match(configHtml, /配额感知多账号调度（Quota-Aware Scheduling）/)
+  assert.match(configHtml, /恢复默认/)
+  assert.doesNotMatch(configHtml, /标题：修复鉴权缓存逻辑/)
+
+  // Accounts tab: renders account cards and global check-all-egress button
+  const accountsHtml = renderToStaticMarkup(
+    React.createElement(SettingsView, { status: snap, stream: 'live', failed: false, initialPanel: 'accounts', applyStatus: () => {} }),
+  )
+  assert.match(accountsHtml, /账号状态 \(1\)/)
+  assert.match(accountsHtml, /检测全部出口/)
+  assert.doesNotMatch(accountsHtml, /<fieldset[^>]*aria-label="桥接配置"/)
+
+  // Theme tokens fix dark-mode primary button foreground & drop backdropFilter lag
+  assert.match(theme.textOnPrimary, /--dsw-alias-label-primary-foreground/)
+  assert.equal('backdropFilter' in styles.modalOverlay, false)
 })
 
 test('AccountCard renders supported, unsupported, error, and unchecked egress states and posts egress/check action safely', async () => {
@@ -519,11 +545,14 @@ test('panel navigation surfaces only enabled-account alerts; empty states point 
   assert.match(flagged, /aria-pressed="true"[^>]*>桥接配置/)
   assert.match(flagged, /会话与用量 · 1（桥接告警）/)
   snap.accounts = []; snap.models = []; snap.sessions = []; snap.persistedSessions = 0
-  const empty = panelMarkup(snap)
-  assert.doesNotMatch(empty, /重置全部会话|个快照告警/)
-  assert.match(empty, /模型目录为空。可点击「刷新模型目录」探测/)
-  assert.match(empty, /尚未收到账号状态。请检查账号配置/)
-  assert.match(empty, /选择 Antigravity \(ACP\) 模型并发送消息/)
+  const emptySessions = panelMarkup(snap, 'live', 'sessions')
+  assert.doesNotMatch(emptySessions, /重置全部会话|个快照告警/)
+  assert.match(emptySessions, /选择 Antigravity \(ACP\) 模型并发送消息/)
+  const emptyConfig = panelMarkup(snap, 'live', 'config')
+  assert.match(emptyConfig, /模型目录为空。可点击「刷新模型目录」探测/)
+  const emptyAccounts = panelMarkup(snap, 'live', 'accounts')
+  assert.match(emptyAccounts, /尚未收到账号状态。请检查账号配置/)
+  assert.doesNotMatch(emptyAccounts, /检测全部出口/)
 })
 
 test('restricted egress reflects warn/off policy rather than claiming every request is blocked', () => {
@@ -562,14 +591,43 @@ test('session actions scope the request and only acknowledge a validated host re
 })
 
 
-test('the configuration fieldset locks all edits for both pending writes', () => {
-  const html = panelMarkup(panelFixture(), 'live', 'config')
+test('the configuration fieldset locks all edits for both pending writes and lazily mounts per-tool override rows', () => {
+  const snap = panelFixture()
+  snap.mcpToolCatalog = {
+    tools: [
+      {
+        name: 'mnemon_runtime_memory',
+        groupId: 'memory_core',
+        kind: 'supplement',
+        description: 'Hot memory',
+        estimatedBytes: 1200,
+        effectiveMode: 'eager',
+        replacedNative: false,
+        overridden: false,
+      },
+    ],
+    eagerCount: 1,
+    lazyCount: 0,
+    offCount: 0,
+    estimatedEagerBytes: 1200,
+    budgetBytes: 52_000,
+    willCompact: false,
+    source: 'live',
+  }
+  const html = panelMarkup(snap, 'live', 'config')
   const form = html.match(/<fieldset[^>]*aria-label="桥接配置"[^>]*>([\s\S]*?)<\/fieldset>/)?.[1]
   assert.ok(form, 'the native group wraps the actual editable fields')
-  assert.equal((form.match(/<(?:input|select)\b/g) ?? []).length, 25)
-  assert.equal((html.match(/<(?:input|select)\b/g) ?? []).length, 25)
-  assert.match(form, /aria-label="补充能力分组 Mnemon 核心记忆与文档"/)
-  assert.match(form, /aria-label="替代能力分组 联网搜索"/)
+  const formControls = (form.match(/<(?:input|select)\b/g) ?? []).length
+  const totalControls = (html.match(/<(?:input|select)\b/g) ?? []).length
+  assert.ok(formControls > 0)
+  assert.equal(formControls, totalControls, 'every editable input/select must live inside the locked fieldset')
+  // Per-tool override list starts collapsed -> tool select & search box are NOT mounted in initial DOM
+  assert.match(form, /aria-expanded="false"[^>]*>[\s\S]*高级：逐工具精细覆写/)
+  assert.doesNotMatch(form, /aria-label="筛选宿主工具"/)
+  assert.doesNotMatch(form, /aria-label="工具 mnemon_runtime_memory 暴露模式"/)
+  // Group controls use accessible segmented radiogroups
+  assert.match(form, /role="radiogroup"[^>]*aria-label="补充能力分组 Mnemon 核心记忆与文档"/)
+  assert.match(form, /role="radiogroup"[^>]*aria-label="替代能力分组 联网搜索"/)
   assert.match(form, /aria-label="自动审查 Provider"/)
   assert.match(form, /aria-label="自动审查模型"/)
   assert.match(form, /aria-label="自动审查推理强度"/)
@@ -578,4 +636,24 @@ test('the configuration fieldset locks all edits for both pending writes', () =>
     if (operation === 'save' || operation === 'resetConfig') assert.match(group, /<fieldset[^>]*disabled=""[^>]*aria-busy="true"/)
     else assert.doesNotMatch(group, /<fieldset[^>]*disabled/)
   }
+})
+
+test('requestAllAccountsEgressCheck posts empty JSON body and validates returned snapshot', async () => {
+  const calls: unknown[] = []
+  const status = { accounts: [account], updatedAt: now }
+  const res = await requestAllAccountsEgressCheck(async (url, init) => {
+    calls.push([url, init?.method, JSON.parse(String(init?.body))])
+    return Response.json({ status })
+  })
+  assert.deepEqual(calls, [['/plugins/agy-acp/accounts/egress/check', 'POST', {}]])
+  assert.deepEqual(res, status)
+
+  await assert.rejects(
+    requestAllAccountsEgressCheck(async () => Response.json({ error: 'raw-secret' }, { status: 409 })),
+    { message: 'ACP 插件当前未启用，无法执行出口检测。' },
+  )
+  await assert.rejects(
+    requestAllAccountsEgressCheck(async () => Response.json({ error: 'raw-secret' }, { status: 500 })),
+    { message: '全部出口检测失败，请稍后重试。' },
+  )
 })

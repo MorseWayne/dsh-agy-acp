@@ -156,3 +156,21 @@ export async function requestAccountAction(
   } catch { /* use the same safe failure for network and malformed replies */ }
   throw new Error(failure)
 }
+
+export async function requestAllAccountsEgressCheck(request = fetch): Promise<StatusSnapshot> {
+  let failure = '全部出口检测失败，请稍后重试。'
+  try {
+    const response = await request('/plugins/agy-acp/accounts/egress/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+    if (response.ok) {
+      const { status } = await response.json() as { status?: StatusSnapshot }
+      if (status && Number.isFinite(status.updatedAt) && Array.isArray(status.accounts)) return status
+    } else {
+      failure = egressFailureByStatus[response.status] ?? failure
+    }
+  } catch { /* keep locally authored safe failure message */ }
+  throw new Error(failure)
+}

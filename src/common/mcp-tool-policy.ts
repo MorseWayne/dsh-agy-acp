@@ -554,6 +554,95 @@ export function estimateToolSchemaBytes(
   return Buffer.byteLength(JSON.stringify(normalized), 'utf8') + perToolOverhead
 }
 
+export function equalEffectiveMcpToolPolicy(a: EffectiveMcpToolPolicy, b: EffectiveMcpToolPolicy): boolean {
+  for (const g of SUPPLEMENT_GROUPS) {
+    if (a.groups[g.id] !== b.groups[g.id]) return false
+  }
+  for (const g of REPLACE_GROUPS) {
+    if (a.replace[g.id] !== b.replace[g.id]) return false
+  }
+  const aKeys = Object.keys(a.overrides)
+  const bKeys = Object.keys(b.overrides)
+  if (aKeys.length !== bKeys.length) return false
+  for (const k of aKeys) {
+    if (a.overrides[k] !== b.overrides[k]) return false
+  }
+  return true
+}
+
+export type McpToolPolicyPresetId = 'balanced' | 'dsh_first' | 'minimal'
+
+export interface McpToolPolicyPreset {
+  readonly id: McpToolPolicyPresetId
+  readonly label: string
+  readonly description: string
+  readonly policy: McpToolPolicyConfig
+}
+
+export const MCP_TOOL_POLICY_PRESETS: readonly McpToolPolicyPreset[] = [
+  {
+    id: 'balanced',
+    label: '省 Token 平衡（推荐）',
+    description: '核心记忆、交付与子代理直出，低频扩展按需发现，基础文件/终端保留 agy 原生',
+    policy: {},
+  },
+  {
+    id: 'dsh_first',
+    label: '深度 DSH 接管',
+    description: '子代理、联网搜索与任务计划均由 DSH 替代，文档/目标/工作流直出，文件与终端按需并存',
+    policy: {
+      groups: {
+        memory_core: 'eager',
+        delivery_skills: 'eager',
+        documents_office: 'eager',
+        goals_teams_workflow: 'eager',
+        memory_admin: 'lazy',
+        media_system: 'lazy',
+        other_plugins: 'lazy',
+      },
+      replace: {
+        subagents: 'replace',
+        web_search: 'replace',
+        planning_schedule: 'replace',
+        file_ops: 'lazy',
+        shell_jobs: 'lazy',
+      },
+    },
+  },
+  {
+    id: 'minimal',
+    label: '最小补充',
+    description: '仅常驻记忆与交付核心，全部原生重叠能力保留 agy 原生，最大化省上下文',
+    policy: {
+      groups: {
+        memory_core: 'eager',
+        delivery_skills: 'eager',
+        documents_office: 'lazy',
+        goals_teams_workflow: 'lazy',
+        memory_admin: 'lazy',
+        media_system: 'lazy',
+        other_plugins: 'lazy',
+      },
+      replace: {
+        subagents: 'native',
+        web_search: 'native',
+        file_ops: 'native',
+        shell_jobs: 'native',
+        planning_schedule: 'native',
+      },
+    },
+  },
+] as const
+
+export function matchMcpPolicyPreset(policy: EffectiveMcpToolPolicy): McpToolPolicyPresetId | null {
+  for (const preset of MCP_TOOL_POLICY_PRESETS) {
+    if (equalEffectiveMcpToolPolicy(policy, resolveEffectiveMcpToolPolicy(preset.policy))) {
+      return preset.id
+    }
+  }
+  return null
+}
+
 export function firstLineSummary(text: string | undefined, maxChars = 96): string {
   if (!text) return ''
   const compact = text.replace(/\s+/g, ' ').trim()

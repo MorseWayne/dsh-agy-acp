@@ -130,7 +130,24 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     }
   }
 
+  let cachedMcpToolCatalog: McpToolCatalogSnapshot | null = null
+  let cachedMcpToolCatalogPolicyKey = ''
+
+  function invalidateMcpToolCatalog(): void {
+    cachedMcpToolCatalog = null
+    cachedMcpToolCatalogPolicyKey = ''
+  }
+
   function collectMcpToolCatalog(): McpToolCatalogSnapshot {
+    const policyKey = `${cfg.mcpExposeOverlappingTools ? '1' : '0'}:${JSON.stringify(cfg.mcpToolPolicy ?? null)}`
+    if (
+      cachedMcpToolCatalog &&
+      cachedMcpToolCatalogPolicyKey === policyKey &&
+      (cachedMcpToolCatalog.source === 'live' || bridges.size === 0)
+    ) {
+      return cachedMcpToolCatalog
+    }
+
     const rawSchemas: Array<{ name: string; description?: string; parameters?: Record<string, unknown> }> = []
     if (bridgeTools?.schemas) {
       try {
@@ -191,7 +208,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       estimatedEagerBytes += META_GATEWAY_ESTIMATED_BYTES
     }
     entries.sort((a, b) => a.name.localeCompare(b.name))
-    return {
+    const snapshot: McpToolCatalogSnapshot = {
       tools: entries,
       eagerCount,
       lazyCount,
@@ -201,6 +218,9 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       willCompact: estimatedEagerBytes > DEFAULT_MAX_EAGER_SCHEMA_BYTES,
       source: entries.length > 0 ? 'live' : 'empty',
     }
+    cachedMcpToolCatalog = snapshot
+    cachedMcpToolCatalogPolicyKey = policyKey
+    return snapshot
   }
 
   const slotManager = cfg.credentialSlotDir
@@ -419,9 +439,11 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     )
 
     bridgeTools = tools
+    invalidateMcpToolCatalog()
     const unlistenChange = sub.on(
       'tools/change' as never,
       (() => {
+        invalidateMcpToolCatalog()
         pool.notifyStatusChange()
       }) as never,
       { global: true },
@@ -429,6 +451,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     pool.notifyStatusChange()
     return () => {
       bridgeTools = undefined
+      invalidateMcpToolCatalog()
       for (const key of bridges.keys()) releaseBridge(key)
       if (typeof unlistenChange === 'function') unlistenChange()
       if (typeof unlisten === 'function') unlisten()

@@ -1,6 +1,7 @@
 import { fakeHost } from './fixtures/session-policy.ts'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { createInterface } from 'node:readline'
@@ -580,5 +581,60 @@ test('AcpClient slices stderr per-turn so prior-turn noise never leaks into subs
     )
   } finally {
     client.dispose()
+  }
+})
+
+test('SSE routes attach pool status listener lazily and coalesce burst broadcasts within throttle window', () => {
+  let getStatusCalls = 0
+  const pool = new AcpSessionPool({
+    ...fakeHost,
+    getConfig: () => resolveConfig({}),
+    resolveBin: () => null,
+    getMcpToolCatalog: () => {
+      getStatusCalls++
+      return undefined
+    },
+  })
+
+  const routes = new Map<string, (req: IncomingMessage, res: ServerResponse) => void | Promise<void>>()
+  const webServer: WebServerLike = {
+    route(method, routePath, handler) {
+      routes.set(`${method} ${routePath}`, handler)
+      return () => routes.delete(`${method} ${routePath}`)
+    },
+  }
+
+  const disposeRoutes = registerAcpRoutes(webServer, pool, { sseThrottleMs: 1_000 })
+  try {
+    // 1. With zero SSE clients connected, pool has zero status listeners and notifyStatusChange skips getStatus()
+    assert.equal(pool.listenerCount('status'), 0)
+    pool.notifyStatusChange()
+    assert.equal(getStatusCalls, 0)
+
+    // 2. Connect an SSE client -> initial snapshot sent + listener attached
+    const req = new EventEmitter() as IncomingMessage
+    const chunks: string[] = []
+    const res = {
+      writeHead() { return this },
+      write(chunk: string) { chunks.push(chunk); return true },
+      end() { return this },
+    } as unknown as ServerResponse
+
+    const handler = routes.get('GET /plugins/agy-acp/events')
+    assert.ok(handler)
+    void handler(req, res)
+    assert.equal(pool.listenerCount('status'), 1)
+    assert.equal(chunks.length, 1)
+
+    // 3. Burst of 5 status notifications within throttle window sends only the leading frame immediately
+    for (let i = 0; i < 5; i++) pool.notifyStatusChange()
+    assert.equal(chunks.length, 2)
+
+    // 4. Closing SSE client detaches listener and cancels pending coalesced broadcast
+    req.emit('close')
+    assert.equal(pool.listenerCount('status'), 0)
+  } finally {
+    disposeRoutes()
+    pool.dispose()
   }
 })
