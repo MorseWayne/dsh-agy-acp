@@ -36,7 +36,7 @@ import { hostPermissions, type QuestionService, type SessionAgent } from './runt
 import { SessionPolicyChangedError } from './runtime/permission-manager.ts'
 import { SessionIndex } from './runtime/session-index.ts'
 import { AcpSessionPool } from './runtime/session-pool.ts'
-import { registerAcpRoutes, type WebServerLike } from './transport/sse.ts'
+import { registerAcpRoutes, type ConnectionLike, type WebServerLike } from './transport/sse.ts'
 
 export const name = '@morsewayne/dsh-agy-acp'
 export const inject = ['llm', 'commands', 'agents', 'permissionPresets', 'approval', 'sandboxPolicy', 'sandbox']
@@ -500,11 +500,13 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     },
   })
 
-  // 4. Register HTTP + SSE endpoints for browser client
-  ctx.inject(['webServer'], (sub) => {
+  // 4. Register HTTP + SSE endpoints for browser client behind DSH connection trust & auth fence
+  ctx.inject(['webServer', 'connection'], (sub) => {
     const webServer = sub.get('webServer') as WebServerLike | undefined
-    if (!webServer) return
+    const connection = sub.get('connection') as ConnectionLike | undefined
+    if (!webServer || !connection || typeof connection.requestRejection !== 'function') return
     return registerAcpRoutes(webServer, pool, {
+      connection,
       listReviewModels: async (provider: string) => {
         const providers = listReviewProviders()
         if (!providers.some(p => p.id === provider)) return null

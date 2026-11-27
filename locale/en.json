@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Antigravity ACP bridge",
+    "description": "Connects Google Antigravity CLI (agy acp) to DSH over persistent low-latency sessions with session/resume & session/load recovery, accurate cache-hit metering, native chat tool cards (Read/Diff/Terminal), a tiered on-demand reverse MCP gateway with presets and schema budget guards, cross-provider auto-review routing, anonymous Google egress geo-fencing, multi-account 5h/7d quota scheduling with TOS quarantine, /agy-acp doctor, and a native-themed web console."
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Antigravity ACP 桥接",
+    "description": "将 Google Antigravity CLI（agy acp）以零冷启动长连接接入 DSH：支持 session/resume 与 session/load 三级会话恢复与精准缓存计量、聊天气泡原生工具卡片（Read/Diff/终端）、按需加载的分级反向 MCP 网关（含预设与预算控制）、跨模型自动审查转发、纯匿名出口合规熔断、多账号 5h/7d 配额调度与 TOS 隔离，以及原生风格控制台与 /agy-acp doctor 自检。"
+  }
+}

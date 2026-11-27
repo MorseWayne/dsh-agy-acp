@@ -9,7 +9,14 @@ export interface ReviewModelChoice {
   name: string
 }
 
+export interface ConnectionLike {
+  /** DSH browser-trust & authentication fence (Host/Origin + login cookie). */
+  requestRejection(request: { readonly headers: IncomingMessage['headers'] }): 401 | 403 | undefined
+}
+
 export interface AcpRoutesOptions {
+  /** DSH host connection service guarding every HTTP/SSE route. */
+  connection?: ConnectionLike
   listReviewModels?: (provider: string) => Promise<ReviewModelChoice[] | null>
   /** Coalesce bursty SSE status broadcasts within this window (ms). Defaults to 180ms; 0 disables throttling. */
   sseThrottleMs?: number
@@ -39,7 +46,10 @@ class HttpInputError extends Error {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+  })
   res.end(JSON.stringify(body))
 }
 
@@ -184,28 +194,39 @@ export function registerAcpRoutes(
     }
   }
 
+  const checkAccess = (req: IncomingMessage, res: ServerResponse): boolean => {
+    const rejection = opts?.connection?.requestRejection(req)
+    if (rejection === undefined) return true
+    sendJson(res, rejection, {
+      error: rejection === 401 ? '未通过 DSH 访问认证' : '拒绝非同源或不受信任的请求',
+    })
+    return false
+  }
+
   const addRoute = (
     method: string,
     path: string,
     handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>,
   ): void => {
+    const guarded = (req: IncomingMessage, res: ServerResponse): void | Promise<void> => {
+      if (!checkAccess(req, res)) return
+      if ((req.method ?? 'GET').toUpperCase() !== method.toUpperCase()) {
+        sendJson(res, 405, { error: `Method ${req.method ?? 'UNKNOWN'} not allowed` })
+        return
+      }
+      return handler(req, res)
+    }
     if (typeof webServer.register === 'function') {
       const d = webServer.register({
         kind: 'exact',
         path,
-        handler: (req, res) => {
-          if ((req.method ?? 'GET').toUpperCase() !== method.toUpperCase()) {
-            sendJson(res, 405, { error: `Method ${req.method ?? 'UNKNOWN'} not allowed` })
-            return
-          }
-          return handler(req, res)
-        },
+        handler: guarded,
       })
       if (typeof d === 'function') disposers.push(d)
       return
     }
     if (typeof webServer.route === 'function') {
-      const d = webServer.route(method, path, handler)
+      const d = webServer.route(method, path, guarded)
       if (typeof d === 'function') disposers.push(d)
     }
   }
@@ -273,6 +294,7 @@ export function registerAcpRoutes(
   })
 
   addRoute('POST', '/plugins/agy-acp/config', async (req, res) => {
+    if (!requireJsonContentType(req, res)) return
     let body: Record<string, unknown>
     try {
       body = await readJsonBody(req)
@@ -340,6 +362,7 @@ export function registerAcpRoutes(
   })
 
   addRoute('POST', '/plugins/agy-acp/sessions/reset', async (req, res) => {
+    if (!requireJsonContentType(req, res)) return
     try {
       const body = await readJsonBody(req)
       const sessionKey = typeof body.sessionKey === 'string' && body.sessionKey ? body.sessionKey : undefined
@@ -409,6 +432,7 @@ export function registerAcpRoutes(
   })
 
   addRoute('POST', '/plugins/agy-acp/accounts/cooldown/clear', async (req, res) => {
+    if (!requireJsonContentType(req, res)) return
     try {
       const body = await readJsonBody(req)
       const accountId = typeof body.accountId === 'string' && body.accountId ? body.accountId : undefined

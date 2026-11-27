@@ -2,6 +2,15 @@
 
 All notable changes to `@morsewayne/dsh-agy-acp` are documented in this file.
 
+## [0.8.4] - 2026-11-27
+
+### Security
+- **DSH HTTP/SSE Access Enforcement**: Bound `/plugins/agy-acp/*` route registration in `src/index.ts` to DSH's `connection` service (`ctx.inject(['webServer', 'connection'], ...)`) and enforced `connection.requestRejection(req)` (Host/Origin trust fence + browser session cookie authentication) at the entry of every GET, SSE, and POST route in `src/transport/sse.ts`.
+- **Strict JSON POST & `no-store` Headers**: Unified `application/json` `Content-Type` enforcement across all 7 `POST` control endpoints (including `/config`, `/sessions/reset`, and `/accounts/cooldown/clear`) and added `Cache-Control: no-store` on all JSON responses.
+
+### Added
+- **Plugin Storefront & DSH Metadata Assets**: Added DSH-compliant vector plugin icon (`icon.svg`), storefront PNG icon (`docs/images/icon-256.png`), repository-declared `screenshots.json`, localized DSH plugin metadata (`locale/en.json`, `locale/zh.json`), updated `package.json` description/exports, and bilingual documentation (`README.md` in English + `README.zh.md` in Chinese).
+
 ## [0.8.3] - 2026-11-27
 
 ### Fixed
