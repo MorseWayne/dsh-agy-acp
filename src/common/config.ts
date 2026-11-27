@@ -1,3 +1,4 @@
+import { validateModelAccountRoutingInput } from './account-routing.ts'
 import { isGeoFenceMode } from './geo.ts'
 import { compactMcpToolPolicy, validateMcpToolPolicyInput } from './mcp-tool-policy.ts'
 import { PROVIDER_ID, type AccountProfileConfig, type PersistedConfigPatch, type PluginConfig } from './types.ts'
@@ -18,6 +19,7 @@ const ALLOWED_PERSIST_KEYS = new Set<keyof PersistedConfigPatch>([
   'mcpExposeOverlappingTools',
   'mcpToolPolicy',
   'quotaAwareScheduling',
+  'modelAccountRouting',
   'defaultModel',
   'defaultEffort',
   'autoReviewProvider',
@@ -153,6 +155,12 @@ export function validateConfigPatchInput(
       }
       patch.geoFenceMode = val
       count++
+    } else if (key === 'modelAccountRouting') {
+      const parsed = validateModelAccountRoutingInput(val)
+      if (!parsed.ok) return parsed
+      // Keep {} in the patch: it replaces persisted rules and masks host rules until reset.
+      patch.modelAccountRouting = parsed.value
+      count++
     } else if (key === 'mcpToolPolicy') {
       const parsed = validateMcpToolPolicyInput(val)
       if (!parsed.ok) return parsed
@@ -193,6 +201,8 @@ export function resolveConfig(raw: Record<string, unknown> = {}): PluginConfig {
   const rawGeoMode = typeof raw.geoFenceMode === 'string' ? raw.geoFenceMode.trim() : ''
   const rawReviewProvider = typeof raw.autoReviewProvider === 'string' ? raw.autoReviewProvider.trim() : ''
   const rawReviewEffort = typeof raw.autoReviewEffort === 'string' ? raw.autoReviewEffort.trim() : ''
+  const parsedRouting = validateModelAccountRoutingInput(raw.modelAccountRouting)
+  const modelAccountRouting = parsedRouting.ok ? parsedRouting.value : undefined
   const parsedPolicy = raw.mcpToolPolicy !== undefined ? validateMcpToolPolicyInput(raw.mcpToolPolicy) : null
   const mcpToolPolicy = parsedPolicy?.ok ? compactMcpToolPolicy(parsedPolicy.value) : undefined
   return {
@@ -209,6 +219,7 @@ export function resolveConfig(raw: Record<string, unknown> = {}): PluginConfig {
     mcpBridge: parseBool(raw.mcpBridge, false),
     mcpExposeOverlappingTools: parseBool(raw.mcpExposeOverlappingTools, false),
     ...(mcpToolPolicy ? { mcpToolPolicy } : {}),
+    ...(modelAccountRouting?.families || modelAccountRouting?.models ? { modelAccountRouting } : {}),
     quotaAwareScheduling: parseBool(raw.quotaAwareScheduling, false),
     geoFenceMode: isGeoFenceMode(rawGeoMode) ? rawGeoMode : 'block',
     accounts: parseAccounts(raw.accounts),

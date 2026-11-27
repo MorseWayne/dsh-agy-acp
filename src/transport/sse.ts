@@ -132,6 +132,7 @@ function readJsonBody(req: IncomingMessage, maxBytes = 64 * 1024): Promise<Recor
  * - GET  /plugins/agy-acp/events              (Server-Sent Events push on state changes)
  * - POST /plugins/agy-acp/config              (validate & persist safe runtime overrides)
  * - POST /plugins/agy-acp/config/reset        (clear persisted overrides back to host defaults)
+ * - POST /plugins/agy-acp/usage/reset         (clear all usage counters and historical labels)
  * - POST /plugins/agy-acp/models/refresh      (force-refresh ACP model catalog)
  * - POST /plugins/agy-acp/sessions/reset      (close one or all active ACP sessions)
  * - POST /plugins/agy-acp/accounts/quota/refresh
@@ -359,6 +360,22 @@ export function registerAcpRoutes(
       sendJson(res, 200, { ok: true, status: pool.getStatus() })
     } catch {
       sendJson(res, 500, { error: '重置配置失败，请重试' })
+    }
+  })
+
+  addRoute('POST', '/plugins/agy-acp/usage/reset', async (req, res) => {
+    if (!requireJsonContentType(req, res)) return
+    try {
+      await readJsonBody(req)
+    } catch (err) {
+      sendJson(res, err instanceof HttpInputError ? err.status : 400, { error: '无效的 JSON 请求' })
+      return
+    }
+    try {
+      pool.resetUsageStats()
+      sendJson(res, 200, { ok: true, status: pool.getStatus() })
+    } catch {
+      sendJson(res, 500, { error: '清空用量统计失败，请重试' })
     }
   })
 

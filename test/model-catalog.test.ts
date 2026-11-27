@@ -4,12 +4,15 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm/brand'
 import type { AcpClient } from '../src/acp/client.ts'
 import type { AcpConfigOption, SessionNewResult } from '../src/acp/protocol.ts'
 import { resolveConfig } from '../src/common/config.ts'
 import { PROVIDER_ID } from '../src/common/types.ts'
 import { AcpAdapter } from '../src/provider/adapter.ts'
 import { AcpRunStore } from '../src/provider/run-store.ts'
+import { MultiAccountPool } from '../src/runtime/account-pool.ts'
 import { mergeModelCatalog, modelCatalog, type ModelCatalog } from '../src/runtime/model-catalog.ts'
 import { policyKey } from '../src/runtime/permission-manager.ts'
 import { SessionIndex } from '../src/runtime/session-index.ts'
@@ -201,4 +204,112 @@ test('syncSessionOptions publishes thought levels learned only after selecting a
   assert.equal(reasoning?.defaultEffort, 'low')
   assert.equal(updates, 1)
   assert.equal(probeLaunches.length, 0)
+})
+
+test('prepared calls probe the strict target and never apply another account’s levels on dispatch', async t => {
+  const first = setup()
+  const second = setup()
+  second.sessionId = 'account-two-session'
+  second.configOptions![1] = selector('thinking', 'thought_level', 'low', ['low'])
+  second.models!.availableModels = second.models!.availableModels.filter(m => !m.modelId.startsWith(`${neon}-`) || m.modelId === `${neon}-low`)
+  const cfg = resolveConfig({ accounts: [first, second].map((full, i) => ({
+    id: `account-${i + 1}`, env: { FAKE_CATALOG_PEER_SETUP: JSON.stringify({ full }) },
+  })) })
+  const accounts = new MultiAccountPool({ accounts: cfg.accounts, preferredAccountId: 'account-1' })
+  let probeCount = 0
+  const pool = new AcpSessionPool({
+    ...fakeHost, accountProvider: accounts, getConfig: () => cfg, resolveBin: () => process.execPath,
+    async prepareArgv(_argv, policy) {
+      if (policy.sessionId === '__catalog__') {
+        probeCount++
+        assert.equal(policy.mode, 'read-only')
+      }
+      return [process.execPath, fileURLToPath(new URL('./fixtures/catalog-peer.mjs', import.meta.url))]
+    },
+  })
+  t.after(() => pool.dispose())
+  const adapter = new AcpAdapter({ getConfig: () => cfg, pool, runs: new AcpRunStore() })
+  const current = await pool.getOrCreateSession('first', process.cwd(), neon)
+  assert.equal(current.session.accountId, 'account-1')
+  assert.ok(current.session.models.find(m => m.value === neon)?.efforts.includes('high'))
+
+  accounts.setModelRouting({ models: { [neon]: { accountId: 'account-2', fallback: 'strict' } } })
+  const strict = await adapter.prepareCall(PROVIDER_ID, neon)
+  assert.deepEqual(strict.model.reasoning?.efforts.map(e => e.id), ['low'])
+  assert.equal(probeCount, 1, 'must not reuse catalog metadata from account-1')
+
+  accounts.setModelRouting({ models: { [neon]: { accountId: 'account-2' } } })
+  await pool.forceRefreshModels() // The menu discovers with account-1. The model route selects account-2.
+  const automatic = await adapter.prepareCall(PROVIDER_ID, neon)
+  assert.ok(automatic.model.reasoning?.efforts.some(e => e.id === 'high'), 'provisional menu evidence')
+  assert.equal(automatic.model.context, undefined)
+  await assert.rejects(async () => {
+    for await (const _ of automatic.stream({ provider: PROVIDER_ID, model: neon, sessionId: 'actual',
+      reasoningEffort: ReasoningEffortId('high'), messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    } as GenerateOptions)) { /* No prompt can be sent with unsupported high. */ }
+  }, /did not select reasoning effort high/)
+  assert.equal(pool.getStatus().sessions.find(s => s.dshSessionKey === 'actual')?.accountId, 'account-2')
+  assert.equal(probeCount, 2, 'do not fan out to unrelated accounts')
+})
+
+test('strict account discovery and sessions leave the public model menu unchanged', async t => {
+  const home = mkdtempSync(join(tmpdir(), 'acp-account-catalog-'))
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  const modelsA = [neon, carbon, 'gemini-4-hydrogen']
+  const modelsB = [neon]
+  const profile = (id: string, models: string[], efforts: string[]) => {
+    const full: SessionNewResult = {
+      sessionId: `${id}-session`,
+      configOptions: [selector('engine', 'model', neon, models), selector('thinking', 'thought_level', efforts[0]!, efforts)],
+      models: { currentModelId: neon, availableModels: models.map(modelId => ({ modelId, name: modelId })) },
+    }
+    return { id, homeDir: join(home, id), env: { FAKE_CATALOG_PEER_SETUP: JSON.stringify({ full }) } }
+  }
+  const cfg = resolveConfig({
+    workspaceRoot: home,
+    accounts: [profile('a', modelsA, ['medium', 'high']), profile('b', modelsB, ['low'])],
+    modelAccountRouting: { models: { [neon]: { accountId: 'b', fallback: 'strict' } } },
+  })
+  const accounts = new MultiAccountPool({ accounts: cfg.accounts, preferredAccountId: 'a', modelRouting: cfg.modelAccountRouting })
+  const pool = new AcpSessionPool({
+    ...fakeHost, accountProvider: accounts, getConfig: () => cfg, resolveBin: () => process.execPath,
+    readPolicy: key => ({ ...fakeHost.readPolicy(key), workspaceRoot: home }),
+    prepareArgv: async () => [process.execPath, fileURLToPath(new URL('./fixtures/catalog-peer.mjs', import.meta.url))],
+  })
+  t.after(() => pool.dispose())
+  const adapter = new AcpAdapter({ getConfig: () => cfg, pool, runs: new AcpRunStore() })
+  const statusIds = () => pool.getStatus().models.map(m => m.value)
+  const menuIds = async () => (await adapter.listModels(PROVIDER_ID)).map(m => m.id)
+  const menuUpdates: string[][] = []
+  pool.on('models-updated', () => menuUpdates.push(statusIds()))
+  assert.deepEqual(await menuIds(), modelsA)
+  const original = structuredClone(pool.getStatus().models)
+  assert.deepEqual(original.map(m => m.value), modelsA)
+  assert.deepEqual(original.find(m => m.value === neon)?.efforts, ['medium', 'high'])
+
+  const statusUpdates: (typeof original)[] = []
+  pool.on('status', (status: ReturnType<AcpSessionPool['getStatus']>) => statusUpdates.push(structuredClone(status.models)))
+  const assertPublicMenuIsA = async () => {
+    assert.deepEqual(pool.getStatus().models, original)
+    assert.deepEqual(await menuIds(), modelsA)
+    assert.deepEqual(menuUpdates, [modelsA], 'only public discovery should publish a menu update')
+    for (const models of statusUpdates) assert.deepEqual(models, original)
+  }
+  const strict = await adapter.prepareCall(PROVIDER_ID, neon)
+  assert.deepEqual(strict.model.reasoning?.efforts.map(e => e.id), ['low'])
+  assert.equal(strict.model.reasoning?.defaultEffort, 'low')
+  await assertPublicMenuIsA()
+
+  const { session } = await pool.getOrCreateSession('strict-chat', home, neon)
+  assert.equal(session.accountId, 'b')
+  assert.deepEqual(session.models.map(m => m.value), modelsB)
+  assert.equal(session.currentEffort, 'low')
+  await assertPublicMenuIsA()
+
+  // Once B is selected for ordinary discovery, its identical catalog can replace A's menu.
+  pool.switchActiveAccount('b')
+  await pool.forceRefreshModels()
+  assert.deepEqual(await menuIds(), modelsB)
+  assert.deepEqual(statusIds(), modelsB)
+  assert.deepEqual(menuUpdates, [modelsA, modelsB])
 })

@@ -7,6 +7,16 @@ export const LOW_QUOTA_THRESHOLD = 0.15
 
 export type ModelFamily = 'gemini-pro' | 'gemini-flash' | 'claude' | 'gpt' | 'other'
 
+export type AccountRouteFallback = 'auto' | 'strict'
+export interface AccountRouteRule {
+  accountId: string
+  fallback?: AccountRouteFallback
+}
+export interface ModelAccountRoutingConfig {
+  families?: Partial<Record<ModelFamily, AccountRouteRule>>
+  models?: Record<string, AccountRouteRule>
+}
+
 export type AccountSource = 'default' | 'host' | 'managed'
 
 export type AccountAuthStatus = 'logged_in' | 'not_logged_in' | 'unknown'
@@ -166,6 +176,7 @@ export interface AccountLoginSessionSnapshot {
 }
 
 export interface PersistedConfigPatch {
+  modelAccountRouting?: ModelAccountRoutingConfig
   mcpBridge?: boolean
   mcpExposeOverlappingTools?: boolean
   mcpToolPolicy?: McpToolPolicyConfig
@@ -183,6 +194,7 @@ export interface PersistedConfigPatch {
 }
 
 export interface PluginConfig {
+  modelAccountRouting?: ModelAccountRoutingConfig
   enabled: boolean
   agyBin: string
   workspaceRoot: string
@@ -295,6 +307,34 @@ export interface UsageTotals {
   reasoningTokens: number
 }
 
+export interface UsageCounter extends UsageTotals {
+  requests: number
+  rateLimited: number
+  failed: number
+  /** Uncached input + cache reads + cache writes + output (not reasoning). */
+  totalTokens: number
+}
+
+export interface AccountUsageEntry {
+  accountId: string
+  accountLabel?: string
+  totals: UsageCounter
+  families: Partial<Record<ModelFamily, UsageCounter>>
+  lastUsedAt: number | null
+}
+
+export type AccountUsageWindowKey = 'today' | 'last7Days' | 'allTime'
+
+export interface AccountUsageWindowSnapshot {
+  totals: UsageCounter
+  accounts: AccountUsageEntry[]
+}
+
+export interface AccountUsageSnapshot extends Record<AccountUsageWindowKey, AccountUsageWindowSnapshot> {
+  retentionDays: number
+  updatedAt: number
+}
+
 export interface StatusSnapshot {
   providerId: string
   enabled: boolean
@@ -310,6 +350,7 @@ export interface StatusSnapshot {
   mcpBridge?: McpBridgeSnapshot
   mcpToolCatalog?: McpToolCatalogSnapshot
   usageTotals: UsageTotals
+  accountUsage?: AccountUsageSnapshot
   accounts: AccountHealthSnapshot[]
   preferredAccountId?: string | null
   models: AcpModelOption[]
@@ -317,6 +358,7 @@ export interface StatusSnapshot {
   environment?: EnvironmentSnapshot
   activeLogin?: AccountLoginSessionSnapshot | null
   config: {
+    modelAccountRouting?: ModelAccountRoutingConfig
     agyBin: string
     workspaceRoot: string
     defaultModel: string
@@ -355,6 +397,10 @@ export interface AccountFailureOptions {
 }
 
 export interface AccountProvider {
+  setModelRouting?(routing: ModelAccountRoutingConfig | undefined): void
+  getModelRouting?(): ModelAccountRoutingConfig | undefined
+  shouldSwitchSessionAccount?(currentAccountId: string, model: string, excludeAccountIds?: ReadonlySet<string>): boolean
+  isStrictModelRoute?(model: string): boolean
   setPreferredAccount?(accountId: string | null): void
   getPreferredAccountId?(): string | null
   acquire(sessionKey: string, model: string, excludeAccountIds?: ReadonlySet<string>): Promise<AccountLease>

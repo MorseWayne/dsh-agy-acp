@@ -3,6 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import React from 'react'
 // @ts-expect-error runtime ReactDOM is supplied by the DSH web host
 import ReactDOM from 'react-dom'
+import { equalModelAccountRouting } from '../common/account-routing.ts'
 import { effortLabel } from '../common/effort.ts'
 import {
   MIRROR_TOOL_NAME,
@@ -126,6 +127,7 @@ function sameConfig(a: StatusSnapshot['config'] | undefined, b: StatusSnapshot['
     a.autoReviewEffort === b.autoReviewEffort &&
     a.mcpBridge === b.mcpBridge &&
     a.mcpExposeOverlappingTools === b.mcpExposeOverlappingTools &&
+    equalModelAccountRouting(a.modelAccountRouting, b.modelAccountRouting) &&
     a.quotaAwareScheduling === b.quotaAwareScheduling &&
     a.sessionIdleTtlMs === b.sessionIdleTtlMs &&
     a.requestTimeoutMs === b.requestTimeoutMs &&
@@ -363,6 +365,11 @@ export function SettingsView({
       : panel === 'accounts'
         ? h(AccountsPanel, {
             accounts,
+            accountUsage: status.accountUsage,
+            models: stableModels,
+            modelAccountRouting: stableConfig?.modelAccountRouting,
+            refreshingModels,
+            onRefreshModels: handleRefreshModels,
             preferredAccountId: status.preferredAccountId,
             geoFenceMode: status.config?.geoFenceMode,
             agyFound: status.environment?.agyFound ?? true,

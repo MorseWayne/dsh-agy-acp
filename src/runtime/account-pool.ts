@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events'
 import path from 'node:path'
 import { lstatSync, realpathSync } from 'node:fs'
 import os from 'node:os'
+import { AUTO_ACCOUNT_ID, classifyModelFamily, compactModelAccountRouting, equalModelAccountRouting, resolveModelAccountRoute } from '../common/account-routing.ts'
 import { DEFAULT_ACCOUNT_ID, maskProxyUrlForDisplay } from '../common/account-validation.ts'
 import { isGeoUnsupportedError } from '../common/geo.ts'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
@@ -14,26 +15,13 @@ import type {
   AccountProvider,
   FamilyQuotaState,
   ModelFamily,
+  ModelAccountRoutingConfig,
   QuotaBucketState,
 } from '../common/types.ts'
 import { detectLinuxCaBundle } from './session-cleanup.ts'
 import type { CredentialSlotLeaseManager } from './credential-lease.ts'
 
-export function classifyModelFamily(model: string): ModelFamily {
-  const m = model.trim().toLowerCase()
-  if (!m) return 'other'
-  if (m.includes('claude') || m.includes('opus') || m.includes('sonnet') || m.includes('haiku')) {
-    return 'claude'
-  }
-  if (/(?:^|[^a-z])gpt(?:$|[^a-z])/.test(m)) return 'gpt'
-  if (m.includes('flash')) {
-    return 'gemini-flash'
-  }
-  if (m.includes('gemini') || m.includes('neon') || m.includes('carbon') || m.includes('hydrogen') || m.includes('pro')) {
-    return 'gemini-pro'
-  }
-  return 'other'
-}
+export { classifyModelFamily }
 
 const TOS_VIOLATION_PATTERNS: readonly RegExp[] = [
   /\btos[_ -]?violation\b/i,
@@ -134,6 +122,15 @@ export function mergeLoopbackNoProxy(existing: string | undefined): string {
   return out.join(',')
 }
 
+const BLOCK_REASON = {
+  missing: '账号不存在', disabled: '账号已停用', excluded: '本次请求已排除此账号', tos: 'TOS 风控隔离',
+  geo: '账号网络出口处于地域熔断期', cooldown: '模型大类处于冷却期', quota: '模型大类配额耗尽',
+} as const
+interface AccountBlock {
+  kind: keyof typeof BLOCK_REASON
+  until?: number
+}
+
 interface InternalAccountState {
   profile: AccountProfileConfig
   activeLeases: number
@@ -146,9 +143,10 @@ interface InternalAccountState {
 }
 
 export interface MultiAccountPoolOptions {
+  modelRouting?: ModelAccountRoutingConfig
   preferredAccountId?: string | null
   accounts: AccountProfileConfig[]
-  slotManager?: CredentialSlotLeaseManager
+  slotManager?: Pick<CredentialSlotLeaseManager, 'acquire'>
   baseCooldownMs?: number
   maxCooldownMs?: number
   now?: () => number
@@ -346,6 +344,7 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
   private readonly quotaRestrictions = new Map<string, string | undefined>()
   private readonly sessionSticky = new Map<string, string>()
   private preferredAccountId: string | null = null
+  private modelRouting?: ModelAccountRoutingConfig
   private readonly baseCooldownMs: number
   private readonly maxCooldownMs: number
   private readonly now: () => number
@@ -356,6 +355,7 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     this.maxCooldownMs = opts.maxCooldownMs ?? 15 * 60_000
     this.now = opts.now ?? (() => Date.now())
     this.preferredAccountId = opts.preferredAccountId ?? null
+    this.modelRouting = compactModelAccountRouting(opts.modelRouting)
     this.syncProfiles(opts.accounts, false)
   }
 
@@ -410,6 +410,32 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
   private isEnabled(accountId: string): boolean {
     const account = this.accounts.get(accountId)
     return Boolean(account && account.profile.enabled !== false)
+  }
+
+  setModelRouting(routing: ModelAccountRoutingConfig | undefined): void {
+    if (equalModelAccountRouting(this.modelRouting, routing)) return
+    this.modelRouting = compactModelAccountRouting(routing)
+    this.emit('change')
+  }
+
+  getModelRouting(): ModelAccountRoutingConfig | undefined {
+    return this.modelRouting && structuredClone(this.modelRouting)
+  }
+
+  isStrictModelRoute(model: string): boolean {
+    return resolveModelAccountRoute(this.modelRouting, model)?.rule.fallback === 'strict'
+  }
+
+  shouldSwitchSessionAccount(currentAccountId: string, model: string, exclude?: ReadonlySet<string>): boolean {
+    if (!model.trim()) return false
+    const rule = resolveModelAccountRoute(this.modelRouting, model)?.rule
+    const now = this.now()
+    const family = classifyModelFamily(model)
+    const healthy = (id: string) => !this.accountBlock(this.accounts.get(id), family, now, exclude)
+    if (rule?.accountId === AUTO_ACCOUNT_ID) return !healthy(currentAccountId)
+    const target = rule?.accountId ?? this.preferredAccountId
+    if (!target || target === currentAccountId) return false
+    return rule?.fallback === 'strict' || healthy(target) || (rule !== undefined && !healthy(currentAccountId))
   }
 
   getPreferredAccountId(): string | null {
@@ -510,6 +536,9 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     model: string,
     excludeAccountIds?: ReadonlySet<string>,
   ): Promise<AccountLease> {
+    const routing = this.modelRouting
+    const rule = resolveModelAccountRoute(routing, model)?.rule
+    const targetId = rule ? (rule.accountId === AUTO_ACCOUNT_ID ? null : rule.accountId) : this.preferredAccountId
     const family = classifyModelFamily(model)
     const now = this.now()
 
@@ -517,19 +546,17 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     let earliestReset = Number.POSITIVE_INFINITY
     let tosBlockedCount = 0
 
-    for (const acc of this.accounts.values()) {
-      if (acc.profile.enabled === false) continue
-      if (excludeAccountIds?.has(acc.profile.id)) continue
-      if (acc.tosBlockedAt !== undefined) {
-        tosBlockedCount += 1
-        continue
+    const strict = rule?.fallback === 'strict'
+    const profiles = strict ? [this.accounts.get(rule.accountId)] : this.accounts.values()
+    for (const acc of profiles) {
+      const block = this.accountBlock(acc, family, now, excludeAccountIds)
+      if (block) {
+        if (strict) throw new Error(`模型“${model}”已严格锁定到账号“${rule.accountId}”：${BLOCK_REASON[block.kind]}`)
+        if (block.kind === 'tos') tosBlockedCount++
+        if (block.until !== undefined) earliestReset = Math.min(earliestReset, block.until)
+      } else if (acc) {
+        candidates.push(acc)
       }
-      const blockedUntil = this.getBlockedUntil(acc, family, now)
-      if (blockedUntil !== null) {
-        if (blockedUntil < earliestReset) earliestReset = blockedUntil
-        continue
-      }
-      candidates.push(acc)
     }
 
     if (candidates.length === 0) {
@@ -546,7 +573,7 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
 
     // Neither an explicit preference nor stickiness can override the health/exclusion filter.
     const stickyId = this.sessionSticky.get(sessionKey)
-    let chosen = candidates.find(c => c.profile.id === this.preferredAccountId)
+    let chosen = candidates.find(c => c.profile.id === targetId)
       ?? candidates.find(c => c.profile.id === stickyId)
 
     if (!chosen) {
@@ -561,6 +588,13 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     }
 
     const slotHandle = this.opts.slotManager ? await this.opts.slotManager.acquire(chosen.profile.id) : null
+    // Slot acquisition may wait on another process. Do not launch a stale binding if the
+    // route was replaced or the account was disabled, removed or quarantined meanwhile.
+    if (slotHandle && (this.modelRouting !== routing || this.accounts.get(chosen.profile.id) !== chosen ||
+      this.accountBlock(chosen, family, this.now(), excludeAccountIds))) {
+      await slotHandle.release()
+      return this.acquire(sessionKey, model, excludeAccountIds)
+    }
     chosen.activeLeases += 1
     chosen.lastUsedAt = now
     this.sessionSticky.set(sessionKey, chosen.profile.id)
@@ -726,10 +760,17 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     return st
   }
 
-  private getBlockedUntil(acc: InternalAccountState, family: ModelFamily, now: number): number | null {
+  /** Single eligibility gate for both selecting a lease and reusing an existing session. */
+  private accountBlock(acc: InternalAccountState | undefined, family: ModelFamily, now: number, exclude?: ReadonlySet<string>): AccountBlock | null {
+    if (!acc) return { kind: 'missing' }
+    if (acc.profile.enabled === false) return { kind: 'disabled' }
+    if (exclude?.has(acc.profile.id)) return { kind: 'excluded' }
+    if (acc.tosBlockedAt !== undefined) return { kind: 'tos' }
     const blocks: number[] = []
+    let kind: AccountBlock['kind'] = 'quota'
     if (acc.geoBlockedUntil !== undefined) {
       if (acc.geoBlockedUntil > now) {
+        kind = 'geo'
         blocks.push(acc.geoBlockedUntil)
       } else {
         acc.geoBlockedUntil = undefined
@@ -739,6 +780,7 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     const st = acc.families.get(family)
     if (st) {
       if (st.cooldownUntil !== undefined && st.cooldownUntil > now) {
+        kind = 'cooldown'
         blocks.push(st.cooldownUntil)
       }
       if (st.fiveHour && st.fiveHour.remainingFraction <= 0) {
@@ -753,7 +795,7 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
       }
     }
 
-    return blocks.length > 0 ? Math.max(...blocks) : null
+    return blocks.length > 0 ? { kind, until: Math.max(...blocks) } : null
   }
 
   private effectiveRemainingQuota(acc: InternalAccountState, family: ModelFamily, now: number): number {

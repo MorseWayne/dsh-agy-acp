@@ -48,6 +48,7 @@ import { hostPermissions, type QuestionService, type SessionAgent } from './runt
 import { SessionPolicyChangedError } from './runtime/permission-manager.ts'
 import { SessionIndex } from './runtime/session-index.ts'
 import { AcpSessionPool } from './runtime/session-pool.ts'
+import { UsageStore } from './runtime/usage-store.ts'
 import { registerAcpRoutes, type ConnectionLike, type WebServerLike } from './transport/sse.ts'
 
 export const name = '@morsewayne/dsh-agy-acp'
@@ -73,7 +74,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   }
   const configStore = new ConfigStore({ log })
   const loaded = configStore.load()
-  let cfg = { ...baseCfg, ...loaded.patch }
+  let cfg = resolveConfig({ ...baseCfg, ...loaded.patch })
 
   let questions: QuestionService | undefined
   ctx.inject(['userQuestions'], sub => {
@@ -260,6 +261,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const multiAccountPool = new MultiAccountPool({
     accounts: accountStore.buildEffectiveProfiles(baseCfg.accounts),
     preferredAccountId: accountStore.getPreferredAccountId(),
+    modelRouting: cfg.modelAccountRouting,
     slotManager,
     inspectAuthStatus: (profile) =>
       inspectAccountAuthStatus(profile, {
@@ -333,7 +335,10 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const egressGuard = new EgressGuard({ log })
   const sessionIndex = new SessionIndex({ log })
   sessionIndex.load()
+  const usageStore = new UsageStore({ log })
+  usageStore.load()
   const pool: AcpSessionPool = new AcpSessionPool({
+    usageStore,
     getConfig: () => cfg,
     resolveBin: () => resolveAgyBin(cfg.agyBin),
     accountProvider: multiAccountPool,
@@ -348,11 +353,12 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     listReviewProviders,
     hasPersistedConfig: () => configStore.hasPersistedOverrides,
     onConfigPatch: patch => {
-      configStore.savePatch(patch)
+      const persisted = configStore.savePatch(patch)
       const prevBin = cfg.agyBin
       const prevRoot = cfg.workspaceRoot
       const prevGeo = cfg.geoFenceMode
-      cfg = { ...cfg, ...patch }
+      cfg = resolveConfig({ ...baseCfg, ...persisted })
+      multiAccountPool.setModelRouting(cfg.modelAccountRouting)
       if (!cfg.mcpBridge) for (const key of bridges.keys()) releaseBridge(key)
       if (
         cfg.agyBin !== prevBin ||
@@ -369,6 +375,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       const prevRoot = cfg.workspaceRoot
       const prevGeo = cfg.geoFenceMode
       cfg = { ...baseCfg }
+      multiAccountPool.setModelRouting(cfg.modelAccountRouting)
       if (!cfg.mcpBridge) for (const key of bridges.keys()) releaseBridge(key)
       if (
         cfg.agyBin !== prevBin ||
@@ -739,8 +746,11 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   ctx.effect(() => () => {
     loginManager.dispose()
     installer.dispose()
-    pool.dispose()
-    slotManager?.dispose()
-    for (const key of bridges.keys()) releaseBridge(key)
+    try {
+      pool.dispose()
+    } finally {
+      slotManager?.dispose()
+      for (const key of bridges.keys()) releaseBridge(key)
+    }
   })
 }

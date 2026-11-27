@@ -1,7 +1,7 @@
 // Minimal offline peer for full and partial model-catalog responses.
 import { createInterface } from 'node:readline'
 
-const { full, update, restoredVia, restored } = JSON.parse(process.argv[2])
+const { full, update, restoredVia, restored } = JSON.parse(process.env.FAKE_CATALOG_PEER_SETUP ?? process.argv[2])
 const write = message => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n')
 
 for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {

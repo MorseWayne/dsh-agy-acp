@@ -2,6 +2,17 @@
 
 All notable changes to `@morsewayne/dsh-agy-acp` are documented in this file.
 
+## [0.10.0] - 2026-11-28
+
+### Added
+- Route individual models or model families to a specific account in the web console. Choose strict routing to require that account, or allow fallback when it is unavailable.
+- View per-account request, failure, rate-limit and token counts in the Accounts panel, with 30 days of local usage history.
+
+### Fixed
+- New and existing managed accounts now initialize missing installation IDs before starting Antigravity in a read-only sandbox, without overwriting an existing ID or requiring a new login.
+- Temporary ACP restore failures keep the original session binding for retry instead of silently starting a new conversation. Prepared calls verify the requested model and reasoning effort against the account that will actually run them.
+- Probing or using a strictly routed account no longer replaces the public model menu with that account's shorter list. An ordinary catalog refresh can still update the menu.
+
 ## [0.9.0] - 2026-11-27
 
 ### Added

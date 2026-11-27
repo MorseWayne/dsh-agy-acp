@@ -6,6 +6,11 @@ import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
+import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
+import { apply } from '../src/index.ts'
+import type { AcpAdapter } from '../src/provider/adapter.ts'
+import { ConfigStore } from '../src/runtime/config-store.ts'
 // @ts-expect-error runtime React is supplied by workspace dependencies
 import React from 'react'
 // @ts-expect-error runtime ReactDOMServer is supplied by workspace dependencies
@@ -60,6 +65,91 @@ function postJsonTo(routes: ReadonlyMap<string, ExactRouteSpec['handler']>) {
     return { statusCode, json: JSON.parse(rawBody) as Record<string, unknown> }
   }
 }
+
+test('plugin HTTP config replaces routes atomically, persists a clear across restart, and resets to host routing', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'agy-route-http-'))
+  const paths = { DSH_AGY_ACP_CONFIG_PATH: 'config.json', DSH_AGY_ACP_SESSIONS_PATH: 'sessions.json',
+    DSH_AGY_ACP_ACCOUNTS_PATH: 'accounts.json', DSH_AGY_ACP_USAGE_PATH: 'usage.json' }
+  const oldEnv = Object.fromEntries(Object.keys(paths).map(k => [k, process.env[k]]))
+  const peer = fileURLToPath(new URL('./fixtures/fake-agy.mjs', import.meta.url))
+  const model = 'gemini-4-neon'
+  const hostRule = { families: { 'gemini-pro': { accountId: 'two' } } }
+  const persistedRule = { models: { [model]: { accountId: 'one' } } }
+  const cleanups: Array<() => void> = []
+  const dispose = () => { while (cleanups.length) cleanups.pop()!() }
+  let turn = 0
+  const mount = async () => {
+    const routes = new Map<string, ExactRouteSpec['handler']>()
+    let adapter!: AcpAdapter
+    const services = new Map<string, unknown>([
+      ['connection', { requestRejection: () => undefined }],
+      ['webServer', { register: (s: ExactRouteSpec) => { routes.set(s.path, s.handler); return () => routes.delete(s.path) } }],
+      ['llm', { registerAdapter: (_ids: string[], a: AcpAdapter) => { adapter = a } }],
+    ])
+    const host = {
+      get: (id: string) => services.get(id),
+      inject: (ids: string[], setup: (ctx: unknown) => void | (() => void)) => {
+        if (!ids.every(k => services.has(k))) return
+        const close = setup(host)
+        if (close) cleanups.push(close)
+      },
+      agents: { get: (id: string) => ({ session: { id } }) },
+      sandboxPolicy: { resolve: ({ session }: { session: { id: string } }) => fakeHost.readPolicy(session.id) },
+      permissionPresets: { current: () => 'danger-full-access' }, approval: { overrideOf: () => 'never' },
+      sandbox: { confine: async (argv: string[]) => { assert.equal(argv[0], peer); return { argv, enforcement: 'full' } } },
+      effect: (setup: () => () => void) => cleanups.push(setup()), on: () => {}, emit: () => {},
+    }
+    apply(host as unknown as Parameters<typeof apply>[0], { agyBin: peer, geoFenceMode: 'off',
+      modelAccountRouting: hostRule, accounts: ['one', 'two'].map(id => ({ id, homeDir: path.join(dir, id), env: { FAKE_ACCOUNT_TAG: id } })),
+    })
+    await adapter.listModels('antigravity-acp') // protocol barrier for the initial catalog probe
+    const post = postJsonTo(routes)
+    return {
+      post: (data: Record<string, unknown>, route = 'config') => post(`/plugins/agy-acp/${route}`, data),
+      run: async () => {
+        let text = ''
+        for await (const c of adapter.stream({ provider: 'antigravity-acp', sessionId: `chat-${++turn}`, model,
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+        } as GenerateOptions)) if (c.type === 'text-delta') text += c.text
+        return text
+      },
+    }
+  }
+  try {
+    for (const [k, f] of Object.entries(paths)) process.env[k] = path.join(dir, f)
+    let app = await mount()
+    assert.equal((await app.post({ accountId: 'one' }, 'accounts/select')).statusCode, 200)
+    assert.match(await app.run(), /^<two>/, 'host family rule overrides global primary')
+    const saved = await app.post({ modelAccountRouting: persistedRule, defaultEffort: 'low' })
+    assert.equal(saved.statusCode, 200)
+    assert.deepEqual((saved.json.status as StatusSnapshot).config.modelAccountRouting, persistedRule)
+    assert.match(await app.run(), /^<one>/, 'HTTP patch synchronizes live routing')
+    assert.equal((await app.post({ modelAccountRouting: { models: { x: { accountId: 'bad id' } } } })).statusCode, 400)
+    dispose()
+    app = await mount()
+    assert.match(await app.run(), /^<one>/, 'restart loads the model override')
+    for (const empty of [null, {}]) {
+      await app.post({ modelAccountRouting: hostRule })
+      assert.match(await app.run(), /^<two>/)
+      const cleared = await app.post({ modelAccountRouting: empty })
+      assert.equal(cleared.statusCode, 200)
+      assert.equal((cleared.json.status as StatusSnapshot).config.modelAccountRouting, undefined)
+      assert.match(await app.run(), /^<one>/, 'empty patch removes the rule from the live scheduler')
+    }
+    assert.deepEqual(new ConfigStore().load().patch, { defaultEffort: 'low', modelAccountRouting: {} })
+    dispose()
+    app = await mount()
+    assert.match(await app.run(), /^<one>/, 'explicit clear masks host routing across restart')
+    const reset = await app.post({}, 'config/reset')
+    assert.deepEqual((reset.json.status as StatusSnapshot).config.modelAccountRouting, hostRule)
+    assert.match(await app.run(), /^<two>/, 'reset restores host rules in scheduler too')
+    assert.equal(new ConfigStore().load().exists, false)
+  } finally {
+    dispose()
+    for (const [k, v] of Object.entries(oldEnv)) if (v === undefined) delete process.env[k]; else process.env[k] = v
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 test('account validation enforces safe IDs, proxy protocols, redaction, and login code bounds', () => {
   assert.equal(slugifyAccountId('Primary US Account'), 'primary-us-account')

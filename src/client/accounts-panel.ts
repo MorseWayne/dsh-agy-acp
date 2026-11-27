@@ -5,10 +5,13 @@ import type {
   AccountAuthStatus,
   AccountHealthSnapshot,
   AccountLoginSessionSnapshot,
+  AcpModelOption,
   GeoFenceMode,
+  ModelAccountRoutingConfig,
   StatusSnapshot,
 } from '../common/types.ts'
 import { AccountCard } from './account-card.ts'
+import { AccountUsagePanel } from './account-usage-panel.ts'
 import {
   AUTO_QUOTA_RETRY_COOLDOWN_MS,
   AUTO_QUOTA_TTL_MS,
@@ -25,6 +28,7 @@ import {
   submitAccountLoginCode,
   updateManagedAccount,
 } from './panel-actions.ts'
+import { ModelRoutingPanel } from './model-routing-panel.ts'
 import { theme } from './theme.ts'
 
 const h = React.createElement
@@ -32,6 +36,11 @@ const autoQuotaAttempted = new Map<string, { at: number; authStatus?: AccountAut
 
 export interface AccountsPanelProps {
   accounts: AccountHealthSnapshot[]
+  accountUsage?: StatusSnapshot['accountUsage']
+  models?: AcpModelOption[]
+  modelAccountRouting?: ModelAccountRoutingConfig
+  refreshingModels?: boolean
+  onRefreshModels?: () => void
   preferredAccountId?: string | null
   geoFenceMode?: GeoFenceMode
   agyFound?: boolean
@@ -83,6 +92,11 @@ function closeOAuthPopup(popup: Window | null): void {
 
 export const AccountsPanel = React.memo(function AccountsPanel({
   accounts,
+  accountUsage,
+  models = [],
+  modelAccountRouting,
+  refreshingModels,
+  onRefreshModels,
   preferredAccountId,
   geoFenceMode,
   agyFound = true,
@@ -790,7 +804,7 @@ export const AccountsPanel = React.memo(function AccountsPanel({
     )
   }
 
-  return h(
+  const accountListCard = h(
     'section',
     { className: 'agy-acp-card' },
     h(
@@ -971,4 +985,8 @@ export const AccountsPanel = React.memo(function AccountsPanel({
         )
       : null,
   )
+  return h(React.Fragment, null,
+    h(AccountUsagePanel, { accounts, accountUsage, applyStatus }),
+    accountListCard,
+    h(ModelRoutingPanel, { accounts, models, routing: modelAccountRouting, preferredAccountId, refreshingModels, onRefreshModels, applyStatus }))
 })

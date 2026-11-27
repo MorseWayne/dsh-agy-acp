@@ -696,6 +696,52 @@ const SCOPED_CSS = `
   box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.08);
 }
 
+/* Model account assignments wrap to the card width, not the viewport width. */
+.agy-acp-route-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 10px 0;
+  border-bottom: ${theme.borderSubtle};
+}
+.agy-acp-route-label { flex: 1 1 190px; min-width: 0; overflow-wrap: anywhere; }
+.agy-acp-route-controls, .agy-acp-route-add-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  min-width: 0;
+  max-width: 100%;
+}
+.agy-acp-route-add-bar { margin-top: 10px; }
+.agy-acp-route-controls .agy-acp-select, .agy-acp-route-add-bar .agy-acp-input,
+.agy-acp-route-add-bar .agy-acp-select {
+  width: auto;
+  max-width: min(100%, 26em);
+  min-width: 0;
+}
+.agy-acp-route-controls .agy-acp-seg { max-width: 100%; flex-wrap: wrap; }
+.agy-acp-route-warning { flex-basis: 100%; overflow-wrap: anywhere; }
+
+/* Account usage comparison: preserve the snapshot ranking at every width. */
+.agy-acp-usage-intro { flex: 1 1 280px; min-width: 0; }
+.agy-acp-usage-intro p { margin: 3px 0 0; }
+.agy-acp-usage-heading { margin: 14px 0 7px; font-size: 13px; }
+.agy-acp-usage-list { list-style: none; padding: 0; margin: 0; }
+.agy-acp-usage-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  padding: 10px 12px;
+  gap: 6px;
+}
+.agy-acp-usage-row + .agy-acp-usage-row { border-top: ${theme.borderSubtle}; }
+.agy-acp-usage-line { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
+.agy-acp-usage-line > * { max-width: 100%; overflow-wrap: anywhere; }
+.agy-acp-usage-line .agy-acp-pill { white-space: normal; }
+.agy-acp-usage-line .agy-acp-seg { flex-wrap: wrap; }
+.agy-acp-usage-share { margin-inline-start: auto; font-variant-numeric: tabular-nums; color: ${theme.textSecondary}; }
+
 /* Account card & quota grid */
 .agy-acp-active-bar {
   display: flex;

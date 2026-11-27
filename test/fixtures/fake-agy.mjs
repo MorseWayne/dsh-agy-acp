@@ -127,7 +127,8 @@ async function handleRequest(id, method, params) {
   }
 
   if (method === 'session/new') {
-    const sessionId = `sess_${nextSessionSeq++}`
+    const catalogProbe = process.argv.includes('--test-catalog-probe')
+    const sessionId = catalogProbe ? 'catalog-probe' : `sess_${nextSessionSeq++}`
     const systemAppend = params?._meta?.antigravity?.systemPrompt?.append ?? null
     const configOptions = [
       {
@@ -165,7 +166,7 @@ async function handleRequest(id, method, params) {
     ]
     const mcpServers = Array.isArray(params?.mcpServers) ? params.mcpServers : []
     sessions.set(sessionId, { turns: 0, configOptions, systemAppend, mcpServers })
-    saveDiskSession(sessionId, { turns: 0, configOptions, systemAppend })
+    if (!catalogProbe) saveDiskSession(sessionId, { turns: 0, configOptions, systemAppend })
     send({
       jsonrpc: '2.0',
       id,
@@ -193,6 +194,10 @@ async function handleRequest(id, method, params) {
     }
     const sessionId = params?.sessionId
     const disk = loadDiskSessions()[sessionId]
+    if (process.env.FAKE_FAIL_SESSION_LOAD === 'erofs') {
+      send({ jsonrpc: '2.0', id, error: { code: -32603, message: 'EROFS: read-only file system during session/load' } })
+      return
+    }
     if (process.env.FAKE_FAIL_SESSION_LOAD === '1' || !disk) {
       send({
         jsonrpc: '2.0',

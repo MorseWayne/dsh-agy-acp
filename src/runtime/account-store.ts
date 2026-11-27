@@ -29,6 +29,10 @@ import {
 } from '../common/account-validation.ts'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import type { AccountAuthStatus, AccountProfileConfig, ManagedAccountRecord } from '../common/types.ts'
+import {
+  AGY_CLI_STORE, InvalidInstallationIdError, assertIndependentAccountHome, ensureInstallationId, readInstallationId,
+  withManagedDirectory, withPreservedInstallationId,
+} from './account-installation-id.ts'
 import { fetchViaEnvProxy } from './egress-guard.ts'
 
 const MAX_ACCOUNTS_FILE_BYTES = 128 * 1024
@@ -498,7 +502,7 @@ export class AccountStore {
   }
 
   ensureManagedAccountHome(id: string): string {
-    return this.prepareOAuthHome(this.resolveManagedAccountHome(id))
+    return this.prepareOAuthHome(this.resolveManagedAccountHome(id), true)
   }
 
   resolvePendingAccountHome(pendingId: string): string {
@@ -518,11 +522,18 @@ export class AccountStore {
     return this.prepareOAuthHome(this.resolvePendingAccountHome(pendingId))
   }
 
-  private prepareOAuthHome(home: string): string {
-    for (const store of ['antigravity-acp', 'antigravity-cli']) {
-      mkdirSync(path.join(home, '.gemini', store), { recursive: true, mode: 0o700 })
+  private prepareOAuthHome(home: string, initialize = false): string {
+    try {
+      assertIndependentAccountHome(home)
+      withManagedDirectory(this.accountsRootDir, path.join(home, '.gemini', 'antigravity-acp'), true, () => {})
+      withManagedDirectory(this.accountsRootDir, path.join(home, '.gemini', AGY_CLI_STORE), true, store => {
+        if (initialize) ensureInstallationId(store)
+      })
+      return home
+    } catch (err) {
+      if (err instanceof InvalidInstallationIdError) throw new AccountStoreError(err.message, 409)
+      throw new AccountStoreError('无法安全初始化托管账号目录及安装标识', 409)
     }
-    return home
   }
 
   cleanupPendingAccountHome(pendingId: string): void {
@@ -611,15 +622,12 @@ export class AccountStore {
     }
 
     const targetHome = this.resolveManagedAccountHome(id)
-    const realRoot = realpathSync(this.accountsRootDir)
-    const assertOwnedHome = (home: string): void => {
-      const info = lstatSync(home)
-      if (!info.isDirectory() || (process.getuid && info.uid !== process.getuid()) ||
-          realpathSync(home) !== path.join(realRoot, path.basename(home))) {
-        throw new AccountStoreError('账号隔离目录不安全，已拒绝替换', 409)
-      }
-    }
-    assertOwnedHome(pendingHome)
+    assertIndependentAccountHome(targetHome)
+    const pendingCliStore = path.join(pendingHome, '.gemini', AGY_CLI_STORE)
+    const targetCliStore = path.join(targetHome, '.gemini', AGY_CLI_STORE)
+    // The OAuth child has exited. Recheck both trees rather than trusting paths checked before login.
+    assertIndependentAccountHome(pendingHome)
+    const previousId = withManagedDirectory(this.accountsRootDir, targetCliStore, false, readInstallationId)
     const now = Date.now()
     const proxyUrl = opts.proxyUrl === undefined ? existing?.proxyUrl : proxyChecked.value
     const record: ManagedAccountRecord = {
@@ -632,27 +640,36 @@ export class AccountStore {
       updatedAt: now,
     }
     const nextList = existing ? this.accounts.map(a => a === existing ? record : a) : [...this.accounts, record]
-    // Stage the old (or orphaned) HOME until both renames and the metadata write succeed.
-    let backup: string | undefined
-    if (lstatSync(targetHome, { throwIfNoEntry: false })) {
-      assertOwnedHome(targetHome)
-      backup = path.join(realRoot, `.backup-${randomUUID()}`)
-      renameSync(targetHome, backup)
-    }
-    let installed = false
-    try {
-      renameSync(pendingHome, targetHome)
-      installed = true
-      this.persist(nextList, this.accounts.length === 0 ? false : this.defaultAccountEnabled, id)
-    } catch (err) {
-      if (installed) renameSync(targetHome, pendingHome)
-      if (backup) renameSync(backup, targetHome)
-      throw err
-    }
-    if (backup) {
-      try { rmSync(backup, { recursive: true }) } catch { this.log?.('could not remove superseded managed account HOME backup') }
-    }
-    return { ...record }
+    const committed = withManagedDirectory(this.accountsRootDir, pendingCliStore, false, store =>
+      withManagedDirectory(this.accountsRootDir, this.accountsRootDir, false, root => {
+        const source = path.join(root, path.basename(pendingHome))
+        const target = path.join(root, path.basename(targetHome))
+        return withPreservedInstallationId(store, root, previousId, () => {
+          // Stage the old (or orphaned) HOME until both renames and metadata write succeed.
+          let backup: string | undefined
+          if (lstatSync(target, { throwIfNoEntry: false })) {
+            backup = path.join(root, `.backup-${randomUUID()}`)
+            renameSync(target, backup)
+          }
+          let installed = false
+          try {
+            renameSync(source, target)
+            installed = true
+            this.persist(nextList, this.accounts.length === 0 ? false : this.defaultAccountEnabled, id)
+          } catch (err) {
+            if (installed) renameSync(target, source)
+            if (backup) renameSync(backup, target)
+            throw err
+          }
+          if (backup) {
+            try { rmSync(backup, { recursive: true }) } catch { this.log?.('could not remove superseded managed account HOME backup') }
+          }
+          return { ...record }
+        })
+      }),
+    )
+    if (!committed) throw new AccountStoreError('临时账号目录不安全或不存在', 409)
+    return committed
   }
 
   addAccount(
@@ -831,13 +848,16 @@ export class AccountStore {
     for (const managed of this.accounts) {
       if (seen.has(managed.id)) continue
       seen.add(managed.id)
-      // Guarantee the isolated home exists on disk so quota checks / logins work immediately.
+      const profile = this.toAccountProfile(managed)
       try {
         this.ensureManagedAccountHome(managed.id)
-      } catch {
-        // ignore mkdir failure on read path
+        profiles.push(profile)
+      } catch (err) {
+        // Keep the record visible, but do not send subprocesses into an unverified HOME.
+        const problem = err instanceof AccountStoreError ? err.message : '无法安全初始化托管账号目录及安装标识'
+        this.log?.(`managed account HOME initialization failed (${managed.id}): ${problem}; account unavailable`)
+        profiles.push({ ...profile, enabled: false })
       }
-      profiles.push(this.toAccountProfile(managed))
     }
 
     return profiles

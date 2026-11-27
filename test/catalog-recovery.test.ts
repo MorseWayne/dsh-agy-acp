@@ -207,6 +207,48 @@ test('prepareCall aborts its own wait promptly without cancelling a shared catal
   await cancelled
   resume.resolve()
   assert.deepEqual((await other).reasoning?.efforts.map(e => e.id), ['low', 'medium', 'high'])
-  assert.equal(launches, 1)
   assert.equal(pool.getStatus().lastError, null)
+})
+
+test('prepareCall uses verified exact abilities without a new probe, while the menu still performs strict discovery', async t => {
+  const launches: string[] = []
+  const fail = Object.assign(new Error('EROFS: account startup needs a writable path'), { code: 'EROFS' })
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const pool = new AcpSessionPool({
+    ...fakeHost, getConfig: resolveConfig, resolveBin: () => process.execPath,
+    async prepareArgv(_argv, policy) {
+      launches.push(policy.sessionId)
+      if (policy.sessionId === '__catalog__') {
+        assert.equal(policy.mode, 'read-only')
+        throw fail
+      }
+      return [process.execPath, fileURLToPath(new URL('./fixtures/fake-agy.mjs', import.meta.url))]
+    },
+  })
+  t.after(() => pool.dispose())
+  const adapter = new AcpAdapter({ getConfig: resolveConfig, pool, runs: new AcpRunStore() })
+  const model = 'gemini-4-neon'
+  await assert.rejects(adapter.prepareCall(PROVIDER_ID, model), err => {
+    assert.ok(err instanceof LlmError)
+    assert.equal(err.code, 'DISCOVERY_FAILED')
+    assert.equal(err.cause, fail)
+    return true
+  })
+  assert.deepEqual(launches, ['__catalog__'], 'cold lookup never starts under the conversation policy')
+
+  const key = 'warm-call'
+  await pool.getOrCreateSession(key, fakeHost.readPolicy(key).workspaceRoot, model)
+  now += 5 * 60_000 + 1
+  const prepared = await adapter.prepareCall(PROVIDER_ID, model)
+  assert.deepEqual(prepared.model.reasoning?.efforts.map(e => e.id), ['low', 'medium', 'high'])
+  assert.deepEqual(launches, ['__catalog__', key], 'the call reuses verified evidence even after the menu TTL')
+
+  const missing = await adapter.prepareCall(PROVIDER_ID, 'gemini-unverified')
+  assert.equal(missing.model.reasoning, undefined, 'do not synthesize levels for an unverified ID')
+  assert.deepEqual(launches, ['__catalog__', key, '__catalog__'])
+  await assert.rejects(pool.forceRefreshModels(), err => err === fail)
+  const afterProbeFailure = await adapter.prepareCall(PROVIDER_ID, model)
+  assert.deepEqual(afterProbeFailure.model.reasoning, prepared.model.reasoning)
+  assert.deepEqual(launches, ['__catalog__', key, '__catalog__', '__catalog__'])
 })

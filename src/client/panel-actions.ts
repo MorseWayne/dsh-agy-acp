@@ -1,8 +1,12 @@
+import { emptyUsageCounter } from '../common/account-usage.ts'
 import type {
   AccountLoginSessionSnapshot,
+  AccountUsageSnapshot,
+  UsageCounter,
   AgyInstallTaskSnapshot,
   EnvironmentCheckReport,
   ManagedAccountRecord,
+  ModelAccountRoutingConfig,
   StatusSnapshot,
 } from '../common/types.ts'
 import { isValidSnapshot } from './status-store.ts'
@@ -40,6 +44,38 @@ export async function postJson<TExtra = Record<string, unknown>>(
   } catch {
     return { ok: false, error: '未能连接到插件，请重试' }
   }
+}
+
+const usageKeys = Object.keys(emptyUsageCounter()) as (keyof UsageCounter)[]
+function validCounter(c: UsageCounter): boolean {
+  return Boolean(c && usageKeys.every(key => Number.isSafeInteger(c[key]) && c[key] >= 0))
+}
+
+// The generic status validator intentionally accepts snapshots from older backends.
+// A reset acknowledgement, however, must include usage that the panel can actually render.
+function validResetUsage(usage?: AccountUsageSnapshot): boolean {
+  return Boolean(usage && Number.isFinite(usage.updatedAt) && Number.isFinite(usage.retentionDays) &&
+    [usage.today, usage.last7Days, usage.allTime].every(w => w && validCounter(w.totals) && Array.isArray(w.accounts) &&
+      w.accounts.every(e => e && typeof e.accountId === 'string' && (e.accountLabel === undefined || typeof e.accountLabel === 'string') &&
+        (e.lastUsedAt === null || Number.isFinite(e.lastUsedAt)) && validCounter(e.totals) && e.families &&
+        typeof e.families === 'object' && !Array.isArray(e.families) && Object.values(e.families).every(validCounter))))
+}
+
+export async function resetAccountUsage(request = fetch): Promise<{ ok: boolean; status?: StatusSnapshot; error?: string }> {
+  const res = await postJson<{ ok?: boolean }>('/plugins/agy-acp/usage/reset', {}, request)
+  if (!res.ok) return { ok: false, error: res.error || '插件拒绝了清空请求，请稍后重试。' }
+  if (res.data?.ok !== true || !res.status || !validResetUsage(res.status.accountUsage)) {
+    return { ok: false, error: res.error || '未收到有效的用量快照，请刷新后重试。' }
+  }
+  return { ok: true, status: res.status }
+}
+
+export async function saveModelAccountRouting(
+  routing: ModelAccountRoutingConfig,
+  request = fetch,
+): Promise<{ ok: boolean; status?: StatusSnapshot; error?: string }> {
+  const { ok, status, error } = await postJson('/plugins/agy-acp/config', { modelAccountRouting: routing }, request)
+  return { ok, status, error }
 }
 
 export interface ReviewModelOption {

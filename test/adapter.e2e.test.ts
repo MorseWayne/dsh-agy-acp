@@ -6,6 +6,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import type { GenerateOptions, Message, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm/brand'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { resolveConfig } from '../src/common/config.ts'
 import { MIRROR_TOOL_NAME, PROVIDER_ID, WRAPPER_TOOL_NAME } from '../src/common/types.ts'
@@ -1307,7 +1308,7 @@ test('SIGTERM after reasoning recovers once with distinct block indices, while p
   }
 })
 
-test('session/load restores native ACP context across idle sweep & restart without digest duplication, isolates replay chunks, and falls back smoothly to session/new', async (t) => {
+test('session/load preserves native context across idle and restart, retains the binding on EROFS, and replaces only a missing session', async (t) => {
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'dsh-agy-load-'))
   const storeFile = path.join(tmpDir, 'fake-agy-sessions.json')
   const indexFile = path.join(tmpDir, 'sessions.json')
@@ -1399,11 +1400,18 @@ test('session/load restores native ACP context across idle sweep & restart witho
   // Simulate full DSH/plugin restart: new pool + new SessionIndex reading persisted sessions.json
   const sessionIndex2 = new SessionIndex({ filePath: indexFile })
   sessionIndex2.load()
+  let coldProbes = 0
   const pool2 = new AcpSessionPool({
     ...fakeHost,
     sessionIndex: sessionIndex2,
     getConfig: () => cfg,
     resolveBin: () => FAKE_AGY_BIN,
+    async prepareArgv(argv, policy) {
+      if (policy.sessionId !== '__catalog__') return argv
+      assert.equal(policy.mode, 'read-only')
+      coldProbes++
+      return [...argv, '--test-catalog-probe']
+    },
   })
   const adapter2 = new AcpAdapter({ getConfig: () => cfg, pool: pool2, runs: new AcpRunStore() })
 
@@ -1413,18 +1421,59 @@ test('session/load restores native ACP context across idle sweep & restart witho
       { role: 'assistant', content: [{ type: 'text', text: 'reply 1' }] } as Message,
       { role: 'user', content: [{ type: 'text', text: 'turn after restart' }] } as Message,
     ]
-    const t3 = await collectChunks(
-      adapter2.stream({
-        provider: PROVIDER_ID,
-        model: 'gemini-4-neon',
-        messages: history3,
-        sessionId: 'conv-load-1',
-      } as GenerateOptions),
-    )
+    const turnAfterRestart = {
+      provider: PROVIDER_ID, model: 'gemini-4-neon', sessionId: 'conv-load-1',
+      messages: history3, reasoningEffort: ReasoningEffortId('high'),
+    } as GenerateOptions
+    const prepare = async () => {
+      const call = await adapter2.prepareCall(PROVIDER_ID, turnAfterRestart.model)
+      assert.ok(call.model.reasoning?.efforts.some(({ id }) => id === 'high'))
+      return call
+    }
+    const initial = sessionIndex2.get('conv-load-1')!
+    const cold = await prepare()
+    assert.equal(coldProbes, 1)
+    assert.deepEqual(sessionIndex2.get('conv-load-1'), initial, 'the constrained helper must not write the conversation binding')
+    const t3 = await collectChunks(cold.stream(turnAfterRestart))
     assert.equal(t3.filter(c => c.type === 'text-delta').map(c => c.text).join(''), '[sess_1#4] turn after restart')
-    assert.equal(pool2.getStatus().sessions[0]?.title, '重构登录模块')
+    const coldRestored = pool2.getStatus().sessions[0]!
+    assert.equal(coldRestored.title, '重构登录模块')
+    assert.equal(coldRestored.acpSessionId, initial.acpSessionId)
+    assert.equal(coldRestored.accountId, initial.accountId)
+    assert.equal(coldRestored.cwd, initial.cwd)
+    assert.equal(coldRestored.currentEffort, 'high')
+    assert.equal(sessionIndex2.get('conv-load-1')?.policyFingerprint, initial.policyFingerprint)
+    // Simulate a temporary load failure before any prompt. The exact account,
+    // workspace, policy and native ID must survive both in memory and on disk.
+    ;(pool2 as unknown as { sessions: Map<string, { lastActiveAt: number }> }).sessions.get('conv-load-1')!.lastActiveAt = 1
+    await pool2.sweepIdleSessions()
+    const original = sessionIndex2.get('conv-load-1')
+    assert.ok(original)
+    assert.equal(original.acpSessionId, 'sess_1')
+    assert.equal(original.accountId, 'default')
+    process.env.FAKE_FAIL_SESSION_LOAD = 'erofs'
+    const prepared = await prepare()
+    await assert.rejects(collectChunks(prepared.stream(turnAfterRestart)), /EROFS/)
+    assert.deepEqual(sessionIndex2.get('conv-load-1'), original)
+    const reread = new SessionIndex({ filePath: indexFile })
+    reread.load()
+    assert.deepEqual(reread.get('conv-load-1'), original)
+    assert.equal(pool2.getStatus().activeSessions, 0)
 
-    // Force `session/load` failure -> seamlessly falls back to `session/new` WITH 24K `<prior_conversation_digest>`
+    // Retry succeeds with the original context, under the same cwd and policy.
+    delete process.env.FAKE_FAIL_SESSION_LOAD
+    const retry = await prepare()
+    assert.equal(coldProbes, 1, 'verified capabilities avoid a second helper on retry')
+    const retried = await collectChunks(retry.stream(turnAfterRestart))
+    assert.equal(retried.filter(c => c.type === 'text-delta').map(c => c.text).join(''), '[sess_1#5] turn after restart')
+    const restored = pool2.getStatus().sessions[0]!
+    assert.equal(restored.resumedVia, 'load')
+    assert.equal(restored.accountId, original.accountId)
+    assert.equal(restored.cwd, original.cwd)
+    assert.equal(restored.currentEffort, 'high')
+    assert.equal(sessionIndex2.get('conv-load-1')?.policyFingerprint, original.policyFingerprint)
+
+    // Definitive session-not-found is still eligible for a fresh turn with a digest.
     ;(pool2 as unknown as { sessions: Map<string, { lastActiveAt: number }> }).sessions.get('conv-load-1')!.lastActiveAt = 1
     await pool2.sweepIdleSessions()
     process.env.FAKE_FAIL_SESSION_LOAD = '1'

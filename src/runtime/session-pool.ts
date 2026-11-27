@@ -3,8 +3,9 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { addAbortListener, EventEmitter } from 'node:events'
-import { AcpClient, AcpProcessExitError, AcpTimeoutError } from '../acp/client.ts'
+import { AcpClient, AcpProcessExitError, AcpRpcError, AcpTimeoutError } from '../acp/client.ts'
 import { transcriptCandidates } from '../acp/transcript-usage.ts'
+import { resolveModelAccountRoute } from '../common/account-routing.ts'
 import { isGeoUnsupportedError } from '../common/geo.ts'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import {
@@ -45,7 +46,8 @@ import {
   type UsageTotals,
 } from '../common/types.ts'
 
-import { isAuthFailureError, isTosViolationError } from './account-pool.ts'
+import { isAuthFailureError, isQuotaOrRateLimitError, isTosViolationError } from './account-pool.ts'
+import { UsageStore } from './usage-store.ts'
 import {
   AccountQuotaError,
   mapQuotaGroupsToFamilies,
@@ -75,6 +77,8 @@ export interface ManagedAcpSession {
   accountId: string
   cwd: string
   currentModel: string
+  /** Requested model ID used by account routing; upstream may expose a different canonical ID. */
+  routingModel?: string
   currentEffort: string
   currentMode: string
   title?: string
@@ -101,6 +105,7 @@ export interface AuxiliaryPromptParams {
   effort?: string
   /** When true and `effort` is not specified, pick the model's lowest available `thought_level`. */
   preferLowestEffort?: boolean
+  verifySelection?: boolean
   systemPromptAppend: string
   systemFallbackBlock: PromptContentBlock
   prompt: PromptContentBlock[]
@@ -143,6 +148,22 @@ export class SingleAccountProvider implements AccountProvider {
   }
 }
 
+function emptyUsageTotals(): UsageTotals {
+  return { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0, reasoningTokens: 0 }
+}
+
+interface AccountModelCatalog {
+  catalog: ModelCatalog
+  image?: boolean
+  windows: Map<string, number>
+}
+
+export interface CallModelCapabilities {
+  model: AcpModelOption
+  image: boolean
+  contextWindow?: number
+}
+
 interface TurnPermissions {
   requests: number
   pending: Set<string>
@@ -169,6 +190,7 @@ export interface SessionPoolDeps {
   accountProvider?: AccountProvider
   egressGuard?: EgressGuard
   sessionIndex?: SessionIndex
+  usageStore?: UsageStore
   getMcpServers?: (sessionKey: string, opts?: { preferHttp?: boolean }) => Promise<AcpMcpServerSpec[]>
   log?: (msg: string) => void
 }
@@ -212,22 +234,20 @@ export class AcpSessionPool extends EventEmitter {
   private readonly egressGuard: EgressGuard
   private cachedCatalog: ModelCatalog = { models: [], routes: new Map() }
   private get cachedModels(): AcpModelOption[] { return this.cachedCatalog.models }
+  private catalogAccountId?: string
+  private readonly accountCatalogs = new Map<string, AccountModelCatalog>()
   private readonly observedWindows = new Map<string, number>()
   private catalogExpiresAt = 0
   private cachedTier: string | null = null
   private lastError: string | null = null
   private sweepTimer: ReturnType<typeof setInterval> | null = null
-  private usageTotals: UsageTotals = {
-    inputTokens: 0,
-    outputTokens: 0,
-    cachedReadTokens: 0,
-    cachedWriteTokens: 0,
-    reasoningTokens: 0,
-  }
+  private readonly usageStore: UsageStore
+  private usageTotals: UsageTotals = emptyUsageTotals()
 
   constructor(private readonly deps: SessionPoolDeps) {
     super()
     this.accountProvider = deps.accountProvider ?? new SingleAccountProvider(() => this.emitStatus())
+    this.usageStore = deps.usageStore ?? new UsageStore({ persist: false })
     this.egressGuard = deps.egressGuard ?? new EgressGuard({ log: deps.log })
     this.sweepTimer = setInterval(() => {
       void this.sweepIdleSessions()
@@ -345,7 +365,7 @@ export class AcpSessionPool extends EventEmitter {
     this.emitStatus()
   }
 
-  recordGeoRejection(accountId: string, env?: NodeJS.ProcessEnv): AccountEgressSnapshot {
+  recordGeoRejection(accountId: string, env?: NodeJS.ProcessEnv, publishError = true): AccountEgressSnapshot {
     const resolvedEnv = env ?? this.accountProvider.getAccountEnv?.(accountId)
     const snap = this.egressGuard.recordGeoRejection(accountId, resolvedEnv, () => {
       if (!this.disposed) this.emitStatus()
@@ -354,7 +374,9 @@ export class AcpSessionPool extends EventEmitter {
     if (mode !== 'off' && mode !== 'warn') {
       this.accountProvider.markGeoBlocked?.(accountId, snap.expiresAt, snap.reason)
     }
-    this.lastError = `[地域风控熔断] 账号“${this.accountLabel(accountId)}”触发上游 Google 地域限制（400），已在本地熔断 60 秒；请切换至支持地区节点后点击「检测出口」。`
+    if (publishError) {
+      this.lastError = `[地域风控熔断] 账号“${this.accountLabel(accountId)}”触发上游 Google 地域限制（400），已在本地熔断 60 秒；请切换至支持地区节点后点击「检测出口」。`
+    }
     this.emitStatus()
     return snap
   }
@@ -369,8 +391,17 @@ export class AcpSessionPool extends EventEmitter {
   }
 
   reportAccountFailure(accountId: string, model: string, error: unknown, options?: AccountFailureOptions): void {
+    this.recordAccountFailureUsage(accountId, model, error, options)
     this.accountProvider.reportFailure?.(accountId, model, error, options)
     this.emitStatus()
+  }
+
+  // Broken session history is a failed turn, but must not affect the account scheduler.
+  recordAccountFailureUsage(accountId: string, model: string, error: unknown, options?: AccountFailureOptions): void {
+    if (this.disposed || (error instanceof Error && (error.name === 'AbortError' ||
+      ('code' in error && error.code === 'ABORT_ERR')))) return
+    this.usageStore.recordFailure({ accountId, accountLabel: this.accountLabel(accountId), model,
+      rateLimited: options?.code === 'QUOTA_EXHAUSTED' || isQuotaOrRateLimitError(error) })
   }
 
   clearAccountCooldown(accountId?: string): void {
@@ -482,6 +513,44 @@ export class AcpSessionPool extends EventEmitter {
     }
   }
 
+  private callAccountFor(model: string): string | undefined {
+    const route = resolveModelAccountRoute(this.accountProvider.getModelRouting?.(), model)?.rule
+    if (route?.fallback === 'strict') return route.accountId
+    // The host adapter interface provides no conversation ID here. A preferred
+    // account with automatic fallback is not a reliable account identity.
+    const enabled = this.accountProvider.getHealthSnapshots?.().filter(a => a.enabled)
+    return enabled?.length === 1 ? enabled[0]?.id : undefined
+  }
+
+  async resolveCallModelCapabilities(model: string, signal?: AbortSignal): Promise<{ capabilities?: CallModelCapabilities } | undefined> {
+    signal?.throwIfAborted()
+    if (this.disposed) throw new Error('ACP session pool disposed')
+    const accountId = this.callAccountFor(model)
+    if (!accountId) return undefined
+    const read = (): CallModelCapabilities | undefined => {
+      const account = this.accountCatalogs.get(accountId)
+      const modelOption = account?.catalog.models.find(m => m.value === model)
+      if (!account || !modelOption) return undefined
+      return { model: modelOption, image: account.image === true, contextWindow: account.windows.get(model) }
+    }
+    const observed = read()
+    if (observed?.model.efforts.length || (observed && this.accountCatalogs.get(accountId)?.catalog.routes.get(model)?.kind === 'legacy')) {
+      return { capabilities: observed }
+    }
+    const enabled = this.accountProvider.getHealthSnapshots?.().filter(a => a.enabled)
+    if (enabled?.length === 1 && enabled[0]?.id === accountId && (!this.catalogAccountId || this.catalogAccountId === accountId)) {
+      // Cold single-account preparation may share the existing constrained menu probe.
+      await this.refreshModels(undefined, signal)
+    } else {
+      // Strict routing must never refresh capabilities under a different account.
+      const runSignal = signal ? AbortSignal.any([this.lifetime.signal, signal]) : this.lifetime.signal
+      await this.probeCatalog(undefined, this.catalogGeneration, { accountId, model }, runSignal)
+    }
+    signal?.throwIfAborted()
+    if (this.callAccountFor(model) !== accountId) throw new Error('ACP account routing changed during call preparation; retry the turn')
+    return { capabilities: read() }
+  }
+
   supportsImageInput(): boolean { return this.initResult?.agentCapabilities?.promptCapabilities?.image === true }
 
   contextWindowFor(model: string): number | undefined {
@@ -494,21 +563,34 @@ export class AcpSessionPool extends EventEmitter {
     if (Number.isSafeInteger(size) && size > 0) {
       sess.contextSize = size
       this.observedWindows.set(model, size)
+      this.accountCatalogs.get(sess.accountId)?.windows.set(model, size)
     }
     sess.lastActiveAt = Date.now()
     this.emitStatus()
   }
 
-  recordTurnUsage(usage: AcpUsage | undefined): void {
-    if (!usage) return
-    const sample = mapUsage(usage)
-    this.usageTotals = {
-      inputTokens: this.usageTotals.inputTokens + sample.inputTokens,
-      outputTokens: this.usageTotals.outputTokens + sample.outputTokens,
-      cachedReadTokens: this.usageTotals.cachedReadTokens + (sample.cacheReadTokens ?? 0),
-      cachedWriteTokens: this.usageTotals.cachedWriteTokens + (sample.cacheWriteTokens ?? 0),
-      reasoningTokens: this.usageTotals.reasoningTokens + (sample.reasoningTokens ?? 0),
+  recordTurnUsage(usage: AcpUsage | undefined, meta?: { accountId?: string; model?: string; countRequest?: boolean }): void {
+    if (this.disposed || (!usage && !meta?.countRequest)) return
+    if (usage) {
+      const sample = mapUsage(usage)
+      this.usageTotals = {
+        inputTokens: this.usageTotals.inputTokens + sample.inputTokens,
+        outputTokens: this.usageTotals.outputTokens + sample.outputTokens,
+        cachedReadTokens: this.usageTotals.cachedReadTokens + (sample.cacheReadTokens ?? 0),
+        cachedWriteTokens: this.usageTotals.cachedWriteTokens + (sample.cacheWriteTokens ?? 0),
+        reasoningTokens: this.usageTotals.reasoningTokens + (sample.reasoningTokens ?? 0),
+      }
     }
+    if (meta?.accountId) {
+      this.usageStore.recordTurn({ accountId: meta.accountId, accountLabel: this.accountLabel(meta.accountId),
+        model: meta.model, countRequest: meta.countRequest, usage: usage && { ...usage, reasoningTokens: usage.thoughtTokens } })
+    }
+    this.emitStatus()
+  }
+
+  resetUsageStats(): void {
+    this.usageStore.reset()
+    this.usageTotals = emptyUsageTotals()
     this.emitStatus()
   }
 
@@ -555,6 +637,8 @@ export class AcpSessionPool extends EventEmitter {
       contextSize: s.contextSize,
       lastActiveAt: s.lastActiveAt,
     }))
+    const accounts = this.getAccountHealthSnapshots()
+    const liveLabels = new Map(accounts.map(a => [a.id, a.label]))
     const connected = Array.from(this.clients.values()).some((c) => c.isRunning)
     const mcpBridge = this.deps.getMcpBridgeSnapshot?.()
     const mcpToolCatalog = this.deps.getMcpToolCatalog?.()
@@ -584,7 +668,8 @@ export class AcpSessionPool extends EventEmitter {
       ...(mcpBridge ? { mcpBridge } : {}),
       ...(mcpToolCatalog ? { mcpToolCatalog } : {}),
       usageTotals: { ...this.usageTotals },
-      accounts: this.getAccountHealthSnapshots(),
+      accountUsage: this.usageStore.getSnapshot({ liveLabels }),
+      accounts,
       preferredAccountId: this.accountProvider.getPreferredAccountId?.() ?? null,
       models: this.cachedModels.filter(m => !m.variantOf),
       ...(this.deps.listReviewProviders ? { reviewProviders: this.deps.listReviewProviders() } : {}),
@@ -601,6 +686,7 @@ export class AcpSessionPool extends EventEmitter {
         mcpBridge: cfg.mcpBridge,
         mcpExposeOverlappingTools: cfg.mcpExposeOverlappingTools,
         ...(cfg.mcpToolPolicy ? { mcpToolPolicy: cfg.mcpToolPolicy } : {}),
+        ...(cfg.modelAccountRouting ? { modelAccountRouting: cfg.modelAccountRouting } : {}),
         quotaAwareScheduling: cfg.quotaAwareScheduling,
         sessionIdleTtlMs: cfg.sessionIdleTtlMs,
         requestTimeoutMs: cfg.requestTimeoutMs,
@@ -662,7 +748,7 @@ export class AcpSessionPool extends EventEmitter {
         session.currentMode = nextMode
       }
       session.lastActiveAt = Date.now()
-      this.captureCatalogFromSession({ configOptions: update.configOptions }, { session })
+      this.captureCatalogFromSession({ configOptions: update.configOptions }, { accountId: session.accountId, session })
       return true
     }
 
@@ -682,7 +768,10 @@ export class AcpSessionPool extends EventEmitter {
       const size = typeof update.size === 'number' && Number.isSafeInteger(update.size) && update.size > 0 ? update.size : 0
       if (size > 0) {
         session.contextSize = size
-        if (session.currentModel) this.observedWindows.set(session.currentModel, size)
+        if (session.currentModel) {
+          this.observedWindows.set(session.currentModel, size)
+          this.accountCatalogs.get(session.accountId)?.windows.set(session.currentModel, size)
+        }
       }
       session.lastActiveAt = Date.now()
       return true
@@ -807,10 +896,12 @@ export class AcpSessionPool extends EventEmitter {
       existing &&
       current?.isRunning &&
       !exclude?.has(existing.accountId) &&
+      !this.accountProvider.shouldSwitchSessionAccount?.(existing.accountId, model, exclude) &&
       this.policies.get(key) === fingerprint
     ) {
       const existingEnv = this.sessionEnvs.get(key) ?? this.accountProvider.getAccountEnv?.(existing.accountId)
       await this.assertEgressAllowed(existing.accountId, existingEnv, this.lifetime.signal)
+      existing.routingModel = model || existing.currentModel
       existing.lastActiveAt = Date.now()
       this.deps.sessionIndex?.updateMeta(key, { touch: true })
       return { client: current, session: existing, created: false }
@@ -882,11 +973,11 @@ export class AcpSessionPool extends EventEmitter {
       }
 
       const leaseEnv = lease.env
-      let launched = await this.newClient(policy, leaseEnv, opening.signal, makePermissionBridge(), makeExitHandler())
+      const launched = await this.newClient(policy, leaseEnv, opening.signal, makePermissionBridge(), makeExitHandler())
       client = launched.client
-      let supportsSystemPromptAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
+      const supportsSystemPromptAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
       opening.signal.throwIfAborted()
-      let mcpServers = await this.deps.getMcpServers?.(key, { preferHttp: supportsMcpHttp(launched.initResult) }) ?? []
+      const mcpServers = await this.deps.getMcpServers?.(key, { preferHttp: supportsMcpHttp(launched.initResult) }) ?? []
       opening.signal.throwIfAborted()
 
       const persisted = !options?.forceNew ? this.deps.sessionIndex?.get(key) : undefined
@@ -908,18 +999,6 @@ export class AcpSessionPool extends EventEmitter {
         bufferedLoadUpdates.set(u.sessionUpdate, u)
       }
 
-      const respawnIfDead = async (): Promise<void> => {
-        if (client?.isRunning) return
-        client?.dispose()
-        this.deps.onSessionClosed?.(key)
-        opening.signal.throwIfAborted()
-        launched = await this.newClient(policy, leaseEnv, opening.signal, makePermissionBridge(), makeExitHandler())
-        client = launched.client
-        supportsSystemPromptAppend = Boolean(launched.initResult.agentCapabilities?._meta?.antigravity?.systemPrompt?.append)
-        mcpServers = await this.deps.getMcpServers?.(key, { preferHttp: supportsMcpHttp(launched.initResult) }) ?? []
-        opening.signal.throwIfAborted()
-      }
-
       if (persistedMatches && persisted) {
         // Never inject DSH's host system prompt via `_meta.antigravity.systemPrompt.append`:
         // Google Cloud Code upstream returns HTTP 429 RESOURCE_EXHAUSTED (triggering ~2.5m silent
@@ -936,21 +1015,16 @@ export class AcpSessionPool extends EventEmitter {
           const unsubResume = client.onSessionUpdate(persisted.acpSessionId, rememberMetadata)
           try {
             const resumeRes: SessionResumeResult = await client.sessionResume(resumePayload)
+            sessionResult = restoredSessionResult(resumeRes, persisted.acpSessionId)
             resumedFromDisk = true
             resumedVia = 'resume'
-            sessionResult = {
-              ...resumeRes,
-              sessionId: resumeRes.sessionId || persisted.acpSessionId,
-            }
           } catch (resumeErr) {
             opening.signal.throwIfAborted()
-            if (isTosViolationError(resumeErr) || isGeoUnsupportedError(resumeErr)) throw resumeErr
+            if (!canReplaceUnrestorableSession(resumeErr)) throw resumeErr
             bufferedLoadUpdates.clear()
             this.deps.log?.(
-              `ACP session/resume failed for "${key}" (${sanitizeDiagnosticText(String(resumeErr), 140)}); ${supportsSessionLoad(launched.initResult) ? 'falling back to session/load' : 'falling back to session/new'}`,
+              `ACP session/resume unavailable for "${key}"; ${supportsSessionLoad(launched.initResult) ? 'trying session/load' : 'starting a new session'}`,
             )
-            if (resumeErr instanceof AcpTimeoutError) client.dispose()
-            await respawnIfDead()
           } finally {
             unsubResume()
           }
@@ -959,31 +1033,20 @@ export class AcpSessionPool extends EventEmitter {
         if (!sessionResult && supportsSessionLoad(launched.initResult)) {
           const unsubReplay = client.onSessionUpdate(persisted.acpSessionId, rememberMetadata)
           try {
-            const loadRes: SessionLoadResult = await client.sessionLoad({
-              ...resumePayload,
-              mcpServers,
-            })
+            const loadRes: SessionLoadResult = await client.sessionLoad(resumePayload)
+            sessionResult = restoredSessionResult(loadRes, persisted.acpSessionId)
             resumedFromDisk = true
             resumedVia = 'load'
-            sessionResult = {
-              ...loadRes,
-              sessionId: loadRes.sessionId || persisted.acpSessionId,
-            }
           } catch (loadErr) {
             opening.signal.throwIfAborted()
-            if (isTosViolationError(loadErr) || isGeoUnsupportedError(loadErr)) throw loadErr
-            this.deps.sessionIndex?.delete(key)
+            // Operational failures leave the index intact. Replace the binding only
+            // after the peer definitively cannot restore it and a new session succeeds.
+            if (!canReplaceUnrestorableSession(loadErr)) throw loadErr
             bufferedLoadUpdates.clear()
-            this.deps.log?.(
-              `ACP session/load failed for "${key}" (${sanitizeDiagnosticText(String(loadErr), 140)}); falling back to session/new`,
-            )
-            if (loadErr instanceof AcpTimeoutError) client.dispose()
-            await respawnIfDead()
+            this.deps.log?.(`ACP session/load unavailable for "${key}"; starting a new session`)
           } finally {
             unsubReplay()
           }
-        } else if (!sessionResult) {
-          this.deps.sessionIndex?.delete(key)
         }
       }
 
@@ -996,7 +1059,9 @@ export class AcpSessionPool extends EventEmitter {
 
       opening.signal.throwIfAborted()
       if (policyKey(this.policy(key)) !== fingerprint) throw new Error('DSH session policy changed during startup')
-      const { routes: modelRoutes, models } = this.captureCatalogFromSession(sessionResult)
+      const { routes: modelRoutes, models } = this.captureCatalogFromSession(sessionResult, {
+        accountId: lease.accountId, image: launched.initResult.agentCapabilities?.promptCapabilities?.image === true,
+      })
       const configOptions = sessionResult.configOptions ?? []
       const appliedSystemHash = resumedFromDisk ? (persisted?.appliedSystemHash ?? null) : null
       const mcpTransport: ManagedAcpSession['mcpTransport'] =
@@ -1012,6 +1077,7 @@ export class AcpSessionPool extends EventEmitter {
         acpSessionId: sessionResult.sessionId,
         accountId: lease.accountId,
         cwd,
+        routingModel: model,
         currentModel: findCurrentOption(configOptions, 'model') ?? sessionResult.models?.currentModelId ?? '',
         currentEffort: findCurrentOption(configOptions, 'thought_level') ?? '',
         currentMode: findCurrentOption(configOptions, 'mode') ?? sessionResult.modes?.currentModeId ?? '',
@@ -1073,7 +1139,7 @@ export class AcpSessionPool extends EventEmitter {
     cwd = cwd || cfg.workspaceRoot || process.cwd()
 
     const requestedModel = params.model || cfg.defaultModel || ''
-    const maxAccounts = this.enabledAccountCount()
+    const maxAccounts = this.isStrictModelRoute(requestedModel) ? 1 : this.enabledAccountCount()
     const triedAccounts = new Set<string>()
 
     const denyAllPermissions = async (req: RequestPermissionParams): Promise<RequestPermissionResult> => {
@@ -1090,6 +1156,7 @@ export class AcpSessionPool extends EventEmitter {
       let client: AcpClient | undefined
       let acpSessionId: string | undefined
       let helperInit: InitializeResult | undefined
+      let usageModel = requestedModel
       let unsub: (() => void) | undefined
       const onAbort = (): void => {
         if (acpSessionId && client?.isRunning) client.sessionCancel(acpSessionId)
@@ -1142,6 +1209,10 @@ export class AcpSessionPool extends EventEmitter {
         if (requestedModel) {
           const route = routes.get(requestedModel)
           const targetModel = route?.value ?? requestedModel
+          if (params.verifySelection && params.effort && (route?.kind === 'legacy' ||
+              (route?.kind === 'config' && route.effort && route.effort !== params.effort))) {
+            throw new Error(`ACP account ${lease.accountId} did not advertise reasoning effort ${params.effort} for ${requestedModel}`)
+          }
           if (targetModel && targetModel !== currentModel) {
             if (route?.kind === 'legacy') {
               await client.request('session/set_model', { sessionId: acpSessionId, modelId: targetModel }, 15_000)
@@ -1156,9 +1227,16 @@ export class AcpSessionPool extends EventEmitter {
               currentModel = mRes.configOptions ? (findCurrentOption(mRes.configOptions, 'model') ?? targetModel) : targetModel
             }
           }
+          if (params.verifySelection && currentModel !== targetModel) {
+            throw new Error(`ACP account ${lease.accountId} did not select model ${requestedModel}`)
+          }
         }
 
         const thoughtOpt = selectOption(configOptions, 'thought_level')
+        if (params.verifySelection && params.effort && thoughtOpt?.currentValue !== params.effort &&
+            !values(thoughtOpt).some(e => e.value === params.effort)) {
+          throw new Error(`ACP account ${lease.accountId} did not advertise reasoning effort ${params.effort} for ${requestedModel}`)
+        }
         if (thoughtOpt) {
           const availableEfforts = sortedEfforts(values(thoughtOpt).map(o => o.value))
           const targetEffort =
@@ -1174,6 +1252,9 @@ export class AcpSessionPool extends EventEmitter {
               value: targetEffort,
             })
             if (eRes.configOptions) configOptions = eRes.configOptions
+            if (params.verifySelection && eRes.configOptions && findCurrentOption(configOptions, 'thought_level') !== targetEffort) {
+              throw new Error(`ACP account ${lease.accountId} did not select reasoning effort ${targetEffort} for ${requestedModel}`)
+            }
           }
         }
 
@@ -1185,20 +1266,24 @@ export class AcpSessionPool extends EventEmitter {
 
         const promptBlocks = [params.systemFallbackBlock, ...params.prompt]
         const timeoutMs = params.timeoutMs ?? Math.min(cfg.requestTimeoutMs, 90_000)
+        usageModel = requestedModel || currentModel
+        const meta = { accountId: lease.accountId, model: usageModel }
         const watcher = createTurnOutcomeWatcher(acpSessionId, lease.env)
         const result = await client.sessionPrompt({ sessionId: acpSessionId, prompt: promptBlocks }, timeoutMs)
         runSignal.throwIfAborted()
-        const hidden = watcher.check(result)
+        const completed = result.stopReason !== 'cancelled' && result.stopReason !== 'aborted'
+        const hidden = completed && watcher.check(result)
         if (hidden) {
-          this.recordTurnUsage(result.usage)
+          this.recordTurnUsage(result.usage, { ...meta, countRequest: false })
           throw Object.assign(new Error(`${hidden.kind === 'quota' ? 'QUOTA_EXHAUSTED' : hidden.code}: ${hidden.message}`), { resetAt: hidden.resetAt })
         }
-        this.reportAccountSuccess(lease.accountId, requestedModel)
-        this.recordTurnUsage(result.usage)
+        if (completed) this.reportAccountSuccess(lease.accountId, requestedModel)
+        this.recordTurnUsage(result.usage, { ...meta, countRequest: completed })
         return result
       } catch (err) {
+        if (runSignal.aborted) throw err
         if (isTosViolationError(err)) {
-          this.reportAccountFailure(lease.accountId, requestedModel, err)
+          this.reportAccountFailure(lease.accountId, usageModel, err)
           throw err
         }
         if (err instanceof EgressBlockedError) {
@@ -1211,14 +1296,14 @@ export class AcpSessionPool extends EventEmitter {
         if (isGeoUnsupportedError(err)) {
           this.recordGeoRejection(lease.accountId, lease.env)
           triedAccounts.add(lease.accountId)
-          this.reportAccountFailure(lease.accountId, requestedModel, err)
+          this.reportAccountFailure(lease.accountId, usageModel, err)
           if (triedAccounts.size < maxAccounts && !runSignal.aborted) {
             continue
           }
           throw err
         }
         const resetAt = err instanceof Error && 'resetAt' in err && typeof err.resetAt === 'number' ? err.resetAt : undefined
-        this.reportAccountFailure(lease.accountId, requestedModel, err, { resetAt })
+        this.reportAccountFailure(lease.accountId, usageModel, err, { resetAt })
         throw err
       } finally {
         runSignal.removeEventListener('abort', onAbort)
@@ -1234,10 +1319,18 @@ export class AcpSessionPool extends EventEmitter {
   async syncSessionOptions(
     client: AcpClient,
     session: ManagedAcpSession,
-    desired: { model?: string; effort?: string; configuredEffort?: string; mode?: string },
+    desired: { model?: string; effort?: string; configuredEffort?: string; mode?: string; verifySelection?: boolean },
   ): Promise<void> {
     const route = desired.model ? session.modelRoutes.get(desired.model) : undefined
     const model = route?.value ?? desired.model
+    if (desired.verifySelection && model && model !== session.currentModel && !route &&
+        !values(selectOption(session.configOptions, 'model')).some(e => e.value === model)) {
+      throw new Error(`ACP account ${session.accountId} did not advertise model ${desired.model}`)
+    }
+    if (desired.verifySelection && desired.effort && (route?.kind === 'legacy' ||
+        (route?.kind === 'config' && route.effort && route.effort !== desired.effort))) {
+      throw new Error(`ACP account ${session.accountId} did not advertise reasoning effort ${desired.effort} for ${desired.model}`)
+    }
     if (model && model !== session.currentModel) {
       let catalogOptions: AcpConfigOption[] | undefined
       if (route?.kind === 'legacy') {
@@ -1263,7 +1356,7 @@ export class AcpSessionPool extends EventEmitter {
       }
       session.contextUsed = null
       session.contextSize = 0
-      if (catalogOptions) this.captureCatalogFromSession({ configOptions: catalogOptions }, { session })
+      if (catalogOptions) this.captureCatalogFromSession({ configOptions: catalogOptions }, { accountId: session.accountId, session })
     }
     const fixedEffort = route?.kind === 'config' ? route.effort : undefined
     const effort = route?.kind === 'legacy' ? undefined : fixedEffort ?? desired.effort
@@ -1287,7 +1380,7 @@ export class AcpSessionPool extends EventEmitter {
       if (res.configOptions) {
         session.configOptions = res.configOptions
         session.currentMode = findCurrentOption(res.configOptions, 'mode') ?? desired.mode
-        if (route?.kind === 'config') {
+        if (route?.kind === 'config' || (desired.verifySelection && effort)) {
           session.currentEffort = findCurrentOption(res.configOptions, 'thought_level') ?? ''
           if (effort && session.currentEffort !== effort) throw new Error(`agy did not retain reasoning effort ${effort} for ${desired.model}`)
         }
@@ -1298,6 +1391,11 @@ export class AcpSessionPool extends EventEmitter {
   }
 
   invalidateCatalog(): void {
+    this.accountCatalogs.clear()
+    this.restartCatalogProbe()
+  }
+
+  private restartCatalogProbe(): void {
     this.catalogGeneration++
     this.catalogExpiresAt = 0
     clearTimeout(this.catalogRetry)
@@ -1362,7 +1460,7 @@ export class AcpSessionPool extends EventEmitter {
 
   async forceRefreshModels(cwd?: string): Promise<AcpModelOption[]> {
     if (this.disposed) throw new Error('ACP session pool disposed')
-    this.invalidateCatalog()
+    this.restartCatalogProbe()
     return await this.runCatalogProbe(cwd)
   }
 
@@ -1377,14 +1475,19 @@ export class AcpSessionPool extends EventEmitter {
     await client.request(method, { sessionId: id }, 1_000).catch(() => {})
   }
 
-  private async probeCatalog(cwd?: string, expectedGen?: number): Promise<AcpModelOption[]> {
+  private async probeCatalog(
+    cwd?: string,
+    expectedGen?: number,
+    target?: { accountId: string; model: string },
+    signal = this.lifetime.signal,
+  ): Promise<AcpModelOption[]> {
     const cfg = this.deps.getConfig()
-    const maxAccounts = this.enabledAccountCount()
+    const maxAccounts = target ? 1 : this.enabledAccountCount()
     const triedAccounts = new Set<string>()
     for (let attempt = 0; attempt < maxAccounts; attempt++) {
       const lease = await this.acquireAccountLease(
         '__catalog__',
-        '',
+        target?.model ?? '',
         triedAccounts.size > 0 ? triedAccounts : undefined,
       )
       let client: AcpClient | undefined
@@ -1392,27 +1495,35 @@ export class AcpSessionPool extends EventEmitter {
       let probeId: string | undefined
       let probeInit: InitializeResult | undefined
       try {
-        await this.assertEgressAllowed(lease.accountId, lease.env, this.lifetime.signal)
+        signal.throwIfAborted()
+        if (target && lease.accountId !== target.accountId) throw new Error('ACP catalog account changed during preparation; retry the turn')
+        await this.assertEgressAllowed(lease.accountId, lease.env, signal)
         // No initiating agent: never prompt, attach MCP, or start an unrestricted helper.
-        const launched = await this.newClient({ sessionId: '__catalog__', workspaceRoot: root, mode: 'read-only' }, lease.env, this.lifetime.signal)
+        const launched = await this.newClient({ sessionId: '__catalog__', workspaceRoot: root, mode: 'read-only' }, lease.env, signal)
         client = launched.client
         probeInit = launched.initResult
-        this.lifetime.signal.throwIfAborted()
-        const stop = () => client?.dispose()
-        this.lifetime.signal.addEventListener('abort', stop, { once: true })
+        signal.throwIfAborted()
+        const activeClient = client
+        const stop = () => activeClient.dispose(signal.reason)
+        signal.addEventListener('abort', stop, { once: true })
         try {
           const res = await client.sessionNew({ cwd: root, mcpServers: [] })
           probeId = res.sessionId
+          signal.throwIfAborted()
           this.accountProvider.markAuthVerified?.(lease.accountId)
           if (expectedGen !== undefined && expectedGen !== this.catalogGeneration) {
             return this.cachedModels
           }
-          this.captureCatalogFromSession(res, { fromProbe: true })
+          this.captureCatalogFromSession(res, {
+            accountId: lease.accountId, fromProbe: target ? 'target' : 'menu',
+            image: launched.initResult.agentCapabilities?.promptCapabilities?.image === true,
+          })
         } finally {
-          this.lifetime.signal.removeEventListener('abort', stop)
+          signal.removeEventListener('abort', stop)
         }
         return this.cachedModels
       } catch (err) {
+        signal.throwIfAborted()
         if (isTosViolationError(err)) {
           this.reportAccountFailure(lease.accountId, '', err)
           throw err
@@ -1422,19 +1533,20 @@ export class AcpSessionPool extends EventEmitter {
         }
         if (err instanceof EgressBlockedError) {
           triedAccounts.add(lease.accountId)
-          if (triedAccounts.size < maxAccounts && !this.lifetime.signal.aborted) {
+          if (triedAccounts.size < maxAccounts && !signal.aborted) {
             continue
           }
         } else if (isGeoUnsupportedError(err)) {
-          this.recordGeoRejection(lease.accountId, lease.env)
+          // Keep the account's breaker armed without replacing the menu's error.
+          this.recordGeoRejection(lease.accountId, lease.env, !target)
           triedAccounts.add(lease.accountId)
-          if (triedAccounts.size < maxAccounts && !this.lifetime.signal.aborted) {
+          if (triedAccounts.size < maxAccounts && !signal.aborted) {
             continue
           }
         }
         throw err
       } finally {
-        if (!this.lifetime.signal.aborted) await this.finishHelperSession(client, probeInit, probeId)
+        if (!signal.aborted) await this.finishHelperSession(client, probeInit, probeId)
         client?.dispose()
         lease.release()
       }
@@ -1463,6 +1575,10 @@ export class AcpSessionPool extends EventEmitter {
     this.emitStatus()
   }
 
+  isStrictModelRoute(model: string): boolean {
+    return this.accountProvider.isStrictModelRoute?.(model) ?? false
+  }
+
   enabledAccountCount(): number {
     const snapshots = this.accountProvider.getHealthSnapshots?.()
     if (snapshots && snapshots.length > 0) {
@@ -1476,8 +1592,9 @@ export class AcpSessionPool extends EventEmitter {
   switchActiveAccount(accountId: string | null): void {
     this.accountProvider.setPreferredAccount?.(accountId)
     if (accountId !== null) {
+      const routing = this.accountProvider.getModelRouting?.()
       for (const [key, session] of this.sessions) {
-        if (session.accountId === accountId) continue
+        if (session.accountId === accountId || resolveModelAccountRoute(routing, session.routingModel || session.currentModel)) continue
         this.deps.sessionIndex?.delete(key)
         const turn = this.active.get(key)
         if (turn) turn.retire = true
@@ -1500,6 +1617,8 @@ export class AcpSessionPool extends EventEmitter {
 
   /** Evict live sessions currently pinned to an account (e.g. after removal, disable, or proxy change). */
   evictSessionsForAccount(accountId: string, reason?: Error): number {
+    this.accountCatalogs.delete(accountId)
+    this.restartCatalogProbe()
     let closed = 0
     for (const [key, session] of [...this.sessions.entries()]) {
       if (session.accountId === accountId) {
@@ -1557,32 +1676,47 @@ export class AcpSessionPool extends EventEmitter {
     for (const key of keys) this.invalidate(key, reason)
     this.accountProvider.dispose?.()
     this.removeAllListeners()
+    this.usageStore.dispose()
   }
 
   private captureCatalogFromSession(
     res: Pick<SessionNewResult, 'configOptions' | 'models' | '_meta'>,
-    { session, fromProbe }: { session?: ManagedAcpSession; fromProbe?: boolean } = {},
+    { accountId, session, fromProbe, image }: {
+      accountId: string; session?: ManagedAcpSession; fromProbe?: 'menu' | 'target'; image?: boolean
+    },
   ): ModelCatalog {
     const snapshot = modelCatalog(res)
     if (fromProbe && !snapshot.models.length) throw new Error('agy returned an empty ACP model catalog')
     if (this.disposed) return snapshot
+    const account: AccountModelCatalog = this.accountCatalogs.get(accountId) ?? { catalog: { models: [], routes: new Map() }, windows: new Map() }
+    if (image !== undefined) account.image = image
+    this.accountCatalogs.set(accountId, account)
+    const menuProbe = fromProbe === 'menu'
+    const sameMenuAccount = this.catalogAccountId === accountId
+    const publishMenu = menuProbe || (fromProbe !== 'target' && (sameMenuAccount || this.catalogAccountId === undefined))
     const tier = res._meta?.antigravity?.tier?.name
-    if (tier) this.cachedTier = tier
-    if (!snapshot.models.length) return this.cachedCatalog
+    if (publishMenu && tier) this.cachedTier = tier
+    if (!snapshot.models.length) return account.catalog
     if (session) {
       const local = mergeModelCatalog({ models: session.models, routes: session.modelRoutes }, snapshot)
       session.models = local.models
       session.modelRoutes = local.routes
     }
-    const catalog = mergeModelCatalog(this.cachedCatalog, snapshot)
-    const signature = JSON.stringify(catalog.models)
-    const recovered = this.lastError !== null && (snapshot.complete || fromProbe)
+    const catalog = mergeModelCatalog(account.catalog, snapshot)
+    account.catalog = catalog
+    if (!publishMenu) return catalog
+    // Merge only with the same account's published menu, never its call catalog:
+    // a targeted probe may have replaced that catalog with a narrower snapshot.
+    const menuCatalog = sameMenuAccount ? mergeModelCatalog(this.cachedCatalog, snapshot) : snapshot
+    const signature = JSON.stringify(menuCatalog.models)
+    const recovered = this.lastError !== null && (snapshot.complete || menuProbe)
     const changed = signature !== this.catalogSignature || recovered
     this.catalogSignature = signature
-    this.cachedCatalog = catalog
+    this.cachedCatalog = menuCatalog
+    this.catalogAccountId = accountId
     // Session metadata can improve capabilities, but only a complete snapshot is fresh for five minutes.
     if (snapshot.complete) this.catalogExpiresAt = Date.now() + 5 * 60_000
-    if (snapshot.complete || fromProbe) {
+    if (snapshot.complete || menuProbe) {
       this.lastError = null
       clearTimeout(this.catalogRetry)
       this.catalogRetry = undefined
@@ -1599,6 +1733,21 @@ export class AcpSessionPool extends EventEmitter {
     if (this.listenerCount('status') === 0) return
     this.emit('status', this.getStatus())
   }
+}
+
+function canReplaceUnrestorableSession(err: unknown): boolean {
+  if (!(err instanceof AcpRpcError) || isTosViolationError(err) || isGeoUnsupportedError(err)) return false
+  // JSON-RPC method not found, or the peer explicitly says the native session is absent.
+  // In particular, process exits, timeouts, internal errors and EROFS are not evidence of loss.
+  return err.code === -32601 ||
+    (err.code === -32002 && /^ACP RPC error \(-32002\): (?:session not found|unknown session)(?:\s*[:.]|$)/i.test(err.message))
+}
+
+function restoredSessionResult(result: SessionLoadResult | SessionResumeResult, sessionId: string): SessionNewResult {
+  if (result.sessionId !== undefined && result.sessionId !== sessionId) {
+    throw new Error('ACP recovery returned a different session ID; the original binding was preserved')
+  }
+  return { ...result, sessionId }
 }
 
 function findCurrentOption(options: AcpConfigOption[], id: string): string | undefined {

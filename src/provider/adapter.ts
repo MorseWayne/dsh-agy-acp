@@ -31,6 +31,7 @@ import {
   MIRROR_TOOL_NAME,
   PROVIDER_ID,
   WRAPPER_TOOL_NAME,
+  type AcpModelOption,
   type PluginConfig,
 } from '../common/types.ts'
 import { isQuotaOrRateLimitError, isTosViolationError } from '../runtime/account-pool.ts'
@@ -126,13 +127,18 @@ export class AcpAdapter extends LlmAdapter {
     })
     signal?.throwIfAborted()
     const matched = models.find((m) => m.value === model)
-    const contextWindow = this.deps.pool.contextWindowFor(model)
+    return this.modelInfo(model, matched, this.inputModalities(), this.deps.pool.contextWindowFor(model))
+  }
+
+  private modelInfo(
+    model: string, matched: AcpModelOption | undefined, inputModalities: ('text' | 'image')[], contextWindow?: number,
+  ): LlmResolvedModelInfo {
     const effort = defaultEffort(matched, this.deps.getConfig().defaultEffort)
     return {
       provider: PROVIDER_ID,
       id: model,
       name: matched?.name ?? model,
-      inputModalities: this.inputModalities(),
+      inputModalities,
       ...(contextWindow ? { context: { contextWindow } } : {}),
       ...(matched && effort
         ? {
@@ -152,21 +158,36 @@ export class AcpAdapter extends LlmAdapter {
     model: LlmResolvedModelInfo
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>
   }> {
-    const modelInfo = await this.resolveModel(provider, model, signal)
+    const selected = await this.deps.pool.resolveCallModelCapabilities(model, signal).catch((err: unknown) => {
+      signal?.throwIfAborted()
+      if (err instanceof LlmError) throw err
+      throw new LlmError(formatCatalogProbeError(err), 'DISCOVERY_FAILED', { cause: err })
+    })
+    signal?.throwIfAborted()
+    const caps = selected?.capabilities
+    let modelInfo: LlmResolvedModelInfo
+    if (selected) {
+      modelInfo = this.modelInfo(model, caps?.model, caps?.image && this.deps.readImage ? ['text', 'image'] : ['text'], caps?.contextWindow)
+    } else {
+      // With automatic account selection this is only a discovery preflight.
+      // Never use another account's observed context window to plan this call.
+      const { context: _unscopedContext, ...discovery } = await this.resolveModel(provider, model, signal)
+      modelInfo = discovery
+    }
     return {
       model: modelInfo,
-      stream: (options) => this.stream({ ...options, signal: options.signal ?? signal }),
+      stream: (options) => this.stream({ ...options, signal: options.signal ?? signal }, true),
     }
   }
 
-  override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+  override async *stream(options: GenerateOptions, verifySelection = false): AsyncIterable<StreamChunk> {
     const cfg = this.deps.getConfig()
     if (!cfg.enabled) {
       throw new LlmError('dsh-agy-acp is disabled by config', 'PROVIDER_DISABLED')
     }
 
     if (options.purpose) {
-      yield* this.streamAuxiliary(options)
+      yield* this.streamAuxiliary(options, verifySelection)
       return
     }
 
@@ -254,7 +275,7 @@ export class AcpAdapter extends LlmAdapter {
         if (err instanceof EgressBlockedError && !options.signal?.aborted) {
           lastEgressBlockedError = err
           triedAccounts.add(err.accountId)
-          if (triedAccounts.size < maxAccounts) {
+          if (triedAccounts.size < maxAccounts && !this.deps.pool.isStrictModelRoute?.(requestedModel)) {
             this.deps.log?.(
               `account "${err.accountId}" blocked by local egress geo-fence, failing over (${triedAccounts.size}/${maxAccounts} tried)`,
             )
@@ -296,6 +317,7 @@ export class AcpAdapter extends LlmAdapter {
           effort: options.reasoningEffort,
           configuredEffort: cfg.defaultEffort,
           mode: targetMode,
+          verifySelection,
         })
       } catch (err) {
         if (err instanceof AcpProcessExitError) {
@@ -361,7 +383,7 @@ export class AcpAdapter extends LlmAdapter {
         const isGeoErr =
           isGeoUnsupportedError(firstItem.error) ||
           (firstItem.error instanceof LlmError && firstItem.error.code === 'ACP_GEO_UNSUPPORTED')
-        if (!isTosErr && (isQuotaOrRateLimitError(firstItem.error) || isGeoErr)) {
+        if (!isTosErr && !this.deps.pool.isStrictModelRoute?.(targetModel) && (isQuotaOrRateLimitError(firstItem.error) || isGeoErr)) {
           triedAccounts.add(session.accountId)
           if (triedAccounts.size < maxAccounts) {
             this.deps.log?.(
@@ -401,6 +423,7 @@ export class AcpAdapter extends LlmAdapter {
   ) {
       const { client, session, policy, targetModel, targetMode } = launch
       const sessionKey = session.dshSessionKey
+      const usageMeta = { accountId: session.accountId, model: session.routingModel || targetModel }
       const cfg = this.deps.getConfig()
       const turn = this.deps.pool.beginPrompt(session, signal)
       const outcomeWatcher = createTurnOutcomeWatcher(
@@ -449,12 +472,13 @@ export class AcpAdapter extends LlmAdapter {
       void client
         .sessionPrompt({ sessionId: session.acpSessionId, prompt: promptBlocks }, cfg.requestTimeoutMs)
         .then((res) => {
-          const hiddenFailure = signal?.aborted || rec.isCancelled
+          const cancelled = signal?.aborted || rec.isCancelled || res.stopReason === 'cancelled' || res.stopReason === 'aborted'
+          const hiddenFailure = cancelled
             ? undefined
             : (outcomeWatcher.check(res) ??
               evaluateInlineWarningFallback(res.stopReason, rec.inlineMessageText, rec.hasThoughtOrTool, res.usage))
           if (hiddenFailure) {
-            this.deps.pool.recordTurnUsage(res.usage)
+            if (res.usage) this.deps.pool.recordTurnUsage(res.usage, { ...usageMeta, countRequest: false })
             if (hiddenFailure.kind === 'tos') {
               const tosErr = new LlmError(
                 `[风控熔断] 账号“${session.accountId}”触发上游服务条款/账号风控限制（TOS_VIOLATION）。已立即本地隔离该账号并中止自动切换备用账号，以防连坐封禁；请排查请求内容与账号状态后在控制台手动解除隔离。`,
@@ -482,9 +506,11 @@ export class AcpAdapter extends LlmAdapter {
             if (hiddenFailure.sessionBroken) {
               // Saved thinking signature corrupted: permanently broken native session, evict so next turn rebuilds cleanly.
               this.deps.log?.(`evicting corrupted ACP session "${sessionKey}" (${hiddenFailure.code})`)
+              const err = new LlmError(hiddenFailure.message, hiddenFailure.code)
+              this.deps.pool.recordAccountFailureUsage(session.accountId, usageMeta.model, err)
               if (this.deps.pool.owns(session)) this.deps.pool.evictSession(sessionKey)
               cleanupTurn()
-              rec.fail(new LlmError(hiddenFailure.message, hiddenFailure.code))
+              rec.fail(err)
               return
             }
             const err = new LlmError(
@@ -502,8 +528,8 @@ export class AcpAdapter extends LlmAdapter {
             return
           }
           if (pendingSystemHash) this.deps.pool.recordAppliedSystemHash(session, pendingSystemHash)
-          if (!signal?.aborted && !rec.isCancelled) this.deps.pool.reportAccountSuccess(session.accountId, targetModel)
-          this.deps.pool.recordTurnUsage(res.usage)
+          if (!cancelled) this.deps.pool.reportAccountSuccess(session.accountId, targetModel)
+          this.deps.pool.recordTurnUsage(res.usage, { ...usageMeta, countRequest: !cancelled })
           // Release active turn slot synchronously BEFORE waking consumers to prevent next-turn race.
           cleanupTurn()
           rec.finish(res.stopReason, res.usage)
@@ -530,7 +556,11 @@ export class AcpAdapter extends LlmAdapter {
           }
           let forceInvalidate = false
           let evictCorruptedSession = false
-          if (!(err instanceof AcpProcessExitError) && isInvalidThinkingSignatureError(error)) {
+          if (signal?.aborted || rec.isCancelled) {
+            // Cancellation can reject session/prompt with a generic RPC/process error.
+            // Keep normal transport cleanup below, without counting an account failure.
+          } else if (!(err instanceof AcpProcessExitError) && isInvalidThinkingSignatureError(error)) {
+            this.deps.pool.recordAccountFailureUsage(session.accountId, usageMeta.model, error)
             evictCorruptedSession = true
             error = new LlmError(
               'Antigravity 历史会话中的 thinking 签名已失效（INVALID_THINKING_SIGNATURE），已自动重置原生会话，下条消息将携带摘要重建新会话。',
@@ -602,7 +632,7 @@ export class AcpAdapter extends LlmAdapter {
     }
   }
 
-  private async *streamAuxiliary(options: GenerateOptions): AsyncIterable<StreamChunk> {
+  private async *streamAuxiliary(options: GenerateOptions, verifySelection: boolean): AsyncIterable<StreamChunk> {
     if (options.signal?.aborted) {
       yield {
         type: 'finish',
@@ -637,6 +667,7 @@ export class AcpAdapter extends LlmAdapter {
         model: resolvedModel,
         effort: resolvedEffort,
         preferLowestEffort: isAutoReview && !resolvedEffort,
+        verifySelection,
         systemPromptAppend: append,
         systemFallbackBlock: fallbackBlock,
         prompt,

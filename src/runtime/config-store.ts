@@ -114,6 +114,7 @@ export class ConfigStore {
 
     const tmpPath = path.join(dir, `.config.${process.pid}.${randomUUID().slice(0, 8)}.tmp`)
     const payload = JSON.stringify({ version: 1, config: nextPersisted }, null, 2) + '\n'
+    if (Buffer.byteLength(payload) > MAX_CONFIG_FILE_BYTES) throw new Error('配置内容过大，无法持久化')
     try {
       writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
       renameSync(tmpPath, this.filePath)
