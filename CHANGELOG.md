@@ -2,6 +2,11 @@
 
 All notable changes to `@morsewayne/dsh-agy-acp` are documented in this file.
 
+## [0.8.1] - 2026-11-27
+
+### Fixed
+- **DSH mid-turn message delivery**: Continue the current DSH turn when a user or agent message arrives alongside an outstanding tool result, avoiding `ACP session already has an active turn`. Deliver the message through the waiting reverse MCP call or a follow-up prompt on the same ACP session, without replaying completed tools.
+
 ## [0.8.0] - 2026-11-27
 
 ### Added

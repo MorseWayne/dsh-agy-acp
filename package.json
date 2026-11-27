@@ -1,6 +1,6 @@
 {
   "name": "@morsewayne/dsh-agy-acp",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Next-generation Google Antigravity (agy acp) bridge plugin for DeepSeek Harness — persistent ACP JSON-RPC sessions, interactive permission callbacks, native tool mirroring, and SSE status stream.",
   "type": "module",
   "license": "MIT",
