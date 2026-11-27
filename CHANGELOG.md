@@ -2,6 +2,12 @@
 
 All notable changes to `@morsewayne/dsh-agy-acp` are documented in this file.
 
+## [0.8.3] - 2026-11-27
+
+### Fixed
+- **ACP model catalog updates**: Merge partial `config_option_update`, `session/resume`, and `session/load` results without dropping other models' reasoning efforts, fixed variants, or legacy routes. Only complete snapshots renew the five-minute cache lifetime.
+- **Cold model discovery errors**: Report the underlying probe failure as `DISCOVERY_FAILED` when no cached catalog is available. Callers can cancel their wait without interrupting discovery for other requests.
+
 ## [0.8.2] - 2026-11-27
 
 ### Fixed
