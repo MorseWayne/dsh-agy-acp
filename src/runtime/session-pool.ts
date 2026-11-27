@@ -2,7 +2,7 @@ import { cancelled, canFinishConfinedTurn, policyKey, SessionPolicyChangedError,
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { EventEmitter } from 'node:events'
+import { addAbortListener, EventEmitter } from 'node:events'
 import { AcpClient, AcpProcessExitError, AcpTimeoutError } from '../acp/client.ts'
 import { transcriptCandidates } from '../acp/transcript-usage.ts'
 import { isGeoUnsupportedError } from '../common/geo.ts'
@@ -57,7 +57,7 @@ import type { SessionIndex } from './session-index.ts'
 import { defaultEffort, sortedEfforts } from '../common/effort.ts'
 import { createTurnOutcomeWatcher } from '../acp/turn-outcome.ts'
 import { mapUsage } from '../acp/usage.ts'
-import { modelCatalog, selectOption, values } from './model-catalog.ts'
+import { mergeModelCatalog, modelCatalog, selectOption, values, type ModelCatalog } from './model-catalog.ts'
 
 export class EgressCheckError extends Error {
   constructor(message: string, readonly status = 400) {
@@ -67,7 +67,7 @@ export class EgressCheckError extends Error {
 
 export interface ManagedAcpSession {
   models: AcpModelOption[]
-  modelRoutes: ReturnType<typeof modelCatalog>['routes']
+  modelRoutes: ModelCatalog['routes']
   dshSessionKey: string
   acpSessionId: string
   accountId: string
@@ -206,7 +206,8 @@ export class AcpSessionPool extends EventEmitter {
   private readonly sessionUnsubs = new Map<string, () => void>()
   private readonly accountProvider: AccountProvider
   private readonly egressGuard: EgressGuard
-  private cachedModels: AcpModelOption[] = []
+  private cachedCatalog: ModelCatalog = { models: [], routes: new Map() }
+  private get cachedModels(): AcpModelOption[] { return this.cachedCatalog.models }
   private readonly observedWindows = new Map<string, number>()
   private catalogExpiresAt = 0
   private cachedTier: string | null = null
@@ -640,13 +641,8 @@ export class AcpSessionPool extends EventEmitter {
       if (nextMode) {
         session.currentMode = nextMode
       }
-      const nextCatalog = modelCatalog({ configOptions: update.configOptions })
-      if (nextCatalog.models.length > 0) {
-        session.models = nextCatalog.models
-        session.modelRoutes = nextCatalog.routes
-        this.captureCatalogFromSession({ sessionId: session.acpSessionId, configOptions: update.configOptions })
-      }
       session.lastActiveAt = Date.now()
+      this.captureCatalogFromSession({ configOptions: update.configOptions }, { session })
       return true
     }
 
@@ -1223,30 +1219,31 @@ export class AcpSessionPool extends EventEmitter {
     const route = desired.model ? session.modelRoutes.get(desired.model) : undefined
     const model = route?.value ?? desired.model
     if (model && model !== session.currentModel) {
+      let catalogOptions: AcpConfigOption[] | undefined
       if (route?.kind === 'legacy') {
         await client.request('session/set_model', { sessionId: session.acpSessionId, modelId: model }, 15_000)
         session.currentModel = model
         session.currentEffort = ''
       } else {
+        const modelOption = selectOption(session.configOptions, 'model')
         const res = await client.sessionSetConfigOption({
           sessionId: session.acpSessionId,
-          configId: selectOption(session.configOptions, 'model')?.id ?? 'model', value: model,
+          configId: modelOption?.id ?? 'model', value: model,
         })
         if (res.configOptions) session.configOptions = res.configOptions
         session.currentModel = res.configOptions ? findCurrentOption(res.configOptions, 'model') ?? model : model
         session.currentEffort = findCurrentOption(res.configOptions ?? [], 'thought_level') ?? ''
         if (session.currentModel !== model) throw new Error(`agy did not select model ${model}`)
-        // Some peers advertise levels only after switching the model. Never
-        // copy the previous model's selector into this model's capabilities.
-        const base = session.models.find(m => m.value === model)
-        const thought = selectOption(res.configOptions, 'thought_level')
-        if (base && !base.efforts.length && thought) {
-          base.efforts = sortedEfforts(values(thought).map(o => o.value))
-          base.nativeEffort = thought.currentValue
+        if (res.configOptions) {
+          // Some peers advertise levels only after switching. Use the new thought selector, never the old model's.
+          catalogOptions = modelOption && !selectOption(res.configOptions, 'model')
+            ? [...res.configOptions, { ...modelOption, currentValue: model }]
+            : res.configOptions
         }
       }
       session.contextUsed = null
       session.contextSize = 0
+      if (catalogOptions) this.captureCatalogFromSession({ configOptions: catalogOptions }, { session })
     }
     const fixedEffort = route?.kind === 'config' ? route.effort : undefined
     const effort = route?.kind === 'legacy' ? undefined : fixedEffort ?? desired.effort
@@ -1323,15 +1320,23 @@ export class AcpSessionPool extends EventEmitter {
     return this.catalogProbe
   }
 
-  async refreshModels(cwd?: string): Promise<AcpModelOption[]> {
+  async refreshModels(cwd?: string, signal?: AbortSignal): Promise<AcpModelOption[]> {
+    signal?.throwIfAborted()
     if (this.cachedModels.length > 0 && Date.now() < this.catalogExpiresAt) return this.cachedModels
+    const probe = this.runCatalogProbe(cwd)
+    // Cancel only this caller's wait: the constrained probe is shared by unrelated callers.
+    const aborted = signal ? Promise.withResolvers<never>() : undefined
+    const listener = signal && aborted ? addAbortListener(signal, () => aborted.reject(signal.reason)) : undefined
     try {
-      return await this.runCatalogProbe(cwd)
+      return await (aborted ? Promise.race([probe, aborted.promise]) : probe)
     } catch (err) {
+      signal?.throwIfAborted()
       if (!this.disposed && this.cachedModels.length > 0) {
         return this.cachedModels
       }
       throw err
+    } finally {
+      listener?.[Symbol.dispose]()
     }
   }
 
@@ -1381,8 +1386,7 @@ export class AcpSessionPool extends EventEmitter {
           if (expectedGen !== undefined && expectedGen !== this.catalogGeneration) {
             return this.cachedModels
           }
-          const catalog = this.captureCatalogFromSession(res)
-          if (!catalog.models.length) throw new Error('agy returned an empty ACP model catalog')
+          this.captureCatalogFromSession(res, { fromProbe: true })
         } finally {
           this.lifetime.signal.removeEventListener('abort', stop)
         }
@@ -1484,20 +1488,35 @@ export class AcpSessionPool extends EventEmitter {
     this.removeAllListeners()
   }
 
-  private captureCatalogFromSession(res: SessionNewResult) {
+  private captureCatalogFromSession(
+    res: Pick<SessionNewResult, 'configOptions' | 'models' | '_meta'>,
+    { session, fromProbe }: { session?: ManagedAcpSession; fromProbe?: boolean } = {},
+  ): ModelCatalog {
+    const snapshot = modelCatalog(res)
+    if (fromProbe && !snapshot.models.length) throw new Error('agy returned an empty ACP model catalog')
+    if (this.disposed) return snapshot
     const tier = res._meta?.antigravity?.tier?.name
     if (tier) this.cachedTier = tier
-    const catalog = modelCatalog(res)
-    if (!catalog.models.length || this.disposed) return catalog
-    const signature = JSON.stringify(catalog.models.filter(m => !m.variantOf))
-    const changed = signature !== this.catalogSignature || this.lastError !== null
+    if (!snapshot.models.length) return this.cachedCatalog
+    if (session) {
+      const local = mergeModelCatalog({ models: session.models, routes: session.modelRoutes }, snapshot)
+      session.models = local.models
+      session.modelRoutes = local.routes
+    }
+    const catalog = mergeModelCatalog(this.cachedCatalog, snapshot)
+    const signature = JSON.stringify(catalog.models)
+    const recovered = this.lastError !== null && (snapshot.complete || fromProbe)
+    const changed = signature !== this.catalogSignature || recovered
     this.catalogSignature = signature
-    this.cachedModels = catalog.models
-    this.catalogExpiresAt = Date.now() + 5 * 60_000
-    this.lastError = null
-    clearTimeout(this.catalogRetry)
-    this.catalogRetry = undefined
-    this.catalogRetryCount = 0
+    this.cachedCatalog = catalog
+    // Session metadata can improve capabilities, but only a complete snapshot is fresh for five minutes.
+    if (snapshot.complete) this.catalogExpiresAt = Date.now() + 5 * 60_000
+    if (snapshot.complete || fromProbe) {
+      this.lastError = null
+      clearTimeout(this.catalogRetry)
+      this.catalogRetry = undefined
+      this.catalogRetryCount = 0
+    }
     if (changed) {
       this.emitStatus()
       this.emit('models-updated')

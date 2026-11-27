@@ -2,8 +2,12 @@ import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
+import { LlmError } from '@deepseek-ai/dsh-llm'
 import { AcpProcessExitError, AcpTimeoutError } from '../src/acp/client.ts'
 import { resolveConfig } from '../src/common/config.ts'
+import { PROVIDER_ID } from '../src/common/types.ts'
+import { AcpAdapter } from '../src/provider/adapter.ts'
+import { AcpRunStore } from '../src/provider/run-store.ts'
 import { EgressGuard } from '../src/runtime/egress-guard.ts'
 import { AcpSessionPool, formatCatalogProbeError } from '../src/runtime/session-pool.ts'
 import { fakeHost } from './fixtures/session-policy.ts'
@@ -139,4 +143,70 @@ test('catalog probe blocked by HK egress launches zero subprocesses, pauses back
   assert.equal(launches, 1)
   assert.equal(pool.getStatus().lastError, null)
   assert.ok(pool.getStatus().models.length > 0)
+})
+
+test('resolveModel reports cold discovery failures and still resolves verified levels from stale cache during an outage', async t => {
+  const failure = new Error('refusing unconfined startup')
+  let unavailable = true
+  let launches = 0
+  const pool = new AcpSessionPool({
+    ...fakeHost, getConfig: resolveConfig, resolveBin: () => process.execPath,
+    async prepareArgv() {
+      launches++
+      if (unavailable) throw failure
+      return [process.execPath, fileURLToPath(new URL('./fixtures/fake-agy.mjs', import.meta.url))]
+    },
+  })
+  t.after(() => pool.dispose())
+  const adapter = new AcpAdapter({ getConfig: resolveConfig, pool, runs: new AcpRunStore() })
+  const resolve = () => adapter.resolveModel(PROVIDER_ID, 'gemini-4-neon')
+  await assert.rejects(resolve(), err => {
+    assert.ok(err instanceof LlmError)
+    assert.equal(err.code, 'DISCOVERY_FAILED')
+    assert.match(err.message, /宿主只读沙箱不可用/)
+    assert.equal(err.cause, failure)
+    return true
+  })
+
+  unavailable = false
+  const expected = await resolve()
+  assert.deepEqual(expected.reasoning?.efforts.map(e => e.id), ['low', 'medium', 'high'])
+  unavailable = true
+  pool.invalidateCatalog()
+  assert.deepEqual(await resolve(), expected)
+  assert.equal(launches, 3, 'the expired cache is used only after another probe fails')
+  assert.match(pool.getStatus().lastError ?? '', /宿主只读沙箱不可用/)
+})
+
+test('prepareCall aborts its own wait promptly without cancelling a shared catalog probe', async t => {
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  let launches = 0
+  const pool = new AcpSessionPool({
+    ...fakeHost, getConfig: resolveConfig, resolveBin: () => process.execPath,
+    async prepareArgv(_argv, _policy, signal) {
+      launches++
+      entered.resolve()
+      await resume.promise
+      assert.equal(signal?.aborted, false)
+      return [process.execPath, fileURLToPath(new URL('./fixtures/fake-agy.mjs', import.meta.url))]
+    },
+  })
+  t.after(() => { resume.resolve(); pool.dispose() })
+  const adapter = new AcpAdapter({ getConfig: resolveConfig, pool, runs: new AcpRunStore() })
+  const model = 'gemini-4-neon'
+  const reason = new Error('caller cancelled discovery')
+  await assert.rejects(adapter.resolveModel(PROVIDER_ID, model, AbortSignal.abort(reason)), err => err === reason)
+  assert.equal(launches, 0)
+
+  const controller = new AbortController()
+  const cancelled = assert.rejects(adapter.prepareCall(PROVIDER_ID, model, controller.signal), err => err === reason)
+  await entered.promise
+  const other = adapter.resolveModel(PROVIDER_ID, model)
+  controller.abort(reason)
+  await cancelled
+  resume.resolve()
+  assert.deepEqual((await other).reasoning?.efforts.map(e => e.id), ['low', 'medium', 'high'])
+  assert.equal(launches, 1)
+  assert.equal(pool.getStatus().lastError, null)
 })

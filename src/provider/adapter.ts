@@ -36,7 +36,7 @@ import {
 import { isQuotaOrRateLimitError, isTosViolationError } from '../runtime/account-pool.ts'
 import { policyKey, SessionPolicyChangedError } from '../runtime/permission-manager.ts'
 import { EgressBlockedError } from '../runtime/egress-guard.ts'
-import type { AcpSessionPool, ManagedAcpSession } from '../runtime/session-pool.ts'
+import { formatCatalogProbeError, type AcpSessionPool, type ManagedAcpSession } from '../runtime/session-pool.ts'
 import { continuationSource, detectContinuation, type ContinuationMessage } from './continuation.ts'
 import { createPreEditLocator, compactDisplayInput } from './mirror-tool.ts'
 import {
@@ -117,8 +117,14 @@ export class AcpAdapter extends LlmAdapter {
     }))
   }
 
-  override async resolveModel(_provider: string, model: string): Promise<LlmResolvedModelInfo> {
-    const models = await this.deps.pool.refreshModels().catch(() => [])
+  override async resolveModel(_provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    signal?.throwIfAborted()
+    const models = await this.deps.pool.refreshModels(undefined, signal).catch((err: unknown) => {
+      signal?.throwIfAborted()
+      if (err instanceof LlmError) throw err
+      throw new LlmError(formatCatalogProbeError(err), 'DISCOVERY_FAILED', { cause: err })
+    })
+    signal?.throwIfAborted()
     const matched = models.find((m) => m.value === model)
     const contextWindow = this.deps.pool.contextWindowFor(model)
     const effort = defaultEffort(matched, this.deps.getConfig().defaultEffort)
@@ -142,12 +148,11 @@ export class AcpAdapter extends LlmAdapter {
     }
   }
 
-  async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<{
+  override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<{
     model: LlmResolvedModelInfo
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>
   }> {
-    if (signal?.aborted) throw signal.reason ?? new LlmError('aborted', 'ABORTED')
-    const modelInfo = await this.resolveModel(provider, model)
+    const modelInfo = await this.resolveModel(provider, model, signal)
     return {
       model: modelInfo,
       stream: (options) => this.stream({ ...options, signal: options.signal ?? signal }),
