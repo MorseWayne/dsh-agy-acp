@@ -90,7 +90,7 @@ Layered controls for default model/reasoning effort, cross-provider auto-review 
 
 ### Requirements
 - **Node.js `>= 24`**
-- Installed and authenticated Antigravity CLI (**`agy >= 1.5`**)
+- Antigravity CLI (**`agy >= 1.5`**) — if not yet installed, open the **Antigravity ACP** console in DSH Web and use the built-in **Environment Check & One-Click Install** wizard (with optional proxy support) to install `agy` and sign in directly inside the panel without leaving your browser.
 
 ### Install from npm
 
@@ -137,7 +137,9 @@ After starting or restarting `dsh web`, run in any chat box:
 - **Zero-credential Google probes** (`src/runtime/egress-guard.ts`): checks `HEAD https://aistudio.google.com/` and anonymous `POST https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` with no tokens sent, mirroring Go `agy`'s proxy precedence (`NO_PROXY` → `HTTPS_PROXY` → `ALL_PROXY` → `HTTP_PROXY`) across HTTP `CONNECT`, SOCKS5/SOCKS5H (`ATYP=0x03` remote DNS), and direct/TUN setups such as Clash Verge.
 - **Unified 4-path gate & instant 400 circuit breaker**: protects main chat (new and reused sessions), auxiliary calls, model discovery, and quota probes with `block` (default) / `strict` / `warn` / `off` modes. Any upstream `400 FAILED_PRECONDITION` destroys the pinned HTTP/2 subprocess immediately, opens a 60s local breaker, and preserves `SessionIndex` for multi-account failover.
 
-### 5. Multi-Account Quota Pool, Hidden Error Detection & TOS Quarantine
+### 5. Multi-Account Quota Pool, In-Panel Login Wizard & TOS Quarantine
+- **Console-managed isolated accounts & direct Google OAuth onboarding** (`src/runtime/account-store.ts`, `src/runtime/account-login.ts`): click **+ Add Account** in the **Accounts & Quotas** tab to open Google OAuth directly with zero pre-filled forms; once you paste back the authorization code, the plugin automatically detects the signed-in Google email, commits a sandboxed `HOME` under `~/.dsh/agy-acp/accounts/<id>`, and persists `~/.dsh/agy-acp/accounts.json` (`0600`) with instant hot reload. Optional per-account proxy routing, renaming, toggling, and removal remain available anytime.
+- **One-click environment check & `agy` installer** (`src/runtime/env-setup.ts`, `src/runtime/doctor.ts`): detects missing or outdated `agy` installations from the console header, runs structured 5-step read-only checks, and supports one-click installation/upgrade from the official Google installer endpoints with optional proxy routing.
 - **Isolated credential slots & quota-aware routing** (`src/runtime/account-pool.ts`, `src/runtime/account-quota.ts`): non-blocking async slot leases, direct upstream quota API with read-only CLI fallback, and optional quota-weighted scheduling favoring higher-headroom accounts.
 - **Hidden error classification & TOS protection**: reads trajectory SQLite steps in read-only mode to catch upstream errors disguised as `end_turn` (`400` / `429` / `TOS_VIOLATION` / `INVALID_THINKING_SIGNATURE`). `TOS_VIOLATION` immediately quarantines the account across all model families and halts failover to prevent chain bans.
 
@@ -162,7 +164,7 @@ Permission policy always belongs to the initiating DSH session (legacy `permissi
 
 ## Diagnostics & Troubleshooting
 
-- **Config persistence**: allowlisted console settings are written atomically to `~/.dsh/agy-acp/config.json` (`0600`) with one-click discard and confirmed reset; sensitive multi-account paths and proxy environments (`accounts`, `credentialSlotDir`) remain read-only from host configuration.
+- **Config & account persistence**: allowlisted console settings are written atomically to `~/.dsh/agy-acp/config.json` (`0600`) with one-click discard and confirmed reset; console-managed isolated accounts are stored separately in `~/.dsh/agy-acp/accounts.json` (`0600`) with strict per-account directories under `~/.dsh/agy-acp/accounts/<id>`, while host-defined `accounts` and `credentialSlotDir` remain read-only from host configuration.
 - **Timeout semantics**: `requestTimeoutMs` acts as an **inactivity timeout** on `session/prompt` rather than a hard wall-clock cap; model output and tool progress reset the timer, while human approvals, long reverse MCP calls, and cancellations each have dedicated lifecycle handling.
 - **Quota & cleanup boundaries**: direct quota API reads only use non-expired credentials clearly belonging to an isolated account (never refreshes OAuth or reads shared default machine tokens). Cleanup only removes verified plugin-owned private temp directories and never touches shared databases or rules in your real `HOME`.
 - **Self-healing**: corrupted `thinking` signatures automatically invalidate the affected session index so the next turn rebuilds via digest without re-running completed tools; SSE disconnects clearly surface that the console is showing the last snapshot.

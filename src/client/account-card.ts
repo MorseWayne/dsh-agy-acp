@@ -88,13 +88,41 @@ export const AccountCard = React.memo(function AccountCard({
   account,
   applyStatus,
   geoFenceMode = 'block',
+  agyFound = true,
+  canToggleEnabled = false,
+  canSwitch = false,
+  switching = false,
+  hasMultipleAccounts = false,
+  startingLogin = false,
+  autoRefreshing = false,
+  autoQuotaError = '',
+  onSelect,
+  onStartLogin,
+  onEdit,
+  onToggleEnabled,
+  onRemove,
 }: {
   account: AccountHealthSnapshot
   geoFenceMode?: GeoFenceMode
+  agyFound?: boolean
+  canToggleEnabled?: boolean
+  canSwitch?: boolean
+  switching?: boolean
+  hasMultipleAccounts?: boolean
+  startingLogin?: boolean
+  autoRefreshing?: boolean
+  autoQuotaError?: string
   applyStatus: (value: StatusSnapshot) => void
+  onSelect?: () => void
+  onStartLogin?: () => void
+  onEdit?: () => void
+  onToggleEnabled?: () => void
+  onRemove?: (purgeData: boolean) => void
 }): unknown {
   const [pending, setPending] = React.useState(null as AccountActionKind | null)
   const [feedback, setFeedback] = React.useState('')
+  const [confirmDelete, setConfirmDelete] = React.useState(false)
+  const [purgeOnDelete, setPurgeOnDelete] = React.useState(true)
   const locked = React.useRef(false)
   const [, redraw] = React.useReducer((n: number) => n + 1, 0)
   const now = Date.now()
@@ -121,6 +149,7 @@ export const AccountCard = React.memo(function AccountCard({
           ? theme.stateWarn
           : theme.stateIdle
   const unavailable = account.quotaRefreshUnavailable || (!account.enabled ? '账号已停用。' : undefined)
+  const isRefreshingQuota = pending === 'refresh' || autoRefreshing
 
   const act = async (action: AccountActionKind): Promise<void> => {
     if (locked.current || (action === 'refresh' && unavailable) || (action === 'egress' && !account.enabled)) return
@@ -162,33 +191,105 @@ export const AccountCard = React.memo(function AccountCard({
         : 'agy-acp-pill agy-acp-pill--sm agy-acp-pill--warn'
       : 'agy-acp-pill agy-acp-pill--sm agy-acp-pill--success'
 
+  const sourceLabel =
+    account.source === 'managed'
+      ? '控制台托管'
+      : account.source === 'default'
+        ? '本机默认'
+        : account.source === 'host'
+          ? '配置文件'
+          : null
+
+  const isActive = Boolean(account.enabled && (account.isPreferred || account.isEffectiveActive))
+  const labelLower = account.label.toLowerCase()
+  const idLower = account.id.toLowerCase()
+  const emailSub =
+    account.email && account.email.toLowerCase() !== labelLower ? account.email : null
+  const idSub =
+    !emailSub && account.id !== account.label && !labelLower.startsWith(`${idLower}@`) ? account.id : null
+  const titleSub = emailSub ?? idSub
+
   return h(
     'article',
-    { className: 'agy-acp-account-card' },
+    { className: isActive ? 'agy-acp-account-card agy-acp-account-card--active' : 'agy-acp-account-card' },
     // Header row: label + status pill + quick actions
     h(
       'div',
       { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' } },
       h(
         'div',
-        { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '8px', minWidth: 0 } },
+        { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '6px', minWidth: 0 } },
         h(
           'h4',
           { style: { margin: 0, fontSize: '14px', fontWeight: 600 } },
           account.label,
-          account.id !== account.label
-            ? h('small', { className: 'agy-acp-muted', style: { fontWeight: 400 } }, ` · ${account.id}`)
+          titleSub
+            ? h('small', { className: 'agy-acp-muted', style: { fontWeight: 400 } }, ` · ${titleSub}`)
             : null,
         ),
+        isActive
+          ? h('span', { className: 'agy-acp-pill agy-acp-pill--sm agy-acp-pill--info' }, '当前使用')
+          : null,
         h(
           'span',
           { className: statusPillClass },
           flag ? `已启用 · ${flag}` : account.enabled ? '已启用' : '已停用',
         ),
+        sourceLabel
+          ? h('span', { className: 'agy-acp-pill agy-acp-pill--sm' }, sourceLabel)
+          : null,
+        account.authStatus === 'logged_in'
+          ? h('span', { className: 'agy-acp-pill agy-acp-pill--sm agy-acp-pill--success' }, '已登录')
+          : account.authStatus === 'not_logged_in'
+            ? h('span', { className: 'agy-acp-pill agy-acp-pill--sm agy-acp-pill--warn' }, '待登录')
+            : account.authStatus === 'unknown' && account.source === 'default'
+              ? h(
+                  'span',
+                  {
+                    className: 'agy-acp-pill agy-acp-pill--sm',
+                    title: '复用本机终端 agy / 系统钥匙串登录态，首次使用或面板登录后自动确认状态',
+                  },
+                  '本机凭据',
+                )
+              : null,
       ),
       h(
         'div',
         { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '6px' } },
+        canSwitch && onSelect
+          ? h(
+              'button',
+              {
+                type: 'button',
+                disabled: !!pending || switching,
+                className: 'agy-acp-btn agy-acp-btn--primary agy-acp-btn--sm',
+                onClick: onSelect,
+                'aria-label': `切换到账号 ${account.label}`,
+              },
+              switching ? '切换中…' : '使用此账号',
+            )
+          : null,
+        account.canInteractiveLogin && onStartLogin
+          ? h(
+              'button',
+              {
+                type: 'button',
+                disabled: !!pending || startingLogin || !agyFound,
+                title: !agyFound ? '请先在顶部安装 agy CLI' : undefined,
+                className:
+                  account.authStatus === 'not_logged_in'
+                    ? 'agy-acp-btn agy-acp-btn--primary agy-acp-btn--sm'
+                    : 'agy-acp-btn agy-acp-btn--sm',
+                onClick: onStartLogin,
+                'aria-label': `引导登录 ${account.label}`,
+              },
+              startingLogin
+                ? '正在生成链接…'
+                : account.authStatus === 'logged_in' || (account.authStatus === 'unknown' && account.source === 'default')
+                  ? '重新登录'
+                  : '登录账号',
+            )
+          : null,
         h(
           'button',
           {
@@ -204,14 +305,50 @@ export const AccountCard = React.memo(function AccountCard({
           'button',
           {
             type: 'button',
-            disabled: !!pending || !!unavailable,
+            disabled: !!pending || autoRefreshing || !!unavailable,
             className: 'agy-acp-btn agy-acp-btn--sm',
             title: unavailable || undefined,
             onClick: () => void act('refresh'),
             'aria-label': `刷新 ${account.label} 的配额`,
           },
-          pending === 'refresh' ? '刷新中…' : '刷新配额',
+          isRefreshingQuota ? '刷新中…' : '刷新配额',
         ),
+        onEdit
+          ? h(
+              'button',
+              {
+                type: 'button',
+                disabled: !!pending,
+                className: 'agy-acp-btn agy-acp-btn--sm',
+                onClick: onEdit,
+              },
+              '编辑',
+            )
+          : null,
+        canToggleEnabled && onToggleEnabled
+          ? h(
+              'button',
+              {
+                type: 'button',
+                disabled: !!pending,
+                className: 'agy-acp-btn agy-acp-btn--sm',
+                onClick: onToggleEnabled,
+              },
+              account.enabled ? '停用' : '启用',
+            )
+          : null,
+        onRemove
+          ? h(
+              'button',
+              {
+                type: 'button',
+                disabled: !!pending,
+                className: 'agy-acp-btn agy-acp-btn--sm agy-acp-btn--danger',
+                onClick: () => setConfirmDelete((v: boolean) => !v),
+              },
+              '删除',
+            )
+          : null,
         cooldowns.length > 0 || account.tosBlocked
           ? h(
               'button',
@@ -228,6 +365,57 @@ export const AccountCard = React.memo(function AccountCard({
       ),
     ),
 
+    // Inline delete confirmation bar
+    confirmDelete && onRemove
+      ? h(
+          'div',
+          {
+            className: 'agy-acp-notice agy-acp-notice--error',
+            style: { marginTop: '8px', marginBottom: 0, padding: '8px 10px' },
+          },
+          h(
+            'div',
+            { style: { display: 'grid', gap: '4px' } },
+            h('strong', { style: { fontSize: '12.5px' } }, `确认删除账号「${account.label}」？`),
+            h(
+              'label',
+              { style: { display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer' } },
+              h('input', {
+                type: 'checkbox',
+                checked: purgeOnDelete,
+                onChange: (ev: { target: { checked: boolean } }) => setPurgeOnDelete(ev.target.checked),
+              }),
+              h('span', { className: 'agy-acp-caption' }, '同时清理该账号的本地登录凭证目录'),
+            ),
+          ),
+          h(
+            'div',
+            { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'agy-acp-btn agy-acp-btn--sm agy-acp-btn--danger',
+                onClick: () => {
+                  setConfirmDelete(false)
+                  onRemove(purgeOnDelete)
+                },
+              },
+              '确认删除',
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'agy-acp-btn agy-acp-btn--sm',
+                onClick: () => setConfirmDelete(false),
+              },
+              '取消',
+            ),
+          ),
+        )
+      : null,
+
     // Meta line
     h(
       'div',
@@ -240,9 +428,18 @@ export const AccountCard = React.memo(function AccountCard({
         `活跃租约 ${account.activeLeases}`,
         `最近分配：${account.lastUsedAt != null ? localTime(account.lastUsedAt) : '暂无记录'}`,
         account.hasSandboxHome && '独立 HOME',
+        account.proxyDisplay && `代理 ${account.proxyDisplay}`,
         account.lastError && '最近请求出现错误',
       ].filter(Boolean).join(' · '),
     ),
+
+    account.source === 'default' && account.enabled && hasMultipleAccounts
+      ? h(
+          'div',
+          { className: 'agy-acp-caption', style: { marginTop: '4px' } },
+          '复用本机终端 agy 登录态；若已通过「+ 添加账号」登录同一账号，可点「停用」隐藏此项。',
+        )
+      : null,
 
     h('hr', { className: 'agy-acp-divider', style: { margin: '10px 0' } }),
 
@@ -381,12 +578,18 @@ export const AccountCard = React.memo(function AccountCard({
             { className: 'agy-acp-caption', style: { marginTop: '4px' } },
             quota
               ? '本次查询没有返回配额窗口。'
-              : '暂无配额样本。' + (unavailable ? '' : '点击「刷新配额」查询此账号的余量。'),
+              : isRefreshingQuota
+                ? '正在自动获取配额…'
+                : '暂无配额样本。' + (unavailable ? '' : '点击「刷新配额」查询此账号的余量。'),
           ),
     ),
 
-    feedback
-      ? h('div', { role: 'status', 'aria-live': 'polite', className: 'agy-acp-caption', style: { marginTop: '8px' } }, feedback)
+    feedback || (!quota && autoQuotaError)
+      ? h(
+          'div',
+          { role: 'status', 'aria-live': 'polite', className: 'agy-acp-caption', style: { marginTop: '8px' } },
+          feedback || autoQuotaError,
+        )
       : null,
   )
 })

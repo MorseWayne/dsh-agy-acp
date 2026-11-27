@@ -2,9 +2,11 @@ import { EventEmitter } from 'node:events'
 import path from 'node:path'
 import { lstatSync, realpathSync } from 'node:fs'
 import os from 'node:os'
+import { DEFAULT_ACCOUNT_ID, maskProxyUrlForDisplay } from '../common/account-validation.ts'
 import { isGeoUnsupportedError } from '../common/geo.ts'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import type {
+  AccountAuthStatus,
   AccountFailureOptions,
   AccountHealthSnapshot,
   AccountLease,
@@ -76,6 +78,26 @@ export function isQuotaOrRateLimitError(error: unknown): boolean {
   )
 }
 
+const AUTH_FAILURE_PATTERNS: readonly RegExp[] = [
+  /\bunauthenticated\b/i,
+  /\bnot\s+logged\s+in\b/i,
+  /\blogin\s+required\b/i,
+  /\bauthentication\s+(?:required|failed|expired)\b/i,
+  /\bplease\s+log\s*in\b/i,
+  /\binvalid_grant\b/i,
+  /\binvalid\s+(?:oauth|auth(?:entication)?|access)\s*(?:token|credentials?)\b/i,
+  /\boauth\b[\s\S]{0,40}\b(?:expired|revoked|invalid|required)\b/i,
+  /\bhttp\s*401\b/i,
+  /\b401\s+unauthorized\b/i,
+]
+
+export function isAuthFailureError(error: unknown): boolean {
+  if (isTosViolationError(error) || isGeoUnsupportedError(error) || isQuotaOrRateLimitError(error)) return false
+  const msg = error instanceof Error ? error.message : String(error ?? '')
+  if (!msg) return false
+  return AUTH_FAILURE_PATTERNS.some((re) => re.test(msg))
+}
+
 /** Classifies an upstream/account failure by strict risk precedence: TOS > geo > quota > other. */
 export function classifyAccountError(error: unknown): AccountErrorCategory {
   if (isTosViolationError(error)) return 'tos'
@@ -124,11 +146,14 @@ interface InternalAccountState {
 }
 
 export interface MultiAccountPoolOptions {
+  preferredAccountId?: string | null
   accounts: AccountProfileConfig[]
   slotManager?: CredentialSlotLeaseManager
   baseCooldownMs?: number
   maxCooldownMs?: number
   now?: () => number
+  inspectAuthStatus?: (profile: AccountProfileConfig) => AccountAuthStatus
+  onAuthObserved?: (accountId: string, state: 'verified' | 'failed') => void
   log?: (msg: string) => void
 }
 
@@ -248,40 +273,61 @@ function canonicalPath(dir: string): string {
 function quotaUnavailable(profile: AccountProfileConfig, profiles: AccountProfileConfig[]): string | undefined {
   if (profile.enabled === false) return '账号已停用'
   if (profiles.length === 1 && !profile.homeDir) return undefined // one explicitly ambient profile, like the machine default
-  if (!profile.homeDir) return '多账号查询需要独立的账号 HOME'
-  const env = buildAccountEnv(profile)!
-  const home = canonicalPath(profile.homeDir)
-  const effectiveHome = (e: NodeJS.ProcessEnv) => process.platform === 'win32' ? e.USERPROFILE : e.HOME
-  if (home === canonicalPath(os.homedir()) || home === path.parse(home).root) return '账号 HOME 与本机环境重叠'
-  const configuredHome = path.resolve(profile.homeDir)
-  if (home !== (process.platform === 'win32' ? configuredHome.toLowerCase() : configuredHome)) return '账号 HOME 不得经过符号链接'
-  if (canonicalPath(effectiveHome(env) || '.') !== home) return '账号环境覆盖了独立 HOME'
+
+  const effectiveHome = (e: NodeJS.ProcessEnv) => (process.platform === 'win32' ? e.USERPROFILE : e.HOME)
   const storePaths = (e: NodeJS.ProcessEnv) => {
     const gemini = path.join(effectiveHome(e) || '.', '.gemini')
-    return [e.GEMINI_HOME || gemini, e.GEMINI_CLI_HOME || gemini, e.ANTIGRAVITY_GEMINI_DIR || gemini, e.ANTIGRAVITY_APP_DATA_DIR || path.join(gemini, 'antigravity-cli')].map(canonicalPath)
-  }
-  const stores = storePaths(env)
-  if (stores.some(dir => dir !== home && !dir.startsWith(home + path.sep))) return '账号凭据目录未隔离'
-  // Check the actual file-backed stores as well as their parents. A symlink/hardlinked
-  // token is not grounds for running the CLI under someone else's sign-in either.
-  const gemini = env.GEMINI_HOME || path.join(home, '.gemini')
-  for (const dir of new Set([path.join(gemini, 'antigravity-acp'), env.ANTIGRAVITY_APP_DATA_DIR || path.join(gemini, 'antigravity-cli')])) {
-    for (const entry of [dir, path.join(dir, 'antigravity-oauth-token'), path.join(dir, 'acp_token.json')]) {
-      try {
-        const stat = lstatSync(entry)
-        if (stat.isSymbolicLink() || (entry === dir ? !stat.isDirectory() : !stat.isFile() || stat.nlink !== 1) ||
-            (process.getuid && stat.uid !== process.getuid()) || !canonicalPath(entry).startsWith(home + path.sep)) return '账号凭据文件未隔离'
-      } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return '无法确认账号凭据文件归属' }
-    }
+    return [
+      e.GEMINI_HOME || gemini,
+      e.GEMINI_CLI_HOME || gemini,
+      e.ANTIGRAVITY_GEMINI_DIR || gemini,
+      e.ANTIGRAVITY_APP_DATA_DIR || path.join(gemini, 'antigravity-cli'),
+    ].map(canonicalPath)
   }
   const overlaps = (a: string, b: string) => a === b || a.startsWith(b + path.sep) || b.startsWith(a + path.sep)
-  if (profiles.some(p => p !== profile && (p.homeDir && overlaps(home, canonicalPath(p.homeDir)) || storePaths(buildAccountEnv(p) ?? process.env).some(dir => stores.some(store => overlaps(store, dir)))))) return '多个账号共享凭据目录，无法归属配额'
-  // Desktop keyrings are user-wide even when HOME differs. Only accept the CLI's
-  // existing file-backed SSH mode, or an explicitly private Linux bus inside this HOME.
-  const privateBusPath = /^unix:path=([^,;%]+)$/.exec(env.DBUS_SESSION_BUS_ADDRESS ?? '')?.[1]
-  const privateLinuxBus = process.platform === 'linux' && privateBusPath && canonicalPath(privateBusPath).startsWith(home + path.sep)
-  if (!env.SSH_CONNECTION?.trim() && !privateLinuxBus) return '无法确认独立凭据环境；请检查该账号的 agy 登录环境'
-  return undefined
+
+  const checkIsolated = (candidate: AccountProfileConfig): string | undefined => {
+    if (!candidate.homeDir) return '多账号查询需要独立的账号 HOME'
+    const env = buildAccountEnv(candidate)!
+    const home = canonicalPath(candidate.homeDir)
+    if (home === canonicalPath(os.homedir()) || home === path.parse(home).root) return '账号 HOME 与本机环境重叠'
+    const configuredHome = path.resolve(candidate.homeDir)
+    if (home !== (process.platform === 'win32' ? configuredHome.toLowerCase() : configuredHome)) return '账号 HOME 不得经过符号链接'
+    if (canonicalPath(effectiveHome(env) || '.') !== home) return '账号环境覆盖了独立 HOME'
+    const stores = storePaths(env)
+    if (stores.some(dir => dir !== home && !dir.startsWith(home + path.sep))) return '账号凭据目录未隔离'
+    // Check the actual file-backed stores as well as their parents. A symlink/hardlinked
+    // token is not grounds for running the CLI under someone else's sign-in either.
+    const gemini = env.GEMINI_HOME || path.join(home, '.gemini')
+    for (const dir of new Set([path.join(gemini, 'antigravity-acp'), env.ANTIGRAVITY_APP_DATA_DIR || path.join(gemini, 'antigravity-cli')])) {
+      for (const entry of [dir, path.join(dir, 'antigravity-oauth-token'), path.join(dir, 'acp_token.json')]) {
+        try {
+          const stat = lstatSync(entry)
+          if (stat.isSymbolicLink() || (entry === dir ? !stat.isDirectory() : !stat.isFile() || stat.nlink !== 1) ||
+              (process.getuid && stat.uid !== process.getuid()) || !canonicalPath(entry).startsWith(home + path.sep)) return '账号凭据文件未隔离'
+        } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return '无法确认账号凭据文件归属' }
+      }
+    }
+    if (profiles.some(p => p !== candidate && (p.homeDir && overlaps(home, canonicalPath(p.homeDir)) || storePaths(buildAccountEnv(p) ?? process.env).some(dir => stores.some(store => overlaps(store, dir)))))) {
+      return '多个账号共享凭据目录，无法归属配额'
+    }
+    // Desktop keyrings are user-wide even when HOME differs. Only accept the CLI's
+    // existing file-backed SSH mode, or an explicitly private Linux bus inside this HOME.
+    const privateBusPath = /^unix:path=([^,;%]+)$/.exec(env.DBUS_SESSION_BUS_ADDRESS ?? '')?.[1]
+    const privateLinuxBus = process.platform === 'linux' && privateBusPath && canonicalPath(privateBusPath).startsWith(home + path.sep)
+    if (!env.SSH_CONNECTION?.trim() && !privateLinuxBus) return '无法确认独立凭据环境；请检查该账号的 agy 登录环境'
+    return undefined
+  }
+
+  if (!profile.homeDir) {
+    // Allow the machine default profile to query quota alongside managed/isolated accounts
+    // when every other configured profile is strictly isolated from the ambient HOME & keyring.
+    if (profile.id !== DEFAULT_ACCOUNT_ID) return '多账号查询需要独立的账号 HOME'
+    const allOthersIsolated = profiles.every(other => other === profile || checkIsolated(other) === undefined)
+    return allOthersIsolated ? undefined : '多账号查询需要独立的账号 HOME'
+  }
+
+  return checkIsolated(profile)
 }
 
 /**
@@ -296,8 +342,10 @@ function quotaUnavailable(profile: AccountProfileConfig, profiles: AccountProfil
  */
 export class MultiAccountPool extends EventEmitter implements AccountProvider {
   private readonly accounts = new Map<string, InternalAccountState>()
+  private profiles: AccountProfileConfig[] = []
   private readonly quotaRestrictions = new Map<string, string | undefined>()
   private readonly sessionSticky = new Map<string, string>()
+  private preferredAccountId: string | null = null
   private readonly baseCooldownMs: number
   private readonly maxCooldownMs: number
   private readonly now: () => number
@@ -307,27 +355,88 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     this.baseCooldownMs = opts.baseCooldownMs ?? 30_000
     this.maxCooldownMs = opts.maxCooldownMs ?? 15 * 60_000
     this.now = opts.now ?? (() => Date.now())
+    this.preferredAccountId = opts.preferredAccountId ?? null
+    this.syncProfiles(opts.accounts, false)
+  }
 
-    for (const profile of opts.accounts) {
-      this.quotaRestrictions.set(profile.id, quotaUnavailable(profile, opts.accounts))
-      this.accounts.set(profile.id, {
-        profile,
-        activeLeases: 0,
-        families: new Map(),
-        lastError: null,
-        lastUsedAt: null,
-      })
+  /**
+   * Hot-reloads the active account list while preserving live leases, quota buckets,
+   * cooldowns, and TOS quarantine state for unchanged accounts.
+   */
+  syncProfiles(nextProfiles: readonly AccountProfileConfig[], notify = true): void {
+    const cloned = nextProfiles.map((p) => ({
+      ...p,
+      ...(p.env ? { env: { ...p.env } } : {}),
+    }))
+    this.profiles = cloned
+    const prevMap = new Map(this.accounts)
+    this.accounts.clear()
+    this.quotaRestrictions.clear()
+
+    const nextIds = new Set<string>()
+    for (const profile of cloned) {
+      nextIds.add(profile.id)
+      this.quotaRestrictions.set(profile.id, quotaUnavailable(profile, cloned))
+      const existing = prevMap.get(profile.id)
+      if (existing) {
+        existing.profile = profile
+        this.accounts.set(profile.id, existing)
+      } else {
+        this.accounts.set(profile.id, {
+          profile,
+          activeLeases: 0,
+          families: new Map(),
+          lastError: null,
+          lastUsedAt: null,
+        })
+      }
     }
+
+    if (this.preferredAccountId !== null && !this.isEnabled(this.preferredAccountId)) {
+      this.preferredAccountId = null
+      this.sessionSticky.clear()
+    }
+    for (const [sessionKey, accountId] of this.sessionSticky) {
+      if (!nextIds.has(accountId)) {
+        this.sessionSticky.delete(sessionKey)
+      }
+    }
+
+    if (notify) {
+      this.emit('change')
+    }
+  }
+
+  private isEnabled(accountId: string): boolean {
+    const account = this.accounts.get(accountId)
+    return Boolean(account && account.profile.enabled !== false)
+  }
+
+  getPreferredAccountId(): string | null {
+    return this.preferredAccountId
+  }
+
+  setPreferredAccount(accountId: string | null): void {
+    const next = accountId !== null && this.isEnabled(accountId) ? accountId : null
+    if (next === this.preferredAccountId) return
+    this.preferredAccountId = next
+    this.sessionSticky.clear()
+    this.emit('change')
+  }
+
+  getProfile(accountId: string): AccountProfileConfig | undefined {
+    const acc = this.accounts.get(accountId)
+    return acc ? { ...acc.profile, ...(acc.profile.env ? { env: { ...acc.profile.env } } : {}) } : undefined
   }
 
   async acquireQuotaLease(accountId: string): Promise<AccountLease & { requiresFileCredentialMode: boolean; directQuotaHome?: string }> {
     const acc = this.accounts.get(accountId)
     if (!acc) throw new Error('未知账号')
-    const reason = quotaUnavailable(acc.profile, this.opts.accounts)
+    const reason = quotaUnavailable(acc.profile, this.profiles)
     if (reason) throw new Error(reason)
     const slot = await this.opts.slotManager?.acquire(accountId)
     // A process-global slot can be awaited; validate again against the current filesystem after it is granted.
-    const changed = quotaUnavailable(acc.profile, this.opts.accounts)
+    const changed = quotaUnavailable(acc.profile, this.profiles)
     if (changed) { slot?.release(); throw new Error(changed) }
     const env = buildAccountEnv(acc.profile)
     const requiresFileCredentialMode = Boolean(acc.profile.homeDir && env?.SSH_CONNECTION?.trim())
@@ -435,9 +544,10 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
       throw new Error(`No healthy accounts available for model family "${family}"${waitHint}`)
     }
 
-    // Prefer sticky account for this session if still healthy
+    // Neither an explicit preference nor stickiness can override the health/exclusion filter.
     const stickyId = this.sessionSticky.get(sessionKey)
-    let chosen = stickyId ? candidates.find((c) => c.profile.id === stickyId) : undefined
+    let chosen = candidates.find(c => c.profile.id === this.preferredAccountId)
+      ?? candidates.find(c => c.profile.id === stickyId)
 
     if (!chosen) {
       candidates.sort((a, b) => {
@@ -471,6 +581,11 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     }
   }
 
+  markAuthVerified(accountId: string): void {
+    if (!this.accounts.has(accountId)) return
+    this.opts.onAuthObserved?.(accountId, 'verified')
+  }
+
   reportSuccess(accountId: string, model: string): void {
     const acc = this.accounts.get(accountId)
     if (!acc) return
@@ -479,6 +594,7 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
     state.consecutiveFailures = 0
     state.cooldownUntil = undefined
     acc.lastError = null
+    this.opts.onAuthObserved?.(accountId, 'verified')
     this.emit('change')
   }
 
@@ -519,6 +635,8 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
       )
     } else if (category === 'geo') {
       acc.geoBlockedUntil = Math.max(acc.geoBlockedUntil ?? 0, this.now() + 60_000)
+    } else if (isAuthFailureError(error)) {
+      this.opts.onAuthObserved?.(accountId, 'failed')
     }
     this.emit('change')
   }
@@ -540,6 +658,8 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
 
   getHealthSnapshots(): AccountHealthSnapshot[] {
     const list: AccountHealthSnapshot[] = []
+    const enabled = this.profiles.filter(p => p.enabled !== false)
+    const effectiveActiveId = this.preferredAccountId ?? (enabled.length === 1 ? enabled[0]!.id : null)
     for (const acc of this.accounts.values()) {
       const families: Partial<Record<ModelFamily, FamilyQuotaState>> = {}
       for (const [fam, st] of acc.families) {
@@ -550,10 +670,30 @@ export class MultiAccountPool extends EventEmitter implements AccountProvider {
           consecutiveFailures: st.consecutiveFailures,
         }
       }
+      const source = acc.profile.source ?? (acc.profile.id === DEFAULT_ACCOUNT_ID && !acc.profile.homeDir ? 'default' : 'host')
+      const rawProxy =
+        acc.profile.proxyUrl ||
+        acc.profile.env?.HTTPS_PROXY ||
+        acc.profile.env?.HTTP_PROXY ||
+        acc.profile.env?.ALL_PROXY ||
+        acc.profile.env?.https_proxy ||
+        acc.profile.env?.http_proxy ||
+        acc.profile.env?.all_proxy
+      const proxyDisplay = maskProxyUrlForDisplay(rawProxy)
+      const authStatus = this.opts.inspectAuthStatus?.(acc.profile)
       list.push({
         id: acc.profile.id,
         label: acc.profile.label ?? acc.profile.id,
+        ...(acc.profile.email ? { email: acc.profile.email } : {}),
+        isPreferred: this.preferredAccountId === acc.profile.id,
+        isEffectiveActive: effectiveActiveId === acc.profile.id,
         enabled: acc.profile.enabled !== false,
+        source,
+        ...(authStatus ? { authStatus } : {}),
+        ...(proxyDisplay ? { proxyDisplay } : {}),
+        ...(rawProxy?.trim() ? { hasProxy: true } : {}),
+        editable: source === 'managed',
+        canInteractiveLogin: source === 'managed' || source === 'default' || Boolean(acc.profile.homeDir),
         quotaRefreshUnavailable: this.quotaRestrictions.get(acc.profile.id),
         ...(acc.tosBlockedAt !== undefined
           ? {

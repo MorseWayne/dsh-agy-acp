@@ -7,7 +7,17 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import type { AccountHealthSnapshot, StatusSnapshot } from '../src/common/types.ts'
 import { initialSnapshot, reduceSnapshot, snapshotNotice } from '../src/client/snapshot-state.ts'
 import { AccountCard } from '../src/client/account-card.ts'
-import { activeCooldowns, bucketDisplay, lowQuotaWarnings, nextAccountExpiry, requestAccountAction, requestAllAccountsEgressCheck, sessionAccountLabel } from '../src/client/account-display.ts'
+import {
+  AUTO_QUOTA_TTL_MS,
+  activeCooldowns,
+  bucketDisplay,
+  lowQuotaWarnings,
+  nextAccountExpiry,
+  requestAccountAction,
+  requestAllAccountsEgressCheck,
+  sessionAccountLabel,
+  shouldAutoFetchQuota,
+} from '../src/client/account-display.ts'
 import { resetSessions, type SessionResetTarget } from '../src/client/panel-actions.ts'
 import { ConfigFieldset, SettingsView } from '../src/client/index.ts'
 import { createStatusStore, type EventSourceLike } from '../src/client/status-store.ts'
@@ -656,4 +666,82 @@ test('requestAllAccountsEgressCheck posts empty JSON body and validates returned
     requestAllAccountsEgressCheck(async () => Response.json({ error: 'raw-secret' }, { status: 500 })),
     { message: '全部出口检测失败，请稍后重试。' },
   )
+})
+
+test('shouldAutoFetchQuota filters eligible accounts, forwards maxAgeMs, and renders auto-loading state', async () => {
+  const baseNow = 500_000
+  // Missing sample on eligible enabled account -> auto fetch
+  assert.equal(shouldAutoFetchQuota(account, baseNow, true), true)
+  // Missing agy / disabled / unavailable / not_logged_in / tosBlocked / geo-unsupported -> skip
+  assert.equal(shouldAutoFetchQuota(account, baseNow, false), false)
+  assert.equal(shouldAutoFetchQuota({ ...account, enabled: false }, baseNow, true), false)
+  assert.equal(shouldAutoFetchQuota({ ...account, quotaRefreshUnavailable: '未隔离' }, baseNow, true), false)
+  assert.equal(shouldAutoFetchQuota({ ...account, authStatus: 'not_logged_in' }, baseNow, true), false)
+  assert.equal(shouldAutoFetchQuota({ ...account, tosBlocked: true }, baseNow, true), false)
+  assert.equal(
+    shouldAutoFetchQuota(
+      {
+        ...account,
+        egress: {
+          status: 'unsupported',
+          country: 'HK',
+          ipMasked: null,
+          proxyMode: 'direct',
+          probeSource: 'mock',
+          checkedAt: baseNow,
+          expiresAt: baseNow + 60_000,
+        },
+      },
+      baseNow,
+      true,
+    ),
+    false,
+  )
+
+  // Fresh sample within TTL -> skip; stale sample or expired bucket -> fetch
+  const freshSample = {
+    sampledAt: baseNow - 10_000,
+    source: 'cli' as const,
+    groups: [{ name: 'Gemini Models', fiveHour: { remainingFraction: 0.8, resetAt: baseNow + 60_000 } }],
+  }
+  assert.equal(shouldAutoFetchQuota({ ...account, quota: freshSample }, baseNow, true), false)
+  assert.equal(
+    shouldAutoFetchQuota({ ...account, quota: { ...freshSample, sampledAt: baseNow - AUTO_QUOTA_TTL_MS } }, baseNow, true),
+    true,
+  )
+  assert.equal(
+    shouldAutoFetchQuota(
+      {
+        ...account,
+        quota: {
+          ...freshSample,
+          groups: [{ name: 'Gemini Models', fiveHour: { remainingFraction: 0.8, resetAt: baseNow - 1 } }],
+        },
+      },
+      baseNow,
+      true,
+    ),
+    true,
+  )
+
+  // requestAccountAction forwards optional maxAgeMs only for auto quota refresh
+  const payloads: unknown[] = []
+  const snap = { accounts: [account], updatedAt: baseNow }
+  await requestAccountAction(
+    'refresh',
+    'default',
+    async (_url, init) => {
+      payloads.push(JSON.parse(String(init?.body)))
+      return Response.json({ status: snap })
+    },
+    { maxAgeMs: AUTO_QUOTA_TTL_MS },
+  )
+  assert.deepEqual(payloads, [{ accountId: 'default', maxAgeMs: AUTO_QUOTA_TTL_MS }])
+
+  // AccountCard shows loading state while auto-fetching quota
+  const loadingHtml = renderToStaticMarkup(
+    React.createElement(AccountCard, { account, autoRefreshing: true, applyStatus: () => {} }),
+  )
+  assert.match(loadingHtml, /正在自动获取配额…/)
+  assert.match(loadingHtml, /<button[^>]*disabled=""[^>]*>刷新中…<\/button>/)
 })

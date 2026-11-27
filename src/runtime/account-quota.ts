@@ -179,8 +179,6 @@ function readAccountAccessToken(accountHome: string, env: NodeJS.ProcessEnv): { 
   if (!path.isAbsolute(accountHome) || !env.SSH_CONNECTION?.trim()) return null
   const home = path.resolve(accountHome)
   const profile = path.join(home, '.gemini')
-  const acp = path.join(profile, 'antigravity-acp')
-  const tokenFile = path.join(acp, 'antigravity-oauth-token')
   const effectiveHome = process.platform === 'win32' ? env.USERPROFILE : env.HOME
   // Cannot prove a Windows file's owner/DACL with mode bits; use the isolated CLI there.
   if (process.getuid === undefined || effectiveHome !== home || home === path.parse(home).root ||
@@ -191,28 +189,29 @@ function readAccountAccessToken(accountHome: string, env: NodeJS.ProcessEnv): { 
   let fd: number | undefined
   try {
     const uid = process.getuid()
-    for (const dir of [home, profile, acp]) {
-      const info = lstatSync(dir)
-      if (!info.isDirectory() || info.uid !== uid || (info.mode & 0o022) || realpathSync(dir) !== dir) return null
+    const safeDir = (dir: string, info = lstatSync(dir)) =>
+      info.isDirectory() && info.uid === uid && !(info.mode & 0o022) && realpathSync(dir) === dir
+    if (!safeDir(home) || !safeDir(profile)) return null
+    // Never open competing sign-ins. A missing store is fine; inaccessible or linked is not.
+    let tokenFile: string | undefined
+    for (const store of ['antigravity-acp', 'antigravity-cli']) {
+      const dir = path.join(profile, store)
+      const parent = lstatSync(dir, { throwIfNoEntry: false })
+      if (!parent) continue
+      if (!safeDir(dir, parent) || lstatSync(path.join(dir, 'acp_token.json'), { throwIfNoEntry: false })) return null
+      const file = path.join(dir, 'antigravity-oauth-token')
+      if (!lstatSync(file, { throwIfNoEntry: false })) continue
+      if (tokenFile) return null
+      tokenFile = file
     }
-    // Only test for competing sign-in stores under this same HOME, never open them.
-    const legacy = path.join(profile, 'antigravity-cli')
-    try {
-      const info = lstatSync(legacy)
-      if (!info.isDirectory() || info.uid !== uid) return null
-    } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return null }
-    for (const alternate of [path.join(acp, 'acp_token.json'),
-      path.join(legacy, 'antigravity-oauth-token'), path.join(legacy, 'acp_token.json')]) {
-      try { lstatSync(alternate); return null } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return null
-      }
-    }
+    if (!tokenFile) return null
     const observed = lstatSync(tokenFile)
     if (!observed.isFile() || observed.uid !== uid || observed.nlink !== 1 || (observed.mode & 0o077) ||
         observed.size <= 0 || observed.size > 64 * 1024) return null
     fd = openSync(tokenFile, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
     const info = fstatSync(fd)
     if (info.dev !== observed.dev || info.ino !== observed.ino || info.size !== observed.size ||
+        info.mtimeMs !== observed.mtimeMs || info.uid !== uid || info.nlink !== 1 || (info.mode & 0o077) ||
         realpathSync(tokenFile) !== tokenFile) return null
     const buf = Buffer.alloc(info.size)
     let parsed: unknown
@@ -220,10 +219,12 @@ function readAccountAccessToken(accountHome: string, env: NodeJS.ProcessEnv): { 
       if (readSync(fd, buf, 0, buf.length, 0) !== buf.length || fstatSync(fd).mtimeMs !== info.mtimeMs) return null
       parsed = JSON.parse(buf.toString('utf8'))
     } finally { buf.fill(0) }
-    if (!object(parsed) || !object(parsed.token)) return null
-    const bearer = parsed.token.access_token
-    const expiry = typeof parsed.token.expiry === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/.test(parsed.token.expiry)
-      ? Date.parse(parsed.token.expiry) : NaN
+    if (!object(parsed)) return null
+    const token = parsed.token === undefined ? parsed : parsed.token
+    if (!object(token)) return null
+    const bearer = token.access_token
+    const expiry = typeof token.expiry === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/.test(token.expiry)
+      ? Date.parse(token.expiry) : NaN
     if (typeof bearer !== 'string' || !/^[A-Za-z0-9._~+/-]{1,8192}=*$/.test(bearer) || !(expiry > Date.now() + 60_000)) return null
     return { bearer, expiry }
   } catch { return null } finally { if (fd !== undefined) closeSync(fd) }

@@ -1,6 +1,8 @@
+import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
+import { DEFAULT_ACCOUNT_ID, maskProxyUrlForDisplay, validateProxyUrl } from './common/account-validation.ts'
 import { resolveConfig } from './common/config.ts'
 import {
   DEFAULT_MAX_EAGER_SCHEMA_BYTES,
@@ -16,6 +18,8 @@ import {
   MIRROR_TOOL_NAME,
   PROVIDER_ID,
   WRAPPER_TOOL_NAME,
+  type EnvironmentCheckReport,
+  type EnvironmentSnapshot,
   type McpBridgeSnapshot,
   type McpToolCatalogEntry,
   type McpToolCatalogSnapshot,
@@ -26,12 +30,20 @@ import { AcpAdapter, resolveAutoReviewRedirectOptions } from './provider/adapter
 import { defineAgyAcpMirrorTool } from './provider/mirror-tool.ts'
 import type { ReadPromptFile, ReadPromptImage } from './provider/prompt-builder.ts'
 import { AcpRunStore } from './provider/run-store.ts'
+import { AccountLoginError, AccountLoginManager } from './runtime/account-login.ts'
+import { buildAccountEnv, MultiAccountPool } from './runtime/account-pool.ts'
+import {
+  AccountStore,
+  detectAccountIdentityFromHome,
+  inspectAccountAuthStatus,
+  MANAGED_ACCOUNT_SSH_SENTINEL,
+} from './runtime/account-store.ts'
 import { resolveAgyBin } from './runtime/bin.ts'
-import { MultiAccountPool } from './runtime/account-pool.ts'
 import { ConfigStore } from './runtime/config-store.ts'
 import { CredentialSlotLeaseManager } from './runtime/credential-lease.ts'
 import { formatAgyStatusReport, runAgyDoctor } from './runtime/doctor.ts'
 import { EgressGuard } from './runtime/egress-guard.ts'
+import { AgyInstaller } from './runtime/env-setup.ts'
 import { hostPermissions, type QuestionService, type SessionAgent } from './runtime/host-permissions.ts'
 import { SessionPolicyChangedError } from './runtime/permission-manager.ts'
 import { SessionIndex } from './runtime/session-index.ts'
@@ -226,14 +238,83 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const slotManager = cfg.credentialSlotDir
     ? new CredentialSlotLeaseManager({ slotDir: cfg.credentialSlotDir })
     : undefined
-  const multiAccountPool =
-    cfg.accounts.length > 0
-      ? new MultiAccountPool({
-          accounts: cfg.accounts,
-          slotManager,
-          log,
-        })
-      : undefined
+  const accountStore = new AccountStore({ log })
+  accountStore.load()
+  const hostAccountIds = new Set(baseCfg.accounts.map(a => a.id))
+  let defaultAuthFailed = false
+  let lastEnvCheck: EnvironmentCheckReport | null = null
+  let poolRef: AcpSessionPool | null = null
+  const markDefaultAuth = (state: 'verified' | 'failed'): void => {
+    if (state === 'verified') {
+      const wasFailed = defaultAuthFailed
+      defaultAuthFailed = false
+      const changed = accountStore.setDefaultAuthVerified(true)
+      if (wasFailed || changed) poolRef?.notifyStatusChange()
+    } else {
+      const wasFailed = defaultAuthFailed
+      defaultAuthFailed = true
+      const changed = accountStore.setDefaultAuthVerified(false)
+      if (!wasFailed || changed) poolRef?.notifyStatusChange()
+    }
+  }
+  const multiAccountPool = new MultiAccountPool({
+    accounts: accountStore.buildEffectiveProfiles(baseCfg.accounts),
+    preferredAccountId: accountStore.getPreferredAccountId(),
+    slotManager,
+    inspectAuthStatus: (profile) =>
+      inspectAccountAuthStatus(profile, {
+        defaultConnected: profile.id === DEFAULT_ACCOUNT_ID && accountStore.isDefaultAuthVerified(),
+        defaultAuthFailed: profile.id === DEFAULT_ACCOUNT_ID && defaultAuthFailed,
+      }),
+    onAuthObserved: (accountId, state) => {
+      if (accountId === DEFAULT_ACCOUNT_ID) markDefaultAuth(state)
+    },
+    log,
+  })
+  const syncManagedAccounts = (): void => {
+    const profiles = accountStore.buildEffectiveProfiles(baseCfg.accounts)
+    multiAccountPool.syncProfiles(profiles)
+    multiAccountPool.setPreferredAccount(accountStore.getPreferredAccountId())
+  }
+
+  const installer = new AgyInstaller({
+    resolveBin: () => resolveAgyBin(cfg.agyBin),
+    onInstalled: async () => {
+      pool.invalidateCatalog()
+      pool.notifyStatusChange()
+      void pool.refreshModels().catch(() => {})
+    },
+    log,
+  })
+
+  const loginManager = new AccountLoginManager({
+    onLoginSuccess: async (accountId) => {
+      if (accountId === DEFAULT_ACCOUNT_ID) {
+        markDefaultAuth('verified')
+      }
+      pool.retireSessionsForAccount(accountId)
+      pool.clearAccountCooldown(accountId)
+      pool.invalidateCatalog()
+      pool.notifyStatusChange()
+      void pool.refreshModels().catch(() => {})
+    },
+    log,
+  })
+
+  const collectEnvironmentSnapshot = (): EnvironmentSnapshot => {
+    const binPath = resolveAgyBin(cfg.agyBin)
+    const task = installer.getSnapshot()
+    return {
+      platform: process.platform,
+      agyFound: Boolean(binPath),
+      agyBinPath: binPath,
+      agyVersion: lastEnvCheck?.cliVersion ?? null,
+      ...(lastEnvCheck ? { supportsFileCredentials: lastEnvCheck.supportsFileCredentials } : {}),
+      manualInstallCommand: installer.manualInstallCommand,
+      ...(task.state !== 'idle' || task.logs.length > 0 ? { installTask: task } : {}),
+      ...(lastEnvCheck ? { lastCheck: lastEnvCheck } : {}),
+    }
+  }
 
   const llm = ctx.get('llm') as DshLlmServiceLike | undefined
   const listReviewProviders = (): ReviewProviderOption[] => {
@@ -262,6 +343,8 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     isMcpBridgeActive: () => bridges.size > 0,
     getMcpBridgeSnapshot: collectMcpBridgeSnapshot,
     getMcpToolCatalog: collectMcpToolCatalog,
+    getEnvironmentSnapshot: collectEnvironmentSnapshot,
+    getActiveLoginSnapshot: () => loginManager.getActiveSnapshot(),
     listReviewProviders,
     hasPersistedConfig: () => configStore.hasPersistedOverrides,
     onConfigPatch: patch => {
@@ -348,6 +431,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     },
     log,
   })
+  poolRef = pool
 
   const boundaryEvents = new Set(['sandbox/mode', 'approval/policy', 'permission/preset'])
   ctx.on('session/event' as never, ((session: { id: string }, event: { type: string; data?: { turn?: number } }) => {
@@ -360,7 +444,13 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     runs.closeOwnerTurn(session.id)
     pool.evictSession(session.id)
   }) as never, { global: true })
-  multiAccountPool?.on('change', () => {
+  multiAccountPool.on('change', () => {
+    pool.notifyStatusChange()
+  })
+  installer.on('change', () => {
+    pool.notifyStatusChange()
+  })
+  loginManager.on('change', () => {
     pool.notifyStatusChange()
   })
 
@@ -401,7 +491,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   // Publish only changed/recovered catalogs, after the cache is ready for re-entry.
   pool.on('models-updated', () => {
     // The running host declares this event; the oldest supported peer typings do not.
-    (ctx.emit as (event: 'llm/models-updated', provider: string) => void)('llm/models-updated', PROVIDER_ID)
+    ;(ctx.emit as (event: 'llm/models-updated', provider: string) => void)('llm/models-updated', PROVIDER_ID)
   })
 
   // 1. Register LLM provider route & optional cross-provider auto-review redirect
@@ -488,6 +578,8 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
           },
           invocation?.signal,
         )
+        lastEnvCheck = outcome.report
+        pool.notifyStatusChange()
         return {
           kind: 'success' as const,
           text: outcome.text,
@@ -517,11 +609,136 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         const list = await llm.listModels(provider)
         return list.map(m => ({ id: m.id, name: m.name || m.id }))
       },
+      runEnvCheck: async () => {
+        const outcome = await runAgyDoctor({
+          pool,
+          resolveBin: () => resolveAgyBin(cfg.agyBin),
+          prepareArgv: permissions.prepareArgv,
+          configFilePath: configStore.filePath,
+          sessionsFilePath: sessionIndex.filePath,
+        })
+        lastEnvCheck = outcome.report
+        pool.notifyStatusChange()
+        return outcome.report
+      },
+      startAgyInstall: (input) => installer.start(input),
+      addAccount: async (body) => {
+        const created = accountStore.addAccount(body, hostAccountIds)
+        syncManagedAccounts()
+        return created
+      },
+      selectAccount: accountId => {
+        const validIds = new Set([DEFAULT_ACCOUNT_ID, ...hostAccountIds, ...accountStore.listManaged().map(a => a.id)])
+        accountStore.setPreferredAccount(accountId, validIds)
+        pool.switchActiveAccount(accountId)
+      },
+      updateAccount: async (body) => {
+        const updated = accountStore.updateAccount(body)
+        syncManagedAccounts()
+        const targetId = typeof body.accountId === 'string' ? body.accountId.trim().toLowerCase() : ''
+        if (targetId && (body.enabled === false || Object.hasOwn(body, 'proxyUrl'))) {
+          pool.evictSessionsForAccount(
+            targetId,
+            new Error('该账号配置已变更或被停用，当前会话已关闭，下一轮将自动重新调度。'),
+          )
+        }
+        return updated
+      },
+      removeAccount: async (accountId, opts) => {
+        const cleanId = accountId.trim().toLowerCase()
+        if (loginManager.getActiveSnapshot()?.accountId === cleanId) {
+          loginManager.cancelLogin()
+        }
+        pool.evictSessionsForAccount(cleanId, new Error('该账号已被移除，当前会话已关闭。'))
+        accountStore.removeAccount(cleanId, opts)
+        syncManagedAccounts()
+      },
+      startAccountLogin: async ({ accountId, proxyUrl }) => {
+        const bin = resolveAgyBin(cfg.agyBin)
+        if (!bin) {
+          throw new AccountLoginError('未检测到 agy 可执行文件，请先在上方点击「一键安装 agy」', 409)
+        }
+        const cwd = cfg.workspaceRoot || process.cwd()
+
+        // Direct one-click OAuth onboarding: no pre-filled account name/ID required.
+        if (!accountId) {
+          const proxyChecked = validateProxyUrl(proxyUrl)
+          if (!proxyChecked.ok) {
+            throw new AccountLoginError(proxyChecked.error, 400)
+          }
+          const cleanProxy = proxyChecked.value || undefined
+          const pendingId = randomUUID().slice(0, 12)
+          const pendingHome = accountStore.preparePendingAccountHome(pendingId)
+          const pendingEnvOverrides: Record<string, string> = {
+            SSH_CONNECTION: MANAGED_ACCOUNT_SSH_SENTINEL,
+          }
+          if (cleanProxy) {
+            pendingEnvOverrides.HTTPS_PROXY = cleanProxy
+            pendingEnvOverrides.HTTP_PROXY = cleanProxy
+            pendingEnvOverrides.ALL_PROXY = cleanProxy
+          }
+          const env = buildAccountEnv({
+            id: `pending-${pendingId}`,
+            homeDir: pendingHome,
+            env: pendingEnvOverrides,
+            ...(cleanProxy ? { proxyUrl: cleanProxy } : {}),
+          })
+          return await loginManager.startLogin({
+            accountId: `pending-${pendingId}`,
+            accountLabel: '新 Google 账号',
+            isNewAccount: true,
+            proxyDisplay: maskProxyUrlForDisplay(cleanProxy),
+            bin,
+            env,
+            cwd,
+            onBeforeSuccess: async ({ outputLog }) => {
+              const identity = await detectAccountIdentityFromHome(pendingHome, {
+                env,
+                outputText: outputLog,
+              })
+              const created = accountStore.commitPendingAccount({
+                pendingId,
+                email: identity.email,
+                name: identity.name,
+                proxyUrl: cleanProxy,
+                reservedHostIds: hostAccountIds,
+              })
+              syncManagedAccounts()
+              pool.switchActiveAccount(created.id)
+              return { accountId: created.id, accountLabel: created.label }
+            },
+            onCleanup: () => {
+              accountStore.cleanupPendingAccountHome(pendingId)
+            },
+          })
+        }
+
+        const profile = multiAccountPool.getProfile(accountId)
+        if (!profile) {
+          throw new AccountLoginError('未找到该账号，请刷新页面后重试', 404)
+        }
+        if (profile.source === 'managed') {
+          accountStore.ensureManagedAccountHome(profile.id)
+        }
+        const env = multiAccountPool.getAccountEnv(profile.id)
+        return await loginManager.startLogin({
+          accountId: profile.id,
+          accountLabel: profile.label ?? profile.id,
+          proxyDisplay: maskProxyUrlForDisplay(profile.proxyUrl),
+          bin,
+          env,
+          cwd,
+        })
+      },
+      submitAccountLoginCode: async (loginId, code) => await loginManager.submitCode(loginId, code),
+      cancelAccountLogin: (loginId) => loginManager.cancelLogin(loginId),
     })
   })
 
   // 5. Cleanup on plugin unload
   ctx.effect(() => () => {
+    loginManager.dispose()
+    installer.dispose()
     pool.dispose()
     slotManager?.dispose()
     for (const key of bridges.keys()) releaseBridge(key)

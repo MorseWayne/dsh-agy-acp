@@ -697,6 +697,19 @@ const SCOPED_CSS = `
 }
 
 /* Account card & quota grid */
+.agy-acp-active-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 9px 12px;
+  margin-bottom: 10px;
+  border-radius: 10px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(127, 127, 127, 0.2));
+  background: var(--dsw-alias-card-tile-fill, rgba(127, 127, 127, 0.05));
+  font-size: 12.5px;
+}
 .agy-acp-account-card {
   border-radius: 12px;
   border: 1px solid var(--dsw-alias-border-l2, rgba(127, 127, 127, 0.2));
@@ -705,8 +718,25 @@ const SCOPED_CSS = `
   margin-bottom: 10px;
   overflow-wrap: anywhere;
 }
+.agy-acp-account-card--active {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #3b82f6) 52%, var(--dsw-alias-border-l2, rgba(127, 127, 127, 0.24)));
+  background: color-mix(in srgb, var(--dsw-alias-state-business-tertiary, rgba(59, 130, 246, 0.1)) 38%, var(--dsw-alias-card-tile-fill, rgba(127, 127, 127, 0.04)));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--dsw-alias-state-business-primary, #3b82f6) 18%, transparent);
+}
 .agy-acp-account-card:last-child {
   margin-bottom: 0;
+}
+.agy-acp-collapsed-default {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 8px 12px;
+  margin-top: 10px;
+  border-radius: 9px;
+  border: 1px dashed var(--dsw-alias-border-l2, rgba(127, 127, 127, 0.22));
+  background: var(--dsw-alias-card-fill, rgba(127, 127, 127, 0.03));
 }
 .agy-acp-quota-grid {
   display: grid;
@@ -719,6 +749,85 @@ const SCOPED_CSS = `
   border-radius: 9px;
   border: 1px solid var(--dsw-alias-border-l1, rgba(127, 127, 127, 0.16));
   background: var(--dsw-alias-card-fill, rgba(127, 127, 127, 0.04));
+}
+
+/* Environment readiness banner & one-click installer */
+.agy-acp-env-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(127, 127, 127, 0.2));
+  background: var(--dsw-alias-card-fill, rgba(127, 127, 127, 0.04));
+}
+.agy-acp-env-card {
+  margin-bottom: 12px;
+}
+.agy-acp-env-card--alert {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #f59e0b) 48%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-tertiary, rgba(245, 158, 11, 0.1)) 45%, var(--dsw-alias-card-fill, transparent));
+}
+.agy-acp-env-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.agy-acp-env-log {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  max-height: 150px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--dsw-alias-bg-layer-2, rgba(0, 0, 0, 0.08));
+  border: 1px solid var(--dsw-alias-border-l1, rgba(127, 127, 127, 0.18));
+}
+.agy-acp-env-fallback {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--dsw-alias-border-l1, rgba(127, 127, 127, 0.16));
+}
+.agy-acp-code-inline {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-layer-2, rgba(127, 127, 127, 0.12));
+  border: 1px solid var(--dsw-alias-border-l1, rgba(127, 127, 127, 0.2));
+  word-break: break-all;
+}
+
+/* Account form & interactive Google login wizard */
+.agy-acp-wizard {
+  margin-bottom: 12px;
+  padding: 13px 14px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-business-primary, #3b82f6) 40%, var(--dsw-alias-border-l2, rgba(127, 127, 127, 0.22)));
+  background: var(--dsw-alias-card-tile-fill, rgba(59, 130, 246, 0.05));
+}
+.agy-acp-wizard-step {
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--dsw-alias-border-l1, rgba(127, 127, 127, 0.18));
+  background: var(--dsw-alias-card-fill, rgba(127, 127, 127, 0.04));
+}
+.agy-acp-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 10px 12px;
 }
 
 /* Modal shell */

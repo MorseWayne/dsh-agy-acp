@@ -1,4 +1,10 @@
-import { LOW_QUOTA_THRESHOLD, type AccountHealthSnapshot, type StatusSnapshot } from '../common/types.ts'
+import {
+  LOW_QUOTA_THRESHOLD,
+  type AccountHealthSnapshot,
+  type EnvironmentCheckItem,
+  type EnvironmentCheckReport,
+  type StatusSnapshot,
+} from '../common/types.ts'
 import { sanitizeDiagnosticText } from '../common/sanitize.ts'
 import { readCliVersion } from './account-quota.ts'
 import type { FilePolicy } from './permission-manager.ts'
@@ -130,19 +136,23 @@ export function formatAgyStatusReport(status: StatusSnapshot, now = Date.now()):
 }
 
 interface CheckOutcome {
+  id: EnvironmentCheckItem['id']
   level: 'PASS' | 'WARN' | 'FAIL'
   title: string
   detail: string
 }
 
 /**
- * Executes a 5-step strictly read-only, sandbox-confined environment self-check for `/agy-acp doctor`.
+ * Executes a 5-step strictly read-only, sandbox-confined environment self-check for `/agy-acp doctor`
+ * and the console "Environment Setup" wizard.
  */
 export async function runAgyDoctor(
   deps: DoctorDeps,
   signal?: AbortSignal,
-): Promise<{ ok: boolean; text: string }> {
+): Promise<{ ok: boolean; text: string; report: EnvironmentCheckReport }> {
   const checks: CheckOutcome[] = []
+  let cliVersion: string | null = null
+  let supportsFileCredentials = false
   const initialStatus = deps.pool.getStatus()
   const cwd = initialStatus.config.workspaceRoot || process.cwd()
   const effectiveSignal = signal ?? new AbortController().signal
@@ -151,11 +161,13 @@ export async function runAgyDoctor(
   const bin = deps.resolveBin()
   if (!bin) {
     checks.push({
+      id: 'binary',
       level: 'FAIL',
       title: 'agy 可执行文件',
       detail: '未在配置路径或 PATH 中找到可执行 agy 二进制，请安装 Antigravity CLI 或配置 agyBin。',
     })
     checks.push({
+      id: 'sandbox',
       level: 'WARN',
       title: '宿主只读沙箱与 CLI 版本',
       detail: '因未找到 agy 可执行文件，跳过版本执行检查。',
@@ -166,6 +178,7 @@ export async function runAgyDoctor(
     try {
       confinedArgv = await deps.prepareArgv([bin, '--version'], roPolicy, effectiveSignal)
       checks.push({
+        id: 'sandbox',
         level: 'PASS',
         title: '宿主只读沙箱 (sandbox.confine)',
         detail: '已通过完整只读执行约束校验（enforcement=full）。',
@@ -173,6 +186,7 @@ export async function runAgyDoctor(
     } catch (err) {
       const msg = sanitizeDiagnosticText(err instanceof Error ? err.message : String(err), 180)
       checks.push({
+        id: 'sandbox',
         level: 'FAIL',
         title: '宿主只读沙箱 (sandbox.confine)',
         detail: `宿主未能提供完整只读沙箱约束，已拒绝无沙箱执行（${msg || 'confinement unavailable'}）。`,
@@ -182,7 +196,10 @@ export async function runAgyDoctor(
     if (confinedArgv) {
       try {
         const ver = await readCliVersion(confinedArgv, undefined, cwd, effectiveSignal)
+        cliVersion = ver.version
+        supportsFileCredentials = ver.supportsFileCredentials
         checks.push({
+          id: 'binary',
           level: ver.version ? 'PASS' : 'WARN',
           title: 'agy CLI 版本',
           detail: ver.version
@@ -192,6 +209,7 @@ export async function runAgyDoctor(
       } catch (err) {
         const msg = sanitizeDiagnosticText(err instanceof Error ? err.message : String(err), 180)
         checks.push({
+          id: 'binary',
           level: 'FAIL',
           title: 'agy CLI 版本',
           detail: msg || '在只读沙箱中执行 agy --version 失败。',
@@ -226,18 +244,21 @@ export async function runAgyDoctor(
 
     if (unsupported.length > 0 && enabled.length === unsupported.length) {
       checks.push({
+        id: 'egress',
         level: 'FAIL',
         title: '网络出口与 Google 地域合规',
         detail: sanitizeDiagnosticText(`全部启用账号均处于受限地区，本地硬熔断生效中：${summary}`, 240),
       })
     } else if (unsupported.length > 0 || degraded.length > 0) {
       checks.push({
+        id: 'egress',
         level: 'WARN',
         title: '网络出口与 Google 地域合规',
         detail: sanitizeDiagnosticText(`部分账号出口受限或探测异常（多账号池将自动避障）：${summary}`, 240),
       })
     } else {
       checks.push({
+        id: 'egress',
         level: 'PASS',
         title: '网络出口与 Google 地域合规',
         detail: sanitizeDiagnosticText(`全部启用账号出口合规：${summary || '无启用账号'}`, 240),
@@ -246,6 +267,7 @@ export async function runAgyDoctor(
   } catch (err) {
     const msg = sanitizeDiagnosticText(err instanceof Error ? err.message : String(err), 180)
     checks.push({
+      id: 'egress',
       level: 'WARN',
       title: '网络出口与 Google 地域合规',
       detail: `出口检测未能完成：${msg}`,
@@ -254,19 +276,23 @@ export async function runAgyDoctor(
 
   // 4. ACP Model Catalog connectivity
   const latestBeforeCatalog = deps.pool.getStatus()
+  const enabledBeforeCatalog = latestBeforeCatalog.accounts.filter((a) => a.enabled)
   const allBlockedByGeo =
     latestBeforeCatalog.config.geoFenceMode !== 'off' &&
     latestBeforeCatalog.config.geoFenceMode !== 'warn' &&
-    latestBeforeCatalog.accounts.filter((a) => a.enabled).every((a) => a.egress?.status === 'unsupported')
+    enabledBeforeCatalog.length > 0 &&
+    enabledBeforeCatalog.every((a) => a.egress?.status === 'unsupported')
 
   if (latestBeforeCatalog.models.length > 0) {
     checks.push({
+      id: 'catalog',
       level: 'PASS',
       title: 'ACP 模型目录',
       detail: `已就绪（共 ${latestBeforeCatalog.models.length} 个可选模型，套餐=${sanitizeDiagnosticText(latestBeforeCatalog.tierName ?? '已识别', 60)}）。`,
     })
   } else if (allBlockedByGeo || !bin) {
     checks.push({
+      id: 'catalog',
       level: 'WARN',
       title: 'ACP 模型目录',
       detail: allBlockedByGeo
@@ -278,6 +304,7 @@ export async function runAgyDoctor(
       const models = await deps.pool.refreshModels()
       const visible = models.filter((m) => !m.variantOf)
       checks.push({
+        id: 'catalog',
         level: visible.length > 0 ? 'PASS' : 'WARN',
         title: 'ACP 模型目录',
         detail: visible.length > 0 ? `只读握手成功（共发现 ${visible.length} 个模型）。` : '握手返回了空模型列表。',
@@ -285,6 +312,7 @@ export async function runAgyDoctor(
     } catch (err) {
       const msg = sanitizeDiagnosticText(err instanceof Error ? err.message : String(err), 200)
       checks.push({
+        id: 'catalog',
         level: 'FAIL',
         title: 'ACP 模型目录',
         detail: msg || '只读模型目录探测失败，请检查 agy 登录状态。',
@@ -295,6 +323,7 @@ export async function runAgyDoctor(
   // 5. Local persistence & session continuity index
   const finalSnap = deps.pool.getStatus()
   checks.push({
+    id: 'persistence',
     level: 'PASS',
     title: '本机持久化与会话索引',
     detail: sanitizeDiagnosticText(
@@ -312,8 +341,22 @@ export async function runAgyDoctor(
     ...checks.map((c) => `[${c.level}] ${c.title}：${c.detail}`),
   ]
 
+  const report: EnvironmentCheckReport = {
+    ok: failCount === 0,
+    checkedAt: Date.now(),
+    cliVersion: cliVersion ?? finalSnap.agentVersion ?? null,
+    supportsFileCredentials,
+    items: checks.map((c) => ({
+      id: c.id,
+      level: c.level === 'PASS' ? 'pass' : c.level === 'WARN' ? 'warn' : 'fail',
+      title: c.title,
+      detail: c.detail,
+    })),
+  }
+
   return {
     ok: failCount === 0,
     text: lines.join('\n'),
+    report,
   }
 }

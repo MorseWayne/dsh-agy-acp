@@ -233,7 +233,7 @@ export class AcpAdapter extends LlmAdapter {
     let crashRetried = recoveryPolicy !== undefined
     let nextBlockIndex = 0
     let lastEgressBlockedError: EgressBlockedError | null = null
-    const maxAccounts = Math.max(1, cfg.accounts.filter((a) => a.enabled !== false).length || 1)
+    const maxAccounts = this.deps.pool.enabledAccountCount()
     const maxIterations = maxAccounts + 2
 
     for (let iter = 0; iter < maxIterations; iter++) {

@@ -7,7 +7,23 @@ export const LOW_QUOTA_THRESHOLD = 0.15
 
 export type ModelFamily = 'gemini-pro' | 'gemini-flash' | 'claude' | 'gpt' | 'other'
 
+export type AccountSource = 'default' | 'host' | 'managed'
+
+export type AccountAuthStatus = 'logged_in' | 'not_logged_in' | 'unknown'
+
+export interface ManagedAccountRecord {
+  email?: string
+  id: string
+  label: string
+  enabled: boolean
+  /** Optional explicit proxy URL (e.g. http://127.0.0.1:7890 or socks5://...). */
+  proxyUrl?: string
+  createdAt: number
+  updatedAt: number
+}
+
 export interface AccountProfileConfig {
+  email?: string
   id: string
   label?: string
   enabled?: boolean
@@ -15,6 +31,10 @@ export interface AccountProfileConfig {
   homeDir?: string
   /** Optional extra environment variables for this account. */
   env?: Record<string, string>
+  /** Origin of this account entry (host config, console-managed, or machine default). */
+  source?: AccountSource
+  /** Optional explicit proxy URL configured on a managed account. */
+  proxyUrl?: string
 }
 
 export interface QuotaBucketState {
@@ -65,6 +85,9 @@ export interface AccountEgressSnapshot {
 }
 
 export interface AccountHealthSnapshot {
+  email?: string
+  isPreferred?: boolean
+  isEffectiveActive?: boolean
   egress?: AccountEgressSnapshot
   quota?: AccountQuotaSample
   quotaRefreshUnavailable?: string
@@ -75,10 +98,71 @@ export interface AccountHealthSnapshot {
   label: string
   enabled: boolean
   hasSandboxHome: boolean
+  source?: AccountSource
+  authStatus?: AccountAuthStatus
+  /** Redacted proxy summary (`scheme://host:port`) without credentials. */
+  proxyDisplay?: string
+  /** Whether a proxy URL is explicitly configured on this managed account. */
+  hasProxy?: boolean
+  /** Whether this account can be edited/deleted via the console UI. */
+  editable?: boolean
+  /** Whether this account supports in-panel interactive Google login (`agy acp --login`). */
+  canInteractiveLogin?: boolean
   activeLeases: number
   families: Partial<Record<ModelFamily, FamilyQuotaState>>
   lastError: string | null
   lastUsedAt: number | null
+}
+
+export interface EnvironmentCheckItem {
+  id: 'binary' | 'sandbox' | 'egress' | 'catalog' | 'persistence'
+  level: 'pass' | 'warn' | 'fail'
+  title: string
+  detail: string
+}
+
+export interface EnvironmentCheckReport {
+  ok: boolean
+  checkedAt: number
+  cliVersion: string | null
+  supportsFileCredentials: boolean
+  items: EnvironmentCheckItem[]
+}
+
+export interface AgyInstallTaskSnapshot {
+  state: 'idle' | 'running' | 'succeeded' | 'failed'
+  action: 'install' | 'update'
+  startedAt?: number
+  finishedAt?: number
+  message: string
+  logs: string[]
+  manualCommand: string
+}
+
+export interface EnvironmentSnapshot {
+  platform: string
+  agyFound: boolean
+  agyBinPath: string | null
+  agyVersion: string | null
+  supportsFileCredentials?: boolean
+  manualInstallCommand: string
+  installTask?: AgyInstallTaskSnapshot
+  lastCheck?: EnvironmentCheckReport
+}
+
+export interface AccountLoginSessionSnapshot {
+  loginId: string
+  accountId: string
+  accountLabel: string
+  /** True when logging in directly to create & register a new isolated account (no pre-filled form required). */
+  isNewAccount?: boolean
+  /** Redacted proxy URL used for this login session, when specified. */
+  proxyDisplay?: string
+  state: 'starting' | 'awaiting_code' | 'exchanging' | 'succeeded' | 'failed' | 'cancelled'
+  authUrl?: string
+  message: string
+  startedAt: number
+  expiresAt: number
 }
 
 export interface PersistedConfigPatch {
@@ -227,8 +311,11 @@ export interface StatusSnapshot {
   mcpToolCatalog?: McpToolCatalogSnapshot
   usageTotals: UsageTotals
   accounts: AccountHealthSnapshot[]
+  preferredAccountId?: string | null
   models: AcpModelOption[]
   reviewProviders?: ReviewProviderOption[]
+  environment?: EnvironmentSnapshot
+  activeLogin?: AccountLoginSessionSnapshot | null
   config: {
     agyBin: string
     workspaceRoot: string
@@ -268,9 +355,13 @@ export interface AccountFailureOptions {
 }
 
 export interface AccountProvider {
+  setPreferredAccount?(accountId: string | null): void
+  getPreferredAccountId?(): string | null
   acquire(sessionKey: string, model: string, excludeAccountIds?: ReadonlySet<string>): Promise<AccountLease>
   reportSuccess?(accountId: string, model: string): void
   reportFailure?(accountId: string, model: string, error: unknown, options?: AccountFailureOptions): void
+  /** Record that an account completed a verified upstream operation without altering cooldowns. */
+  markAuthVerified?(accountId: string): void
   updateQuota?(
     accountId: string,
     family: ModelFamily,

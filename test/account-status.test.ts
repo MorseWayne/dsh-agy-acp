@@ -117,3 +117,60 @@ test('quotaAwareScheduling stays observational when off, routes to high-headroom
   assert.equal(pool.getStatus().accounts[0]?.families['gemini-pro']?.fiveHour, undefined)
   assert.equal(pool.getStatus().accounts[0]?.quota?.groups[0]?.fiveHour?.remainingFraction, 0.05)
 })
+
+test('machine default can refresh quota alongside strictly isolated managed accounts and respects maxAgeMs cache', async t => {
+  const isolatedCfg = resolveConfig({
+    accounts: [
+      { id: 'default', label: '本机默认账号', source: 'default' },
+      { id: 'managed-a', homeDir: path.resolve('fake-managed-a'), env: { ...testEnv, TEST_LABEL: 'managed-a' }, source: 'managed' },
+    ],
+  })
+  const accountPool = new MultiAccountPool({ accounts: isolatedCfg.accounts })
+  let usageLaunches = 0
+  const pool = new AcpSessionPool({
+    ...fakeHost,
+    accountProvider: accountPool,
+    getConfig: () => isolatedCfg,
+    resolveBin: () => 'mock-agy',
+    async prepareArgv(argv) {
+      if (argv[1] === '--version') return [process.execPath, '-e', "console.log('agy 1.5.17')"]
+      usageLaunches++
+      return [process.execPath, '-e', printUsage]
+    },
+  })
+  t.after(() => pool.dispose())
+
+  const snaps = pool.getStatus().accounts
+  assert.equal(snaps.find(a => a.id === 'default')?.quotaRefreshUnavailable, undefined)
+  assert.equal(snaps.find(a => a.id === 'managed-a')?.quotaRefreshUnavailable, undefined)
+
+  await pool.refreshAccountQuota('default')
+  assert.equal(usageLaunches, 1)
+  const firstSample = pool.getStatus().accounts.find(a => a.id === 'default')?.quota
+  assert.ok(firstSample?.groups.length)
+  assert.equal(firstSample.groups[0]?.name, 'machine')
+
+  // Fresh sample within maxAgeMs skips re-probing completely (0 additional launches)
+  await pool.refreshAccountQuota('default', { maxAgeMs: 180_000 })
+  assert.equal(usageLaunches, 1)
+  assert.equal(pool.getStatus().accounts.find(a => a.id === 'default')?.quota?.sampledAt, firstSample.sampledAt)
+
+  // Manual refresh without maxAgeMs always re-probes
+  await pool.refreshAccountQuota('default')
+  assert.equal(usageLaunches, 2)
+
+  // Managed account also refreshes independently
+  await pool.refreshAccountQuota('managed-a')
+  assert.equal(usageLaunches, 3)
+  assert.equal(pool.getStatus().accounts.find(a => a.id === 'managed-a')?.quota?.groups[0]?.name, 'managed-a')
+
+  // If ANY other profile lacks isolation (e.g. missing SSH_CONNECTION), default is still blocked fail-closed
+  const mixedPool = new MultiAccountPool({
+    accounts: [
+      { id: 'default', label: '本机默认账号', source: 'default' },
+      { id: 'unisolated-host', homeDir: path.resolve('fake-unisolated') },
+    ],
+  })
+  t.after(() => mixedPool.dispose())
+  assert.ok(mixedPool.getHealthSnapshots().find(a => a.id === 'default')?.quotaRefreshUnavailable)
+})

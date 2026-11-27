@@ -90,7 +90,7 @@ src/
 
 ### 环境要求
 - **Node.js `>= 24`**
-- 已安装并完成登录的 Antigravity CLI（**`agy >= 1.5`**）
+- Antigravity CLI（**`agy >= 1.5`**）—— 如尚未安装，可在 DSH Web 打开 **Antigravity ACP** 控制台，使用内置的 **「一键环境检查与安装 `agy`」**（支持可选代理）和 **面板内 Google 交互式登录向导** 直接完成准备，全程无需手动打开终端。
 
 ### 从 npm 安装
 
@@ -137,7 +137,9 @@ npm run build
 - **零第三方依赖纯匿名探测**（`src/runtime/egress-guard.ts`）：直接探测 `HEAD https://aistudio.google.com/` 与匿名 `POST https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`，不发送任何凭据，严格对齐 Go `agy` 的代理路由规则（`NO_PROXY` → `HTTPS_PROXY` → `ALL_PROXY` → `HTTP_PROXY`），原生支持 HTTP `CONNECT`、SOCKS5/SOCKS5H（`ATYP=0x03` 远端解析防 DNS 泄露）及直连/TUN，完美适配 Clash Verge 等分流代理。
 - **4 链路统一守门与漏网 400 瞬时熔断**：覆盖主对话（新建与长连接复用）、辅助调用、模型目录探测与配额查询。支持 `block`（默认）/ `strict` / `warn` / `off` 四档策略；一旦代理漂移触发上游 `400 FAILED_PRECONDITION`，立即销毁旧子进程（释放固定 Go HTTP/2 连接）、触发 60 秒本地熔断并保留 `SessionIndex` 供多账号无缝切号恢复。
 
-### 5. 多账号配额池、隐藏异常识别与 TOS 隔离
+### 5. 多账号配额池、面板内引导登录与 TOS 隔离
+- **控制台一键 OAuth 加号与隔离多账号管理**（`src/runtime/account-store.ts`、`src/runtime/account-login.ts`）：在「账号与配额」页点击 **「+ 添加账号」** 即可直接弹出 Google OAuth 授权页，无需预先手填账号名称或 ID；粘回授权码完成登录后自动识别 Google 邮箱并命名，原子落盘至 `~/.dsh/agy-acp/accounts.json`（`0600` 权限）与独立隔离目录 `~/.dsh/agy-acp/accounts/<id>` 并即时热生效（中途取消自动清理临时目录、不留空壳）。随时支持展开设置专属代理、改名、启停或删除。
+- **一键环境检查与官方 `agy` 安装/升级**（`src/runtime/env-setup.ts`、`src/runtime/doctor.ts`）：控制台顶部自动检测 `agy` 安装状态，支持一键执行 5 项只读环境自检与官方源一键安装/升级（支持填可选代理地址），装完热生效无需重启 DSH。
 - **独立凭据槽与配额权重调度**（`src/runtime/account-pool.ts`、`src/runtime/account-quota.ts`）：非阻塞异步凭据槽租约，支持直连上游配额接口 + 只读 CLI 兜底，开启「配额感知调度」后优先分配高余量账号。
 - **隐藏异常与 TOS 保护**：通过只读 SQLite 轨迹步骤识别伪装成 `end_turn` 的上游错误（`400` / `429` / `TOS_VIOLATION` / `INVALID_THINKING_SIGNATURE`）。命中 `TOS_VIOLATION` 时以最高优先级隔离全模型族并阻断自动故障转移，避免牵连池内其他账号。
 
@@ -163,7 +165,7 @@ npm run build
 ## 诊断与排查
 
 ### 控制台与运行时说明
-- **配置持久化**：控制台白名单配置原子写入 `~/.dsh/agy-acp/config.json`（`0600`），支持一键「放弃修改」与二次确认「恢复默认」；多账号敏感目录与代理环境变量（`accounts`、`credentialSlotDir`）仅由宿主配置只读管理。
+- **配置与账号持久化**：控制台白名单配置原子写入 `~/.dsh/agy-acp/config.json`（`0600`），支持一键「放弃修改」与二次确认「恢复默认」；控制台托管的多账号单独原子写入 `~/.dsh/agy-acp/accounts.json`（`0600`），隔离目录严格限定于 `~/.dsh/agy-acp/accounts/<id>`，宿主配置里定义的 `accounts` 与 `credentialSlotDir` 仍保持只读。
 - **超时语义**：`requestTimeoutMs` 对 `session/prompt` 表示**活跃空闲超时**而非整轮硬上限；有效模型输出与工具进展会重置计时，等待人工审批、长耗时反向 MCP 工具与主动取消均有独立生命周期处理。
 - **配额与隔离边界**：仅针对明确归属隔离账号且未过期的文件凭据尝试直连配额 API（不续签 OAuth、不读取机器默认共享令牌）；`3P` 为共享额度，满额滚动窗口的占位时间不会被误判为真实倒计时。插件仅清理可核实归属的私有临时目录，不触碰真实 HOME 中的共享会话数据库或规则目录。
 - **异常自愈**：若检测到已损坏的 `thinking` 签名，插件会自动作废对应会话索引并在下轮以摘要重建，不会盲目重跑已执行过的工具；SSE 断连时控制台会明确提示当前展示的是最后快照。

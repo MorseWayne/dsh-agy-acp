@@ -15,6 +15,7 @@ import {
 import { sessionAccountLabel } from './account-display.ts'
 import { AccountsPanel } from './accounts-panel.ts'
 import { ConfigFieldset, ConfigPanel, type Operation } from './config-panel.ts'
+import { EnvSetupBanner } from './env-setup-banner.ts'
 import { AgyAcpToolRow } from './mirror-tool-view.ts'
 import { postJson, resetSessions, type SessionResetTarget } from './panel-actions.ts'
 import { accountAttention } from './runtime-display.ts'
@@ -285,6 +286,14 @@ export function SettingsView({
       ? h('div', { role: 'status', className: 'agy-acp-notice agy-acp-notice--warn' }, notice)
       : null,
 
+    h(EnvSetupBanner, {
+      environment: status.environment,
+      agentVersion: status.agentVersion,
+      applyStatus,
+      onOpenConfig: () => setPanel('config'),
+      onOpenAccounts: () => setPanel('accounts'),
+    }),
+
     // Diagnostic error banner (from Phase 2 sanitized lastError)
     status.lastError
       ? h(
@@ -354,7 +363,10 @@ export function SettingsView({
       : panel === 'accounts'
         ? h(AccountsPanel, {
             accounts,
+            preferredAccountId: status.preferredAccountId,
             geoFenceMode: status.config?.geoFenceMode,
+            agyFound: status.environment?.agyFound ?? true,
+            activeLogin: status.activeLogin,
             applyStatus,
           })
         : stableConfig
@@ -414,6 +426,13 @@ function AgyAcpConsoleWidget(props?: SlotOwnerProps): unknown {
 
   const notice = snapshotNotice(state)
   const current = !notice ? status?.sessions.find(s => s.dshSessionKey === props?.sessionId) : undefined
+  const enabledAccounts = status?.accounts.filter(a => a.enabled) ?? []
+  const activeAcc =
+    status?.accounts.find(a => a.isEffectiveActive) ??
+    (status?.preferredAccountId
+      ? status.accounts.find(a => a.id === status.preferredAccountId && a.enabled)
+      : undefined) ??
+    (enabledAccounts.length === 1 ? enabledAccounts[0] : undefined)
   const badgeLabel = notice
     ? `AGY·ACP · ${stream === 'offline' ? '实时连接中断' : '连接中'}`
     : current
@@ -423,7 +442,15 @@ function AgyAcpConsoleWidget(props?: SlotOwnerProps): unknown {
     status?.config?.geoFenceMode !== 'off' &&
       status?.accounts.some(a => a.enabled && a.egress?.status === 'unsupported'),
   )
-  const dotColor = status?.lastError || hasGeoAlert ? theme.stateError : current ? theme.stateSuccess : theme.stateIdle
+  const missingAgy = status?.environment?.agyFound === false
+  const dotColor =
+    status?.lastError || hasGeoAlert
+      ? theme.stateError
+      : missingAgy
+        ? theme.stateWarn
+        : current
+          ? theme.stateSuccess
+          : theme.stateIdle
 
   const modal = open
     ? portalToBody(
@@ -497,7 +524,9 @@ function AgyAcpConsoleWidget(props?: SlotOwnerProps): unknown {
         },
         title: current
           ? `${current.currentModel} · 使用账号 ${sessionAccountLabel(current.accountId, status?.accounts ?? [])} · 推理强度 ${effortLabel(current.currentEffort) || '未报告'} · ACP 上下文 ${contextLabel(current)}`
-          : status?.lastError || notice || '打开 Antigravity ACP 控制台',
+          : status?.lastError ||
+            notice ||
+            (activeAcc ? `当前账号：${activeAcc.label} · 点击打开 Antigravity ACP 控制台` : '打开 Antigravity ACP 控制台'),
         style: {
           opacity: current || status?.lastError ? 0.96 : 0.8,
         },

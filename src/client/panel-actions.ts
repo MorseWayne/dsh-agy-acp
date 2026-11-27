@@ -1,29 +1,41 @@
-import type { StatusSnapshot } from '../common/types.ts'
+import type {
+  AccountLoginSessionSnapshot,
+  AgyInstallTaskSnapshot,
+  EnvironmentCheckReport,
+  ManagedAccountRecord,
+  StatusSnapshot,
+} from '../common/types.ts'
 import { isValidSnapshot } from './status-store.ts'
 
-interface PostJsonResult {
+interface PostJsonResult<TExtra = Record<string, unknown>> {
   ok: boolean
   status?: StatusSnapshot
   error?: string
+  data?: TExtra
 }
 
-export async function postJson(url: string, body: Record<string, unknown>, request = fetch): Promise<PostJsonResult> {
+export async function postJson<TExtra = Record<string, unknown>>(
+  url: string,
+  body: Record<string, unknown>,
+  request = fetch,
+): Promise<PostJsonResult<TExtra>> {
   try {
     const res = await request(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     })
-    let data: { status?: StatusSnapshot; error?: string } = {}
+    let data: (TExtra & { status?: StatusSnapshot; error?: string }) | undefined
     try {
-      data = (await res.json()) as { status?: StatusSnapshot; error?: string }
+      data = (await res.json()) as TExtra & { status?: StatusSnapshot; error?: string }
     } catch {
       // ignore non-JSON body
     }
     return {
       ok: res.ok,
-      ...(isValidSnapshot(data.status) ? { status: data.status } : {}),
-      ...(typeof data.error === 'string' && data.error.trim() ? { error: data.error.trim() } : {}),
+      ...(isValidSnapshot(data?.status) ? { status: data.status } : {}),
+      ...(typeof data?.error === 'string' && data.error.trim() ? { error: data.error.trim() } : {}),
+      ...(data ? { data } : {}),
     }
   } catch {
     return { ok: false, error: '未能连接到插件，请重试' }
@@ -91,4 +103,151 @@ export async function resetSessions(target: SessionResetTarget, request = fetch)
   const res = await postJson('/plugins/agy-acp/sessions/reset', body, request)
   if (!res.ok || !res.status) return { message: '会话操作未完成，请检查插件连接后重试。' }
   return { status: res.status, message: success }
+}
+
+export async function runEnvironmentCheck(
+  request = fetch,
+): Promise<{ ok: boolean; report?: EnvironmentCheckReport; status?: StatusSnapshot; error?: string }> {
+  const res = await postJson<{ report?: EnvironmentCheckReport }>('/plugins/agy-acp/env/check', {}, request)
+  return {
+    ok: res.ok,
+    report: res.data?.report,
+    status: res.status,
+    error: res.error,
+  }
+}
+
+export async function startAgyInstall(
+  input: { action?: 'install' | 'update'; proxyUrl?: string },
+  request = fetch,
+): Promise<{ ok: boolean; task?: AgyInstallTaskSnapshot; status?: StatusSnapshot; error?: string }> {
+  const res = await postJson<{ task?: AgyInstallTaskSnapshot }>(
+    '/plugins/agy-acp/env/install',
+    {
+      action: input.action ?? 'install',
+      ...(input.proxyUrl?.trim() ? { proxyUrl: input.proxyUrl.trim() } : {}),
+    },
+    request,
+  )
+  return {
+    ok: res.ok,
+    task: res.data?.task,
+    status: res.status,
+    error: res.error,
+  }
+}
+
+export async function addManagedAccount(
+  input: { id?: string; label: string; proxyUrl?: string; enabled?: boolean },
+  request = fetch,
+): Promise<{ ok: boolean; account?: ManagedAccountRecord; status?: StatusSnapshot; error?: string }> {
+  const res = await postJson<{ account?: ManagedAccountRecord }>(
+    '/plugins/agy-acp/accounts/add',
+    {
+      label: input.label,
+      ...(input.id?.trim() ? { id: input.id.trim() } : {}),
+      ...(input.proxyUrl?.trim() ? { proxyUrl: input.proxyUrl.trim() } : {}),
+      ...(typeof input.enabled === 'boolean' ? { enabled: input.enabled } : {}),
+    },
+    request,
+  )
+  return {
+    ok: res.ok,
+    account: res.data?.account,
+    status: res.status,
+    error: res.error,
+  }
+}
+
+export async function updateManagedAccount(
+  input: { accountId: string; label?: string; proxyUrl?: string; enabled?: boolean },
+  request = fetch,
+): Promise<{ ok: boolean; status?: StatusSnapshot; error?: string }> {
+  const payload: Record<string, unknown> = { accountId: input.accountId }
+  if (input.label !== undefined) payload.label = input.label
+  if (input.enabled !== undefined) payload.enabled = input.enabled
+  if (input.proxyUrl !== undefined) payload.proxyUrl = input.proxyUrl
+  const res = await postJson('/plugins/agy-acp/accounts/update', payload, request)
+  return { ok: res.ok, status: res.status, error: res.error }
+}
+
+export async function removeManagedAccount(
+  accountId: string,
+  purgeData = false,
+  request = fetch,
+): Promise<{ ok: boolean; status?: StatusSnapshot; error?: string }> {
+  const res = await postJson('/plugins/agy-acp/accounts/remove', { accountId, purgeData }, request)
+  return { ok: res.ok, status: res.status, error: res.error }
+}
+
+export async function selectActiveAccount(
+  accountId: string | null,
+  request = fetch,
+): Promise<{ ok: boolean; status?: StatusSnapshot; error?: string }> {
+  const res = await postJson('/plugins/agy-acp/accounts/select', { accountId }, request)
+  return { ok: res.ok, status: res.status, error: res.error }
+}
+
+export async function startAccountLogin(
+  input?: { accountId?: string; proxyUrl?: string },
+  request = fetch,
+): Promise<{ ok: boolean; login?: AccountLoginSessionSnapshot; status?: StatusSnapshot; error?: string }> {
+  const payload: Record<string, unknown> = {}
+  if (input?.accountId?.trim()) payload.accountId = input.accountId.trim()
+  if (input?.proxyUrl?.trim()) payload.proxyUrl = input.proxyUrl.trim()
+  const res = await postJson<{ login?: AccountLoginSessionSnapshot }>(
+    '/plugins/agy-acp/accounts/login/start',
+    payload,
+    request,
+  )
+  return { ok: res.ok, login: res.data?.login, status: res.status, error: res.error }
+}
+
+export async function submitAccountLoginCode(
+  loginId: string,
+  code: string,
+  request = fetch,
+): Promise<{ ok: boolean; login?: AccountLoginSessionSnapshot; status?: StatusSnapshot; error?: string }> {
+  const res = await postJson<{ login?: AccountLoginSessionSnapshot }>(
+    '/plugins/agy-acp/accounts/login/submit',
+    { loginId, code },
+    request,
+  )
+  return { ok: res.ok, login: res.data?.login, status: res.status, error: res.error }
+}
+
+export async function cancelAccountLogin(
+  loginId?: string,
+  request = fetch,
+): Promise<{ ok: boolean; status?: StatusSnapshot; error?: string }> {
+  const res = await postJson('/plugins/agy-acp/accounts/login/cancel', loginId ? { loginId } : {}, request)
+  return { ok: res.ok, status: res.status, error: res.error }
+}
+
+export async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // fallback below
+  }
+  try {
+    if (typeof document !== 'undefined' && document.body) {
+      const el = document.createElement('textarea')
+      el.value = text
+      el.setAttribute('readonly', '')
+      el.style.position = 'fixed'
+      el.style.opacity = '0'
+      document.body.appendChild(el)
+      el.select()
+      const ok = document.execCommand('copy')
+      document.body.removeChild(el)
+      return ok
+    }
+  } catch {
+    // ignore
+  }
+  return false
 }

@@ -31,9 +31,11 @@ import {
   type AccountFailureOptions,
   type AccountHealthSnapshot,
   type AccountLease,
+  type AccountLoginSessionSnapshot,
   type AccountProvider,
   type AccountQuotaSample,
   type AcpModelOption,
+  type EnvironmentSnapshot,
   type McpBridgeSnapshot,
   type McpToolCatalogSnapshot,
   type PluginConfig,
@@ -43,7 +45,7 @@ import {
   type UsageTotals,
 } from '../common/types.ts'
 
-import { isTosViolationError } from './account-pool.ts'
+import { isAuthFailureError, isTosViolationError } from './account-pool.ts'
 import {
   AccountQuotaError,
   mapQuotaGroupsToFamilies,
@@ -157,6 +159,8 @@ export interface SessionPoolDeps {
   isMcpBridgeActive?: () => boolean
   getMcpBridgeSnapshot?: () => McpBridgeSnapshot
   getMcpToolCatalog?: () => McpToolCatalogSnapshot | undefined
+  getEnvironmentSnapshot?: () => EnvironmentSnapshot
+  getActiveLoginSnapshot?: () => AccountLoginSessionSnapshot | null
   listReviewProviders?: () => ReviewProviderOption[]
   onConfigPatch?: (patch: Partial<PluginConfig>) => void | Promise<void>
   onConfigReset?: () => void | Promise<void>
@@ -387,13 +391,25 @@ export class AcpSessionPool extends EventEmitter {
     })
   }
 
-  /** Manual observation only: never acquire a scheduler-selected fallback or change local cooldowns. */
-  async refreshAccountQuota(id: string): Promise<void> {
+  /** Observation only: never acquire a scheduler-selected fallback or change local cooldowns. */
+  async refreshAccountQuota(id: string, opts?: { maxAgeMs?: number }): Promise<void> {
     if (this.disposed || !this.deps.getConfig().enabled) throw new AccountQuotaError('ACP 插件未启用', 409)
     const account = this.getAccountHealthSnapshots().find(a => a.id === id)
     if (!account) throw new AccountQuotaError('未找到该账号', 404)
     if (account.quotaRefreshUnavailable || !account.enabled || !this.accountProvider.acquireQuotaLease) {
       throw new AccountQuotaError(account.quotaRefreshUnavailable || '此账号不支持配额查询', 409)
+    }
+    if (typeof opts?.maxAgeMs === 'number' && Number.isFinite(opts.maxAgeMs) && opts.maxAgeMs > 0) {
+      const existing = this.quotaSamples.get(id)
+      const now = Date.now()
+      if (existing && now - existing.sampledAt < opts.maxAgeMs) {
+        const hasExpiredBucket = existing.groups.some(
+          g =>
+            (g.fiveHour?.resetAt != null && g.fiveHour.resetAt <= now) ||
+            (g.sevenDay?.resetAt != null && g.sevenDay.resetAt <= now),
+        )
+        if (!hasExpiredBucket) return
+      }
     }
     const pending = this.quotaReads.get(id)
     if (pending) return pending
@@ -437,6 +453,7 @@ export class AcpSessionPool extends EventEmitter {
       signal.throwIfAborted()
       const sample: AccountQuotaSample = { groups, sampledAt: Date.now(), source }
       this.quotaSamples.set(id, sample)
+      this.accountProvider.markAuthVerified?.(id)
       if (this.deps.getConfig().quotaAwareScheduling) {
         this.applySampleToScheduler(id, sample)
       }
@@ -568,8 +585,11 @@ export class AcpSessionPool extends EventEmitter {
       ...(mcpToolCatalog ? { mcpToolCatalog } : {}),
       usageTotals: { ...this.usageTotals },
       accounts: this.getAccountHealthSnapshots(),
+      preferredAccountId: this.accountProvider.getPreferredAccountId?.() ?? null,
       models: this.cachedModels.filter(m => !m.variantOf),
       ...(this.deps.listReviewProviders ? { reviewProviders: this.deps.listReviewProviders() } : {}),
+      ...(this.deps.getEnvironmentSnapshot ? { environment: this.deps.getEnvironmentSnapshot() } : {}),
+      ...(this.deps.getActiveLoginSnapshot ? { activeLogin: this.deps.getActiveLoginSnapshot() } : {}),
       config: {
         agyBin: cfg.agyBin,
         workspaceRoot: cfg.workspaceRoot,
@@ -1053,7 +1073,7 @@ export class AcpSessionPool extends EventEmitter {
     cwd = cwd || cfg.workspaceRoot || process.cwd()
 
     const requestedModel = params.model || cfg.defaultModel || ''
-    const maxAccounts = Math.max(1, cfg.accounts.filter((a) => a.enabled !== false).length || 1)
+    const maxAccounts = this.enabledAccountCount()
     const triedAccounts = new Set<string>()
 
     const denyAllPermissions = async (req: RequestPermissionParams): Promise<RequestPermissionResult> => {
@@ -1359,7 +1379,7 @@ export class AcpSessionPool extends EventEmitter {
 
   private async probeCatalog(cwd?: string, expectedGen?: number): Promise<AcpModelOption[]> {
     const cfg = this.deps.getConfig()
-    const maxAccounts = Math.max(1, cfg.accounts.filter((a) => a.enabled !== false).length || 1)
+    const maxAccounts = this.enabledAccountCount()
     const triedAccounts = new Set<string>()
     for (let attempt = 0; attempt < maxAccounts; attempt++) {
       const lease = await this.acquireAccountLease(
@@ -1383,6 +1403,7 @@ export class AcpSessionPool extends EventEmitter {
         try {
           const res = await client.sessionNew({ cwd: root, mcpServers: [] })
           probeId = res.sessionId
+          this.accountProvider.markAuthVerified?.(lease.accountId)
           if (expectedGen !== undefined && expectedGen !== this.catalogGeneration) {
             return this.cachedModels
           }
@@ -1395,6 +1416,9 @@ export class AcpSessionPool extends EventEmitter {
         if (isTosViolationError(err)) {
           this.reportAccountFailure(lease.accountId, '', err)
           throw err
+        }
+        if (isAuthFailureError(err)) {
+          this.reportAccountFailure(lease.accountId, '', err)
         }
         if (err instanceof EgressBlockedError) {
           triedAccounts.add(lease.accountId)
@@ -1437,6 +1461,53 @@ export class AcpSessionPool extends EventEmitter {
     client?.dispose(reason)
     this.deps.onSessionClosed?.(key)
     this.emitStatus()
+  }
+
+  enabledAccountCount(): number {
+    const snapshots = this.accountProvider.getHealthSnapshots?.()
+    if (snapshots && snapshots.length > 0) {
+      return Math.max(1, snapshots.filter((a) => a.enabled).length)
+    }
+    return Math.max(1, this.deps.getConfig().accounts.filter((a) => a.enabled !== false).length || 1)
+  }
+
+  /** Switch future turns without interrupting an in-flight prompt. Cold bindings are
+   * resumed only after the scheduler acquires a lease for the same account. */
+  switchActiveAccount(accountId: string | null): void {
+    this.accountProvider.setPreferredAccount?.(accountId)
+    if (accountId !== null) {
+      for (const [key, session] of this.sessions) {
+        if (session.accountId === accountId) continue
+        this.deps.sessionIndex?.delete(key)
+        const turn = this.active.get(key)
+        if (turn) turn.retire = true
+        else this.invalidate(key)
+      }
+    }
+    this.emitStatus()
+  }
+
+  /** Retire live sessions pinned to an account without interrupting active turns (e.g. after re-login). */
+  retireSessionsForAccount(accountId: string): void {
+    for (const [key, session] of [...this.sessions.entries()]) {
+      if (session.accountId !== accountId) continue
+      this.deps.sessionIndex?.delete(key)
+      const turn = this.active.get(key)
+      if (turn) turn.retire = true
+      else this.invalidate(key)
+    }
+  }
+
+  /** Evict live sessions currently pinned to an account (e.g. after removal, disable, or proxy change). */
+  evictSessionsForAccount(accountId: string, reason?: Error): number {
+    let closed = 0
+    for (const [key, session] of [...this.sessions.entries()]) {
+      if (session.accountId === accountId) {
+        this.invalidate(key, reason)
+        closed++
+      }
+    }
+    return closed
   }
 
   evictSession(key: string, reason?: Error): void {
@@ -1518,8 +1589,8 @@ export class AcpSessionPool extends EventEmitter {
       this.catalogRetryCount = 0
     }
     if (changed) {
-      this.emitStatus()
       this.emit('models-updated')
+      this.emitStatus()
     }
     return catalog
   }

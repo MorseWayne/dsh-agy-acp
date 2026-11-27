@@ -123,10 +123,35 @@ export function formatEgressBadge(egress: AccountEgressSnapshot | undefined, mod
   }
 }
 
+export const AUTO_QUOTA_TTL_MS = 3 * 60_000
+export const AUTO_QUOTA_RETRY_COOLDOWN_MS = 60_000
+
+/** Whether opening the Accounts panel should lazily fetch/refresh this account's quota sample. */
+export function shouldAutoFetchQuota(
+  account: AccountHealthSnapshot,
+  now: number,
+  agyFound = true,
+  ttlMs = AUTO_QUOTA_TTL_MS,
+): boolean {
+  if (!agyFound || !account.enabled || account.quotaRefreshUnavailable) return false
+  if (account.authStatus === 'not_logged_in' || account.tosBlocked || account.egress?.status === 'unsupported') {
+    return false
+  }
+  const quota = account.quota
+  if (!quota) return true
+  if (now - quota.sampledAt >= ttlMs) return true
+  return quota.groups.some(
+    g =>
+      (g.fiveHour?.resetAt != null && g.fiveHour.resetAt <= now) ||
+      (g.sevenDay?.resetAt != null && g.sevenDay.resetAt <= now),
+  )
+}
+
 export async function requestAccountAction(
   action: AccountActionKind,
   accountId: string,
   request = fetch,
+  opts?: { maxAgeMs?: number },
 ): Promise<StatusSnapshot> {
   let failure =
     action === 'refresh'
@@ -141,8 +166,12 @@ export async function requestAccountAction(
         : action === 'egress'
           ? 'egress/check'
           : 'cooldown/clear'
+    const payload: Record<string, unknown> = { accountId }
+    if (action === 'refresh' && typeof opts?.maxAgeMs === 'number' && opts.maxAgeMs > 0) {
+      payload.maxAgeMs = opts.maxAgeMs
+    }
     const response = await request(`/plugins/agy-acp/accounts/${endpoint}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accountId }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
     })
     // Do not echo upstream stderr, proxy URLs, credentials or arbitrary error bodies.
     if (response.ok) {

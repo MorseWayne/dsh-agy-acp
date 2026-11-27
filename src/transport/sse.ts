@@ -1,7 +1,17 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { validateConfigPatchInput } from '../common/config.ts'
-import { PROVIDER_ID, type StatusSnapshot } from '../common/types.ts'
+import {
+  PROVIDER_ID,
+  type AccountLoginSessionSnapshot,
+  type AgyInstallTaskSnapshot,
+  type EnvironmentCheckReport,
+  type ManagedAccountRecord,
+  type StatusSnapshot,
+} from '../common/types.ts'
+import { AccountLoginError } from '../runtime/account-login.ts'
 import { AccountQuotaError } from '../runtime/account-quota.ts'
+import { AccountStoreError } from '../runtime/account-store.ts'
+import { EnvSetupError } from '../runtime/env-setup.ts'
 import { EgressCheckError, type AcpSessionPool } from '../runtime/session-pool.ts'
 
 export interface ReviewModelChoice {
@@ -20,6 +30,15 @@ export interface AcpRoutesOptions {
   listReviewModels?: (provider: string) => Promise<ReviewModelChoice[] | null>
   /** Coalesce bursty SSE status broadcasts within this window (ms). Defaults to 180ms; 0 disables throttling. */
   sseThrottleMs?: number
+  runEnvCheck?: () => Promise<EnvironmentCheckReport>
+  startAgyInstall?: (input: { action?: 'install' | 'update'; proxyUrl?: string }) => AgyInstallTaskSnapshot
+  addAccount?: (body: Record<string, unknown>) => Promise<ManagedAccountRecord>
+  updateAccount?: (body: Record<string, unknown>) => Promise<unknown>
+  selectAccount?: (accountId: string | null) => Promise<void> | void
+  removeAccount?: (accountId: string, opts?: { purgeData?: boolean }) => Promise<void>
+  startAccountLogin?: (input: { accountId?: string; proxyUrl?: string }) => Promise<AccountLoginSessionSnapshot>
+  submitAccountLoginCode?: (loginId: string, code: string) => Promise<AccountLoginSessionSnapshot>
+  cancelAccountLogin?: (loginId?: string) => void
 }
 
 export interface ExactRouteSpec {
@@ -391,8 +410,12 @@ export function registerAcpRoutes(
       sendJson(res, 400, { error: '请选择要刷新的账号' })
       return
     }
+    const maxAgeMs =
+      typeof body.maxAgeMs === 'number' && Number.isFinite(body.maxAgeMs) && body.maxAgeMs > 0
+        ? Math.min(3_600_000, Math.max(1_000, Math.floor(body.maxAgeMs)))
+        : undefined
     try {
-      await pool.refreshAccountQuota(body.accountId)
+      await pool.refreshAccountQuota(body.accountId, maxAgeMs ? { maxAgeMs } : undefined)
       sendJson(res, 200, { ok: true, status: pool.getStatus() })
     } catch (err) {
       // Never expose child stderr, slot paths, sandbox argv or inherited env values.
@@ -442,6 +465,231 @@ export function registerAcpRoutes(
       const status = err instanceof HttpInputError ? err.status : 400
       sendJson(res, status, { error: err instanceof Error ? err.message : String(err) })
     }
+  })
+
+  addRoute('POST', '/plugins/agy-acp/env/check', async (req, res) => {
+    if (!requireJsonContentType(req, res)) return
+    try {
+      await readJsonBody(req)
+    } catch (err) {
+      const status = err instanceof HttpInputError ? err.status : 400
+      sendJson(res, status, { error: err instanceof Error ? err.message : '无效的 JSON 请求' })
+      return
+    }
+    if (!opts?.runEnvCheck) {
+      sendJson(res, 501, { error: '当前运行环境不支持面板内环境检查' })
+      return
+    }
+    try {
+      const report = await opts.runEnvCheck()
+      sendJson(res, 200, { ok: true, report, status: pool.getStatus() })
+    } catch {
+      sendJson(res, 500, { error: '环境检查未能完成，请稍后重试' })
+    }
+  })
+
+  addRoute('POST', '/plugins/agy-acp/env/install', async (req, res) => {
+    if (!requireJsonContentType(req, res)) return
+    let body: Record<string, unknown>
+    try {
+      body = await readJsonBody(req)
+    } catch (err) {
+      const status = err instanceof HttpInputError ? err.status : 400
+      sendJson(res, status, { error: err instanceof Error ? err.message : '无效的 JSON 请求' })
+      return
+    }
+    if (!opts?.startAgyInstall) {
+      sendJson(res, 501, { error: '当前运行环境不支持一键安装' })
+      return
+    }
+    const action = body.action === 'update' ? 'update' : 'install'
+    const proxyUrl = typeof body.proxyUrl === 'string' ? body.proxyUrl : undefined
+    try {
+      const task = opts.startAgyInstall({ action, proxyUrl })
+      sendJson(res, 200, { ok: true, task, status: pool.getStatus() })
+    } catch (err) {
+      const status = err instanceof EnvSetupError ? err.status : 500
+      sendJson(res, status, { error: err instanceof EnvSetupError ? err.message : '无法启动安装任务，请稍后重试' })
+    }
+  })
+
+  addRoute('POST', '/plugins/agy-acp/accounts/add', async (req, res) => {
+    if (!requireJsonContentType(req, res)) return
+    let body: Record<string, unknown>
+    try {
+      body = await readJsonBody(req)
+    } catch (err) {
+      const status = err instanceof HttpInputError ? err.status : 400
+      sendJson(res, status, { error: err instanceof Error ? err.message : '无效的 JSON 请求' })
+      return
+    }
+    if (!opts?.addAccount) {
+      sendJson(res, 501, { error: '当前运行环境不支持控制台托管账号' })
+      return
+    }
+    try {
+      const account = await opts.addAccount(body)
+      sendJson(res, 200, { ok: true, account, status: pool.getStatus() })
+    } catch (err) {
+      const status = err instanceof AccountStoreError ? err.status : 500
+      sendJson(res, status, { error: err instanceof AccountStoreError ? err.message : '添加账号失败，请稍后重试' })
+    }
+  })
+
+  addRoute('POST', '/plugins/agy-acp/accounts/select', async (req, res) => {
+    if (!requireJsonContentType(req, res)) return
+    try {
+      const { accountId } = await readJsonBody(req)
+      if (accountId !== null && typeof accountId !== 'string') throw new HttpInputError(400, '请指定账号 ID 或 null')
+      if (!opts?.selectAccount) throw new HttpInputError(501, '当前运行环境不支持切换账号')
+      const id = accountId?.trim() || null
+      if (id !== null) {
+        const account = pool.getStatus().accounts.find(a => a.id === id)
+        if (!account) throw new AccountStoreError('未找到该账号', 404)
+        if (!account.enabled) throw new AccountStoreError('账号已停用', 409)
+      }
+      await opts.selectAccount(id)
+      sendJson(res, 200, { ok: true, status: pool.getStatus() })
+    } catch (err) {
+      if (err instanceof AccountStoreError || err instanceof HttpInputError) sendJson(res, err.status, { error: err.message })
+      else sendJson(res, 500, { error: '切换账号失败，请稍后重试' })
+    }
+  })
+
+  addRoute('POST', '/plugins/agy-acp/accounts/update', async (req, res) => {
+    if (!requireJsonContentType(req, res)) return
+    let body: Record<string, unknown>
+    try {
+      body = await readJsonBody(req)
+    } catch (err) {
+      const status = err instanceof HttpInputError ? err.status : 400
+      sendJson(res, status, { error: err instanceof Error ? err.message : '无效的 JSON 请求' })
+      return
+    }
+    if (!opts?.updateAccount) {
+      sendJson(res, 501, { error: '当前运行环境不支持编辑账号' })
+      return
+    }
+    try {
+      await opts.updateAccount(body)
+      sendJson(res, 200, { ok: true, status: pool.getStatus() })
+    } catch (err) {
+      const status = err instanceof AccountStoreError ? err.status : 500
+      sendJson(res, status, { error: err instanceof AccountStoreError ? err.message : '更新账号失败，请稍后重试' })
+    }
+  })
+
+  addRoute('POST', '/plugins/agy-acp/accounts/remove', async (req, res) => {
+    if (!requireJsonContentType(req, res)) return
+    let body: Record<string, unknown>
+    try {
+      body = await readJsonBody(req)
+    } catch (err) {
+      const status = err instanceof HttpInputError ? err.status : 400
+      sendJson(res, status, { error: err instanceof Error ? err.message : '无效的 JSON 请求' })
+      return
+    }
+    if (!opts?.removeAccount) {
+      sendJson(res, 501, { error: '当前运行环境不支持删除账号' })
+      return
+    }
+    if (typeof body.accountId !== 'string' || !body.accountId.trim()) {
+      sendJson(res, 400, { error: '请指定要删除的账号 ID' })
+      return
+    }
+    try {
+      await opts.removeAccount(body.accountId, { purgeData: body.purgeData === true })
+      sendJson(res, 200, { ok: true, status: pool.getStatus() })
+    } catch (err) {
+      const status = err instanceof AccountStoreError ? err.status : 500
+      sendJson(res, status, { error: err instanceof AccountStoreError ? err.message : '删除账号失败，请稍后重试' })
+    }
+  })
+
+  addRoute('POST', '/plugins/agy-acp/accounts/login/start', async (req, res) => {
+    if (!requireJsonContentType(req, res)) return
+    let body: Record<string, unknown>
+    try {
+      body = await readJsonBody(req)
+    } catch (err) {
+      const status = err instanceof HttpInputError ? err.status : 400
+      sendJson(res, status, { error: err instanceof Error ? err.message : '无效的 JSON 请求' })
+      return
+    }
+    if (!opts?.startAccountLogin) {
+      sendJson(res, 501, { error: '当前运行环境不支持面板内引导登录' })
+      return
+    }
+    const accountId =
+      typeof body.accountId === 'string' && body.accountId.trim() ? body.accountId.trim() : undefined
+    const proxyUrl =
+      typeof body.proxyUrl === 'string' && body.proxyUrl.trim() ? body.proxyUrl.trim() : undefined
+    try {
+      const login = await opts.startAccountLogin({
+        ...(accountId ? { accountId } : {}),
+        ...(proxyUrl ? { proxyUrl } : {}),
+      })
+      sendJson(res, 200, { ok: true, login, status: pool.getStatus() })
+    } catch (err) {
+      const status =
+        err instanceof AccountLoginError || err instanceof AccountStoreError ? err.status : 502
+      sendJson(res, status, {
+        error:
+          err instanceof AccountLoginError || err instanceof AccountStoreError
+            ? err.message
+            : '无法启动账号登录流程，请检查 agy CLI 是否已安装',
+        status: pool.getStatus(),
+      })
+    }
+  })
+
+  addRoute('POST', '/plugins/agy-acp/accounts/login/submit', async (req, res) => {
+    if (!requireJsonContentType(req, res)) return
+    let body: Record<string, unknown>
+    try {
+      body = await readJsonBody(req)
+    } catch (err) {
+      const status = err instanceof HttpInputError ? err.status : 400
+      sendJson(res, status, { error: err instanceof Error ? err.message : '无效的 JSON 请求' })
+      return
+    }
+    if (!opts?.submitAccountLoginCode) {
+      sendJson(res, 501, { error: '当前运行环境不支持提交登录授权码' })
+      return
+    }
+    if (typeof body.loginId !== 'string' || !body.loginId.trim()) {
+      sendJson(res, 400, { error: '缺少登录会话标识，请重新发起登录' })
+      return
+    }
+    if (typeof body.code !== 'string') {
+      sendJson(res, 400, { error: '请粘贴 Google 授权码或回调网址' })
+      return
+    }
+    try {
+      const login = await opts.submitAccountLoginCode(body.loginId.trim(), body.code)
+      sendJson(res, 200, { ok: true, login, status: pool.getStatus() })
+    } catch (err) {
+      const status = err instanceof AccountLoginError ? err.status : 502
+      sendJson(res, status, {
+        error: err instanceof AccountLoginError ? err.message : '登录验证失败，请重试',
+        status: pool.getStatus(),
+      })
+    }
+  })
+
+  addRoute('POST', '/plugins/agy-acp/accounts/login/cancel', async (req, res) => {
+    if (!requireJsonContentType(req, res)) return
+    let body: Record<string, unknown>
+    try {
+      body = await readJsonBody(req)
+    } catch (err) {
+      const status = err instanceof HttpInputError ? err.status : 400
+      sendJson(res, status, { error: err instanceof Error ? err.message : '无效的 JSON 请求' })
+      return
+    }
+    const loginId = typeof body.loginId === 'string' && body.loginId.trim() ? body.loginId.trim() : undefined
+    opts?.cancelAccountLogin?.(loginId)
+    sendJson(res, 200, { ok: true, status: pool.getStatus() })
   })
 
   return () => {

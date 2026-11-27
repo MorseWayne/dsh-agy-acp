@@ -57,6 +57,31 @@ test('direct probe reads only an unambiguous, unexpired private CLI sign-in; no 
   assert.deepEqual(calls.sort(), ['https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary', 'https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary'])
 })
 
+test('direct quota accepts a private CLI token alone and rejects competing ACP and CLI tokens without egress', { skip: !unix }, async t => {
+  const f = fixture(t)
+  const cliDir = path.join(f.home, '.gemini', 'antigravity-cli')
+  mkdirSync(cliDir, { mode: 0o700 })
+  const cliFile = path.join(cliDir, 'antigravity-oauth-token')
+  writeFileSync(cliFile, JSON.stringify({ token: { access_token: 'test.cli_bearer', expiry: fresh() } }), { mode: 0o600 })
+  const info = lstatSync(cliFile)
+  assert.ok(info.isFile() && !info.isSymbolicLink())
+  assert.equal(info.uid, process.getuid!())
+  assert.equal(info.mode & 0o777, 0o600)
+  assert.equal(existsSync(f.file), false)
+
+  const fetcher = t.mock.fn<typeof fetchViaEnvProxy>(async () => ({ statusCode: 200, body: JSON.stringify(summary) }))
+  const probe = () => readDirectAccountQuota(f.env, signal, { accountHome: f.home, fetcher })
+  assert.deepEqual(await probe(), [{ name: 'Claude & GPT (shared)', sevenDay: { remainingFraction: 0.71 } }])
+  assert.deepEqual(fetcher.mock.calls.map(call => call.arguments[0].headers?.Authorization), [
+    'Bearer test.cli_bearer', 'Bearer test.cli_bearer',
+  ])
+
+  f.put(fresh())
+  fetcher.mock.resetCalls()
+  assert.equal(await probe(), null)
+  assert.equal(fetcher.mock.callCount(), 0)
+})
+
 test('redirect, rejection and conflicting daily/prod readings stop before trying model fallbacks', { skip: !unix }, async t => {
   const f = fixture(t); f.put(fresh())
   for (const statusCode of [302, 401, 403, 200]) {
