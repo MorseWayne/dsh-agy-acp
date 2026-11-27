@@ -6,10 +6,11 @@ import {
   type LlmProviderInfo,
   type LlmResolvedModelInfo,
   type StreamChunk,
+  type TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 import { ReasoningEffortId, type ToolCallId } from '@deepseek-ai/dsh-llm/brand'
-import { AcpProcessExitError, AcpRpcError, AcpTimeoutError } from '../acp/client.ts'
-import type { AcpToolCallUpdate } from '../acp/protocol.ts'
+import { AcpProcessExitError, AcpRpcError, AcpTimeoutError, type AcpClient } from '../acp/client.ts'
+import type { AcpToolCallUpdate, PromptContentBlock } from '../acp/protocol.ts'
 import {
   createTurnOutcomeWatcher,
   evaluateInlineWarningFallback,
@@ -36,9 +37,11 @@ import { isQuotaOrRateLimitError, isTosViolationError } from '../runtime/account
 import { policyKey, SessionPolicyChangedError } from '../runtime/permission-manager.ts'
 import { EgressBlockedError } from '../runtime/egress-guard.ts'
 import type { AcpSessionPool, ManagedAcpSession } from '../runtime/session-pool.ts'
+import { continuationSource, detectContinuation, type ContinuationMessage } from './continuation.ts'
 import { createPreEditLocator, compactDisplayInput } from './mirror-tool.ts'
 import {
   buildAuxiliaryPromptBlocks,
+  buildMidTurnPromptBlock,
   buildPromptBlocksWithAttachments,
   type ReadPromptImage,
   type ReadPromptFile,
@@ -49,7 +52,6 @@ import {
 } from './prompt-builder.ts'
 import {
   AcpRunRecording,
-  decodeMirrorCallId,
   encodeMirrorCallId,
   normalizeLocations,
   type AcpRunStore,
@@ -94,6 +96,8 @@ export function resolveAutoReviewRedirectOptions(
 }
 
 export class AcpAdapter extends LlmAdapter {
+  private readonly recordingSessions = new WeakMap<AcpRunRecording, PromptSession>()
+
   constructor(private readonly deps: AcpAdapterDeps) {
     super()
   }
@@ -182,41 +186,39 @@ export class AcpAdapter extends LlmAdapter {
       availableToolNames,
     }
 
-    // 1. Continuation span: DSH just executed `agy_acp_tool` or a delegated native DSH tool and is resuming the same ACP turn.
+    // Only a result for the host step this recording actually emitted can resume it.
     const continuationMessages = options.messages as readonly ContinuationMessage[]
-    const continuation = detectContinuation(continuationMessages)
+    const rec = this.deps.runs.getContinuationForOwner(sessionKey)
+    const continuation = detectContinuation(continuationMessages, rec, rec ? this.deps.runs.hasHostTurn(rec) : false)
     let messages = options.messages as readonly PromptMessage[]
     let recoveryPolicy: string | undefined
-    if (continuation) {
-      const rec = this.deps.runs.get(continuation.runId)
-      if (rec && rec.owner === sessionKey) {
-        const callId = encodeMirrorCallId(rec.id, continuation.itemIndex)
-        const callIndex = options.messages.findLastIndex(m => m.role === 'assistant' &&
-          m.content.some(b => b.type === 'tool-call' && b.id === callId))
-        if (callIndex >= 0 && !options.signal?.aborted && !cfg.mcpBridge && this.deps.runs.isLatestForOwner(rec)) {
-          recoveryPolicy = rec.claimApprovalRecovery(continuation.itemIndex)
-        }
-        if (recoveryPolicy && policyKey(this.deps.pool.policy(sessionKey)) === recoveryPolicy) {
-          // Keep the original user input (including images). The interrupted tool never produced a result.
-          rec.releaseRecording()
-          messages = messages.slice(0, callIndex)
-          this.deps.log?.(`recreating ACP session "${sessionKey}" after interrupted approval (retry 1/1)`)
-        } else {
-          // Feed any delegated reverse-MCP tool results back to the waiting ACP bridge before resuming the stream.
-          for (const entry of collectContinuationToolResults(continuationMessages, rec.id)) {
-            rec.resolveMcpCall(entry.itemIndex, entry.result)
-          }
-          const resumeIndex = Math.max(continuation.itemIndex + 1, rec.cursor)
-          const onContAbort = () => rec.requestCancel()
-          options.signal?.addEventListener('abort', onContAbort, { once: true })
-          try {
-            yield* this.driveRecording(rec, resumeIndex, driveMode, options.signal)
-          } finally {
-            options.signal?.removeEventListener('abort', onContAbort)
-          }
-          return
-        }
+    if (rec && continuation) {
+      const lastItemIndex = Math.max(...continuation.toolResults.map(entry => entry.itemIndex))
+      const callId = encodeMirrorCallId(rec.id, lastItemIndex)
+      const callIndex = options.messages.findLastIndex(m => m.role === 'assistant' &&
+        m.content.some(b => b.type === 'tool-call' && b.id === callId))
+      if (callIndex >= 0 && !continuation.midTurnMessages.length && !options.signal?.aborted && !cfg.mcpBridge) {
+        recoveryPolicy = rec.claimApprovalRecovery(lastItemIndex)
       }
+      if (recoveryPolicy && policyKey(this.deps.pool.policy(sessionKey)) === recoveryPolicy) {
+        // Keep the original user input (including images). The interrupted tool never produced a result.
+        rec.releaseRecording()
+        messages = messages.slice(0, callIndex)
+        this.deps.log?.(`recreating ACP session "${sessionKey}" after interrupted approval (retry 1/1)`)
+      } else {
+        const onContAbort = () => rec.requestCancel()
+        options.signal?.addEventListener('abort', onContAbort, { once: true })
+        try {
+          if (options.signal?.aborted) onContAbort()
+          else this.deliverToolResults(rec, continuation)
+          yield* this.driveRecording(rec, rec.cursor, driveMode, options.signal)
+        } finally {
+          options.signal?.removeEventListener('abort', onContAbort)
+        }
+        return
+      }
+    } else if (rec) {
+      this.logContinuation(rec, continuationSource(continuationMessages.at(-1)), 'fresh', 'none')
     }
 
     // 2. Fresh turn over persistent ACP session (with automatic 429/geo failover + 1x pre-output crash recovery).
@@ -340,13 +342,69 @@ export class AcpAdapter extends LlmAdapter {
       }
 
       if (session.currentMode !== targetMode) throw new Error(`Antigravity did not accept permission mode ${targetMode}`)
-      const turn = this.deps.pool.beginPrompt(session, options.signal)
+      const launch = { client, session, policy, targetModel, targetMode }
+      const { rec, turn } = this.startRecording(launch, promptBlocks, driveMode, options.signal, pendingSystemHash,
+        !crashRetried && !cfg.mcpBridge)
+
+      // Peek first item before yielding so quota/429/geo failover and pre-output crash recovery stay seamless.
+      // Never fail over on TOS_VIOLATION to avoid cascading bans across backup accounts.
+      const firstItem = await rec.waitFor(0, options.signal)
+      if (firstItem?.kind === 'error' && !(firstItem.error instanceof AcpProcessExitError) && !turn.permissions.requests && !options.signal?.aborted) {
+        const isTosErr =
+          isTosViolationError(firstItem.error) ||
+          (firstItem.error instanceof LlmError && firstItem.error.code === 'ACP_TOS_VIOLATION')
+        const isGeoErr =
+          isGeoUnsupportedError(firstItem.error) ||
+          (firstItem.error instanceof LlmError && firstItem.error.code === 'ACP_GEO_UNSUPPORTED')
+        if (!isTosErr && (isQuotaOrRateLimitError(firstItem.error) || isGeoErr)) {
+          triedAccounts.add(session.accountId)
+          if (triedAccounts.size < maxAccounts) {
+            this.deps.log?.(
+              `account "${session.accountId}" hit ${isGeoErr ? 'geo-restriction' : 'quota/rate-limit'} on "${targetModel}", failing over (${triedAccounts.size}/${maxAccounts} tried)`,
+            )
+            rec.releaseRecording()
+            await this.deps.pool.closeSession(sessionKey)
+            continue
+          }
+        }
+      }
+
+      const resumeAt = yield* this.driveRecording(rec, 0, driveMode, options.signal, nextBlockIndex, () =>
+        !crashRetried && !options.signal?.aborted && !turn.permissions.requests &&
+        !session.hasMcpServers && targetMode !== 'auto' && this.deps.runs.isLatestForOwner(rec) &&
+        rec.items.every(item => item.kind === 'error' || (item.kind === 'update' &&
+          ['agent_thought_chunk', 'usage_update', 'session_info_update', 'available_commands_update',
+            'config_option_update'].includes(item.update.sessionUpdate))))
+      if (resumeAt !== undefined && !options.signal?.aborted) {
+        crashRetried = true
+        recoveryPolicy = policyKey(policy)
+        nextBlockIndex = resumeAt
+        this.deps.log?.(`ACP exited before an answer or tool call for "${sessionKey}"; recreating session (retry 1/1)`)
+        continue
+      }
+      return
+    }
+  }
+
+  private startRecording(
+    launch: PromptSession,
+    promptBlocks: PromptContentBlock[],
+    mode: DriveRecordingMode,
+    signal?: AbortSignal,
+    pendingSystemHash?: string | null,
+    canRecoverApproval = false,
+  ) {
+      const { client, session, policy, targetModel, targetMode } = launch
+      const sessionKey = session.dshSessionKey
+      const cfg = this.deps.getConfig()
+      const turn = this.deps.pool.beginPrompt(session, signal)
       const outcomeWatcher = createTurnOutcomeWatcher(
         session.acpSessionId,
         this.deps.pool.accountEnvFor(session),
       )
-      const rec = this.deps.runs.create(sessionKey, createPreEditLocator(cwd))
-      rec.delegatesMcp = canDelegateMcpTools && Boolean(session.hasMcpServers)
+      const rec = this.deps.runs.create(sessionKey, createPreEditLocator(policy.workspaceRoot))
+      this.recordingSessions.set(rec, launch)
+      rec.delegatesMcp = mode.canDelegateMcpTools && Boolean(session.hasMcpServers)
       // agy emits usage_update at the end of a prompt, so seed with the last known occupancy for mirror boundaries.
       if (typeof session.contextUsed === 'number') rec.contextUsed = session.contextUsed
       // Exact per-call usage (cache hits included) comes from agy's transcript; ACP only reports a run total.
@@ -370,7 +428,7 @@ export class AcpAdapter extends LlmAdapter {
       const onAbort = (): void => {
         rec.requestCancel()
       }
-      options.signal?.addEventListener('abort', onAbort, { once: true })
+      signal?.addEventListener('abort', onAbort, { once: true })
 
       let cleanedUp = false
       const cleanupTurn = (): void => {
@@ -379,14 +437,14 @@ export class AcpAdapter extends LlmAdapter {
         turn.finish()
         unsubscribe()
         rec.setCancelHandler(null)
-        options.signal?.removeEventListener('abort', onAbort)
+        signal?.removeEventListener('abort', onAbort)
       }
 
       // Run `session/prompt` in background so the recording can span multiple DSH tool-mirror loops.
       void client
         .sessionPrompt({ sessionId: session.acpSessionId, prompt: promptBlocks }, cfg.requestTimeoutMs)
         .then((res) => {
-          const hiddenFailure = options.signal?.aborted
+          const hiddenFailure = signal?.aborted || rec.isCancelled
             ? undefined
             : (outcomeWatcher.check(res) ??
               evaluateInlineWarningFallback(res.stopReason, rec.inlineMessageText, rec.hasThoughtOrTool, res.usage))
@@ -439,7 +497,7 @@ export class AcpAdapter extends LlmAdapter {
             return
           }
           if (pendingSystemHash) this.deps.pool.recordAppliedSystemHash(session, pendingSystemHash)
-          if (!options.signal?.aborted) this.deps.pool.reportAccountSuccess(session.accountId, targetModel)
+          if (!signal?.aborted && !rec.isCancelled) this.deps.pool.reportAccountSuccess(session.accountId, targetModel)
           this.deps.pool.recordTurnUsage(res.usage)
           // Release active turn slot synchronously BEFORE waking consumers to prevent next-turn race.
           cleanupTurn()
@@ -457,7 +515,7 @@ export class AcpAdapter extends LlmAdapter {
           if (err instanceof AcpProcessExitError) {
             const { interruptedBeforeGrant, granted } = turn.permissions
             if (interruptedBeforeGrant) {
-              if (canMirrorNativeTools && !crashRetried && !session.hasMcpServers && !cfg.mcpBridge && targetMode !== 'auto' && policy.approval === 'ask') {
+              if (mode.canMirrorNativeTools && canRecoverApproval && !session.hasMcpServers && targetMode !== 'auto' && policy.approval === 'ask') {
                 rec.allowApprovalRecovery(interruptedBeforeGrant, policyKey(policy))
               }
               error = new Error(`工具审批因 ACP 退出而中断，该请求尚未获准执行。 ${err.message}`, { cause: err })
@@ -513,43 +571,29 @@ export class AcpAdapter extends LlmAdapter {
           cleanupTurn()
         })
 
-      // Peek first item before yielding so quota/429/geo failover and pre-output crash recovery stay seamless.
-      // Never fail over on TOS_VIOLATION to avoid cascading bans across backup accounts.
-      const firstItem = await rec.waitFor(0, options.signal)
-      if (firstItem?.kind === 'error' && !(firstItem.error instanceof AcpProcessExitError) && !turn.permissions.requests && !options.signal?.aborted) {
-        const isTosErr =
-          isTosViolationError(firstItem.error) ||
-          (firstItem.error instanceof LlmError && firstItem.error.code === 'ACP_TOS_VIOLATION')
-        const isGeoErr =
-          isGeoUnsupportedError(firstItem.error) ||
-          (firstItem.error instanceof LlmError && firstItem.error.code === 'ACP_GEO_UNSUPPORTED')
-        if (!isTosErr && (isQuotaOrRateLimitError(firstItem.error) || isGeoErr)) {
-          triedAccounts.add(session.accountId)
-          if (triedAccounts.size < maxAccounts) {
-            this.deps.log?.(
-              `account "${session.accountId}" hit ${isGeoErr ? 'geo-restriction' : 'quota/rate-limit'} on "${targetModel}", failing over (${triedAccounts.size}/${maxAccounts} tried)`,
-            )
-            rec.releaseRecording()
-            await this.deps.pool.closeSession(sessionKey)
-            continue
-          }
-        }
-      }
+      return { rec, turn }
+  }
 
-      const resumeAt = yield* this.driveRecording(rec, 0, driveMode, options.signal, nextBlockIndex, () =>
-        !crashRetried && !options.signal?.aborted && !turn.permissions.requests &&
-        !session.hasMcpServers && targetMode !== 'auto' && this.deps.runs.isLatestForOwner(rec) &&
-        rec.items.every(item => item.kind === 'error' || (item.kind === 'update' &&
-          ['agent_thought_chunk', 'usage_update', 'session_info_update', 'available_commands_update',
-            'config_option_update'].includes(item.update.sessionUpdate))))
-      if (resumeAt !== undefined && !options.signal?.aborted) {
-        crashRetried = true
-        recoveryPolicy = policyKey(policy)
-        nextBlockIndex = resumeAt
-        this.deps.log?.(`ACP exited before an answer or tool call for "${sessionKey}"; recreating session (retry 1/1)`)
-        continue
-      }
-      return
+  private logContinuation(rec: AcpRunRecording, source: string, route: 'continue' | 'fresh', delivery: string): void {
+    this.deps.log?.(`ACP continuation sessionKey=${JSON.stringify(rec.owner)} runId=${rec.id} source.kind=${source} route=${route} delivery=${delivery}`)
+  }
+
+  private deliverToolResults(rec: AcpRunRecording, continuation: NonNullable<ReturnType<typeof detectContinuation>>): void {
+    rec.acknowledgeToolResults()
+    rec.collectMidTurnMessages(continuation.midTurnMessages)
+    for (const { itemIndex, result } of continuation.toolResults) {
+      if (rec.canResolveMcpCall(itemIndex)) this.resolveMcpReceipt(rec, itemIndex, result)
+    }
+    const queued = rec.undeliveredMidTurnMessages().at(-1)
+    if (queued) this.logContinuation(rec, queued.source, 'continue', 'queued')
+  }
+
+  private resolveMcpReceipt(rec: AcpRunRecording, itemIndex: number, result: DelegatedMcpResult): void {
+    const pending = rec.undeliveredMidTurnMessages()
+    const receipt = pending.length ? { ...result, content: [...result.content, buildMidTurnPromptBlock(pending)] } : result
+    if (rec.resolveMcpCall(itemIndex, receipt) && pending.length) {
+      rec.markMidTurnMessagesDelivered()
+      this.logContinuation(rec, pending.at(-1)!.source, 'continue', 'mcp-result')
     }
   }
 
@@ -653,6 +697,7 @@ export class AcpAdapter extends LlmAdapter {
 
     const emitToolChunks = (tc: MergedToolCall, stepIdx: number): StreamChunk[] => {
       rec.markToolEmitted(tc.toolCallId)
+      rec.expectToolResult(stepIdx)
       const toolName = isCodeMode ? WRAPPER_TOOL_NAME : MIRROR_TOOL_NAME
       const callId = encodeMirrorCallId(rec.id, stepIdx) as ToolCallId
       const locations = normalizeLocations(tc.locations)
@@ -702,6 +747,7 @@ export class AcpAdapter extends LlmAdapter {
 
     const emitMcpToolChunks = (call: PendingMcpCall): StreamChunk[] => {
       call.emitted = true
+      rec.expectToolResult(call.itemIndex)
       const callId = encodeMirrorCallId(rec.id, call.itemIndex) as ToolCallId
       const toolName = isCodeMode ? WRAPPER_TOOL_NAME : call.name
       const argsJson = isCodeMode
@@ -753,7 +799,7 @@ export class AcpAdapter extends LlmAdapter {
     }
 
     while (true) {
-      if (signal?.aborted) {
+      if (signal?.aborted || rec.isCancelled || rec.isReleased) {
         rec.releaseRecording()
         const closed = closeOpenBlock()
         if (closed) yield closed
@@ -786,7 +832,7 @@ export class AcpAdapter extends LlmAdapter {
       }
 
       const item = await rec.waitFor(idx, signal)
-      if (signal?.aborted) {
+      if (signal?.aborted || rec.isCancelled || rec.isReleased) {
         rec.releaseRecording()
         const closed = closeOpenBlock()
         if (closed) yield closed
@@ -849,6 +895,7 @@ export class AcpAdapter extends LlmAdapter {
         if (closed) yield closed
         const priorUsageCount = rec.consumedSpanUsageCount
         const spanUsage = await takeSpanUsage(rec, FINAL_USAGE_RETRIES, signal)
+        let usage: TokenUsage | undefined
         if (spanUsage) {
           // agy's transcript.jsonl PLANNER_RESPONSE currently omits thinking_tokens.
           // When this run had a single model call, enrich with the run-level thoughtTokens safely.
@@ -862,14 +909,53 @@ export class AcpAdapter extends LlmAdapter {
             thought <= spanUsage.outputTokens
               ? { ...spanUsage, reasoningTokens: thought }
               : spanUsage
-          yield { type: 'usage', usage: callUsageToTokenUsage(enriched) }
+          usage = callUsageToTokenUsage(enriched)
         } else if (!rec.hasUsageSource) {
-          const usage = mapContextUsage(item.usage, rec.contextUsed)
-          if (usage) yield { type: 'usage', usage }
+          usage = mapContextUsage(item.usage, rec.contextUsed)
         }
         rec.cursor = Math.max(rec.cursor, idx + 1)
+        const pending = rec.undeliveredMidTurnMessages()
+        const launch = this.recordingSessions.get(rec)
+        const aborted = signal?.aborted || rec.isCancelled || rec.isReleased || item.stopReason === 'cancelled'
+        if (!aborted && pending.length && launch) {
+          // The producer drops pool.active before publishing done. Begin on the very same
+          // persistent session; never recreate it or replay the preceding prompt or tools.
+          try {
+            const { session } = launch
+            await this.deps.pool.assertEgressAllowed(session.accountId, this.deps.pool.accountEnvFor(session), signal)
+            if (rec.isCancelled || rec.isReleased || policyKey(this.deps.pool.policy(session.dshSessionKey)) !== policyKey(launch.policy)) {
+              throw new SessionPolicyChangedError()
+            }
+            const { rec: next } = this.startRecording(launch, [buildMidTurnPromptBlock(pending)], mode, signal)
+            next.inheritMidTurnMessageKeys(rec)
+            this.logContinuation(rec, pending.at(-1)!.source, 'continue', 'session/prompt')
+            rec.releaseRecording()
+            for await (const chunk of this.driveRecording(next, 0, mode, signal, blockIdx)) {
+              if (chunk.type === 'usage') {
+                usage = mergeStepUsage(usage, chunk.usage)
+              } else if (chunk.type === 'finish') {
+                if (usage) yield { type: 'usage', usage }
+                yield chunk
+              } else {
+                yield chunk
+              }
+            }
+          } catch (error) {
+            rec.releaseRecording()
+            if (usage) yield { type: 'usage', usage }
+            if (signal?.aborted || error instanceof SessionPolicyChangedError) {
+              yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'ACP follow-up aborted' } } }
+            } else {
+              yield { type: 'finish', reason: { kind: 'error', failure: { code: 'ACP_ERROR', message: error instanceof Error ? error.message : String(error) } } }
+            }
+          }
+          return
+        }
         rec.releaseRecording()
-        yield { type: 'finish', reason: { kind: 'stop' } }
+        if (usage) yield { type: 'usage', usage }
+        yield { type: 'finish', reason: aborted
+          ? { kind: 'aborted', failure: { code: 'ABORTED', message: 'ACP prompt cancelled' } }
+          : { kind: 'stop' } }
         return
       }
 
@@ -887,7 +973,7 @@ export class AcpAdapter extends LlmAdapter {
           continue
         }
         if (!isCodeMode && availableToolNames && !availableToolNames.has(call.name)) {
-          rec.resolveMcpCall(call.itemIndex, {
+          this.resolveMcpReceipt(rec, call.itemIndex, {
             content: [{ type: 'text', text: `Error: Tool "${call.name}" is not available in this DSH step` }],
             isError: true,
           })
@@ -923,7 +1009,7 @@ export class AcpAdapter extends LlmAdapter {
                 continue
               }
               if (availableToolNames && !availableToolNames.has(nextCall.name)) {
-                rec.resolveMcpCall(nextCall.itemIndex, {
+                this.resolveMcpReceipt(rec, nextCall.itemIndex, {
                   content: [{ type: 'text', text: `Error: Tool "${nextCall.name}" is not available in this DSH step` }],
                   isError: true,
                 })
@@ -1107,6 +1193,20 @@ async function takeSpanUsage(rec: AcpRunRecording, retries: number, signal?: Abo
   return rec.consumeSpanUsage()
 }
 
+function mergeStepUsage(previous: TokenUsage | undefined, latest: TokenUsage): TokenUsage {
+  if (!previous) return latest
+  // The host keeps one usage sample per step. Keep the most recent prompt-side
+  // occupancy/cache buckets and all generation, as for multiple calls in one prompt.
+  const additionalOutput = previous.outputTokens
+  const reasoning = (previous.reasoningTokens ?? 0) + (latest.reasoningTokens ?? 0)
+  return {
+    ...latest,
+    outputTokens: additionalOutput + latest.outputTokens,
+    ...(latest.totalTokens !== undefined ? { totalTokens: latest.totalTokens + additionalOutput } : {}),
+    ...(previous.reasoningTokens !== undefined || latest.reasoningTokens !== undefined ? { reasoningTokens: reasoning } : {}),
+  }
+}
+
 function isToolReadyToEmit(rec: AcpRunRecording, idx: number, tc: MergedToolCall): boolean {
   if (tc.status === 'completed' || tc.status === 'failed' || tc.status === 'pending') return true
   const hasMetadata =
@@ -1128,163 +1228,10 @@ interface DriveRecordingMode {
   readonly availableToolNames: ReadonlySet<string> | null
 }
 
-// Read the shared fields structurally: older DSH puts results in user blocks,
-// while newer DSH uses a separate tool message with a top-level call ID.
-interface ContinuationBlock {
-  readonly type: string
-  readonly toolCallId?: unknown
-  readonly text?: string
-  readonly content?: unknown
-  readonly isError?: unknown
-}
-
-interface ContinuationMessage {
-  readonly role: string
-  readonly source?: { readonly kind?: string }
-  readonly toolCallId?: unknown
-  readonly isError?: unknown
-  readonly content: readonly ContinuationBlock[]
-}
-
-/** User message sources that start a fresh turn rather than injecting step-boundary context. */
-const FRESH_TURN_USER_SOURCES = new Set([
-  'user',
-  'scheduled',
-  'schedule',
-  'goal',
-  'goal-continuation',
-  'agent-message',
-  'compact-checkpoint',
-])
-
-function isStepContextUserMessage(message: ContinuationMessage): boolean {
-  const kind = message.source?.kind
-  return typeof kind === 'string' && kind.length > 0 && !FRESH_TURN_USER_SOURCES.has(kind)
-}
-
-function formatContinuationResultBlocks(raw: unknown): string {
-  if (typeof raw === 'string') return raw
-  if (!Array.isArray(raw)) return ''
-  return raw
-    .map((b) => {
-      if (b && typeof b === 'object' && (b as { type?: unknown }).type === 'text' && typeof (b as { text?: unknown }).text === 'string') {
-        return (b as { text: string }).text
-      }
-      return JSON.stringify(b)
-    })
-    .join('\n')
-}
-
-export function detectContinuation(
-  messages: readonly ContinuationMessage[],
-): { runId: string; itemIndex: number } | null {
-  let targetRunId: string | null = null
-  let maxItemIndex = -1
-
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i]!
-    if (message.role === 'developer') {
-      if (targetRunId === null) continue
-      break
-    }
-    if (message.role === 'tool') {
-      const parsed = typeof message.toolCallId === 'string' ? decodeMirrorCallId(message.toolCallId) : null
-      if (!parsed) break
-      if (targetRunId === null) {
-        targetRunId = parsed.runId
-        maxItemIndex = parsed.itemIndex
-      } else if (parsed.runId === targetRunId) {
-        if (parsed.itemIndex > maxItemIndex) maxItemIndex = parsed.itemIndex
-      } else {
-        break
-      }
-      continue
-    }
-
-    if (message.role !== 'user') break
-
-    // DSH may append step-boundary snapshots or deferred tool contexts while preparing the next step of this turn.
-    if (isStepContextUserMessage(message)) {
-      if (targetRunId === null) continue
-      break
-    }
-
-    let matchedInUser = false
-    for (let j = message.content.length - 1; j >= 0; j--) {
-      const block = message.content[j]
-      if (block?.type === 'tool-result' && typeof block.toolCallId === 'string') {
-        const parsed = decodeMirrorCallId(block.toolCallId)
-        if (!parsed) continue
-        if (targetRunId === null) {
-          targetRunId = parsed.runId
-          maxItemIndex = parsed.itemIndex
-          matchedInUser = true
-        } else if (parsed.runId === targetRunId) {
-          if (parsed.itemIndex > maxItemIndex) maxItemIndex = parsed.itemIndex
-          matchedInUser = true
-        }
-      }
-    }
-    if (!matchedInUser) break
-  }
-
-  return targetRunId !== null ? { runId: targetRunId, itemIndex: maxItemIndex } : null
-}
-
-/** Extracts trailing DSH tool-result payloads belonging to `runId` for delegated reverse-MCP calls. */
-export function collectContinuationToolResults(
-  messages: readonly ContinuationMessage[],
-  runId: string,
-): Array<{ itemIndex: number; result: DelegatedMcpResult }> {
-  const collected: Array<{ itemIndex: number; result: DelegatedMcpResult }> = []
-  let foundAny = false
-
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i]!
-    if (message.role === 'developer') {
-      if (!foundAny) continue
-      break
-    }
-    if (message.role === 'tool') {
-      const parsed = typeof message.toolCallId === 'string' ? decodeMirrorCallId(message.toolCallId) : null
-      if (!parsed || parsed.runId !== runId) break
-      foundAny = true
-      collected.push({
-        itemIndex: parsed.itemIndex,
-        result: {
-          content: [{ type: 'text', text: formatContinuationResultBlocks(message.content) }],
-          isError: Boolean(message.isError),
-        },
-      })
-      continue
-    }
-
-    if (message.role !== 'user') break
-
-    if (isStepContextUserMessage(message)) {
-      if (!foundAny) continue
-      break
-    }
-
-    let matchedInUser = false
-    for (let j = message.content.length - 1; j >= 0; j--) {
-      const block = message.content[j]
-      if (block?.type === 'tool-result' && typeof block.toolCallId === 'string') {
-        const parsed = decodeMirrorCallId(block.toolCallId)
-        if (!parsed || parsed.runId !== runId) continue
-        foundAny = true
-        matchedInUser = true
-        collected.push({
-          itemIndex: parsed.itemIndex,
-          result: {
-            content: [{ type: 'text', text: formatContinuationResultBlocks(block.content) }],
-            isError: Boolean(block.isError),
-          },
-        })
-      }
-    }
-    if (!matchedInUser) break
-  }
-
-  return collected.reverse()
+interface PromptSession {
+  readonly client: AcpClient
+  readonly session: ManagedAcpSession
+  readonly policy: ReturnType<AcpSessionPool['policy']>
+  readonly targetModel: string
+  readonly targetMode: string
 }

@@ -35,6 +35,12 @@ export interface DelegatedMcpResult {
   isError?: boolean
 }
 
+export interface MidTurnMessage {
+  readonly key: string
+  readonly source: string
+  readonly text: string
+}
+
 export interface PendingMcpCall {
   readonly itemIndex: number
   readonly name: string
@@ -103,6 +109,9 @@ export class AcpRunRecording {
   private readonly mcpCalls = new Map<number, PendingMcpCall>()
   private readonly suppressedMcpToolCallIds = new Set<string>()
   private readonly deferredNativeToolIds = new Set<string>()
+  private readonly pendingToolResults = new Set<number>()
+  private readonly seenMidTurnMessages = new Set<string>()
+  private readonly pendingMidTurnMessages = new Map<string, MidTurnMessage>()
   private waiters: Array<() => void> = []
   private recovery?: { toolId: string; policy: string }
   private cancelled = false
@@ -123,6 +132,9 @@ export class AcpRunRecording {
   /** Explicitly release only after the adapter consumes (or abandons) the final span. */
   releaseRecording(): void {
     this.released = true
+    this.pendingToolResults.clear()
+    this.seenMidTurnMessages.clear()
+    this.pendingMidTurnMessages.clear()
     this.failAllPendingMcpCalls(new Error('ACP recording released before delegated MCP call resolved'))
   }
 
@@ -141,9 +153,49 @@ export class AcpRunRecording {
   }
 
   requestCancel(reason?: Error): void {
+    if (this.cancelled) return
     this.cancelled = true
     this.failAllPendingMcpCalls(reason ?? new Error('ACP turn cancelled before delegated MCP call resolved'))
     this.cancelHandler?.()
+    this.wakeAll()
+  }
+
+  expectToolResult(itemIndex: number): void {
+    this.pendingToolResults.add(itemIndex)
+  }
+
+  expectsToolResult(itemIndex: number): boolean {
+    return this.pendingToolResults.has(itemIndex)
+  }
+
+  acknowledgeToolResults(): void {
+    this.pendingToolResults.clear()
+  }
+
+  canResolveMcpCall(itemIndex: number): boolean {
+    const call = this.mcpCalls.get(itemIndex)
+    return Boolean(call?.emitted && !call.settled)
+  }
+
+  collectMidTurnMessages(messages: readonly MidTurnMessage[]): void {
+    for (const message of messages) {
+      if (this.seenMidTurnMessages.has(message.key)) continue
+      this.seenMidTurnMessages.add(message.key)
+      this.pendingMidTurnMessages.set(message.key, message)
+    }
+  }
+
+  inheritMidTurnMessageKeys(previous: AcpRunRecording): void {
+    // Only host IDs are stable across physical prompts; fallback step keys are run-local.
+    for (const key of previous.seenMidTurnMessages) if (key.startsWith('id:')) this.seenMidTurnMessages.add(key)
+  }
+
+  undeliveredMidTurnMessages(): MidTurnMessage[] {
+    return [...this.pendingMidTurnMessages.values()]
+  }
+
+  markMidTurnMessagesDelivered(): void {
+    this.pendingMidTurnMessages.clear()
   }
 
   allowApprovalRecovery(toolId: string, policy: string): void {
@@ -519,8 +571,7 @@ export class AcpRunRecording {
 
   async waitFor(index: number, signal?: AbortSignal): Promise<RunItem | null> {
     while (index >= this.items.length) {
-      if (this.settled) return null
-      if (signal?.aborted) return null
+      if (this.settled || this.cancelled || this.released || signal?.aborted) return null
       await this.waitOnce(signal)
     }
     return this.items[index] ?? null
@@ -625,12 +676,40 @@ export class AcpRunStore {
   private readonly runs = new Map<string, AcpRunRecording>()
   private readonly latestByOwner = new Map<string, AcpRunRecording>()
   private readonly superseded = new WeakSet<AcpRunRecording>()
+  private readonly hostTurns = new Map<string, number>()
+  private readonly recordingTurns = new WeakMap<AcpRunRecording, number>()
+
+  beginHostTurn(owner: string, turn: number): void {
+    if (this.hostTurns.get(owner) === turn) return
+    this.closeOwnerTurn(owner)
+    this.hostTurns.set(owner, turn)
+  }
+
+  endHostTurn(owner: string, turn: number): void {
+    const current = this.hostTurns.get(owner)
+    if (current !== undefined && current !== turn) return
+    this.closeOwnerTurn(owner)
+  }
+
+  closeOwnerTurn(owner: string): void {
+    const rec = this.latestByOwner.get(owner)
+    const belongsToTurn = rec && this.hostTurns.get(owner) === this.recordingTurns.get(rec)
+    this.hostTurns.delete(owner)
+    if (rec && belongsToTurn && !rec.isReleased) {
+      if (!rec.isSettled) rec.requestCancel(new Error('DSH turn ended'))
+      rec.releaseRecording()
+    }
+  }
 
   create(owner?: string, preEdit?: (tc: AcpToolCallUpdate) => NormalizedLocation[] | undefined): AcpRunRecording {
     const rec = new AcpRunRecording(undefined, owner, preEdit)
     for (const run of this.runs.values()) if (run.owner === owner) this.superseded.add(run)
     this.runs.set(rec.id, rec)
-    if (owner) this.latestByOwner.set(owner, rec)
+    if (owner) {
+      this.latestByOwner.set(owner, rec)
+      const turn = this.hostTurns.get(owner)
+      if (turn !== undefined) this.recordingTurns.set(rec, turn)
+    }
     // The cap applies to eligible history only: waking a waiter or finishing the
     // ACP producer does not mean DSH has consumed the remaining continuation.
     const history = [...this.runs.values()].filter(run => run.canEvict)
@@ -647,9 +726,21 @@ export class AcpRunStore {
   }
 
   getActiveForOwner(owner: string): AcpRunRecording | undefined {
+    const rec = this.getContinuationForOwner(owner)
+    return rec?.isSettled ? undefined : rec
+  }
+
+  /** A finished ACP producer may still have output to drain after a tool receipt in the same DSH turn. */
+  getContinuationForOwner(owner: string): AcpRunRecording | undefined {
     const rec = this.latestByOwner.get(owner)
-    if (!rec || rec.isSettled || rec.isReleased || rec.isCancelled) return undefined
+    if (!rec || rec.isReleased || rec.isCancelled || this.hostTurns.get(owner) !== this.recordingTurns.get(rec)) {
+      return undefined
+    }
     return rec
+  }
+
+  hasHostTurn(run: AcpRunRecording): boolean {
+    return this.recordingTurns.has(run) && run.owner !== undefined && this.getContinuationForOwner(run.owner) === run
   }
 
   cancelActiveForOwner(owner: string, reason?: Error): void {

@@ -350,12 +350,16 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   })
 
   const boundaryEvents = new Set(['sandbox/mode', 'approval/policy', 'permission/preset'])
-  ctx.on('session/event' as never, ((session: { id: string }, event: { type: string }) => {
+  ctx.on('session/event' as never, ((session: { id: string }, event: { type: string; data?: { turn?: number } }) => {
     if (event.type === 'working-directory/change') pool.invalidate(session.id, new SessionPolicyChangedError())
     else if (boundaryEvents.has(event.type)) pool.policyChanged(session.id)
-    else if (event.type === 'turn/end') runs.cancelActiveForOwner(session.id, new Error('DSH turn ended'))
+    else if (event.type === 'turn/start' && typeof event.data?.turn === 'number') runs.beginHostTurn(session.id, event.data.turn)
+    else if (event.type === 'turn/end' && typeof event.data?.turn === 'number') runs.endHostTurn(session.id, event.data.turn)
   }) as never, { global: true })
-  ctx.on('session/disposed' as never, ((session: { id: string }) => pool.evictSession(session.id)) as never, { global: true })
+  ctx.on('session/disposed' as never, ((session: { id: string }) => {
+    runs.closeOwnerTurn(session.id)
+    pool.evictSession(session.id)
+  }) as never, { global: true })
   multiAccountPool?.on('change', () => {
     pool.notifyStatusChange()
   })

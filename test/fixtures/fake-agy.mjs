@@ -289,7 +289,39 @@ async function handleRequest(id, method, params) {
       .map((b) => b.text)
       .join('\n')
 
-    if (promptText.includes('DELEGATE_MCP_SINGLE') || promptText.includes('DELEGATE_MCP_PARALLEL') || promptText.includes('DELEGATE_MCP_MIXED')) {
+    if (promptText.startsWith('DSH messages received during this turn')) {
+      const messages = JSON.parse(promptText.slice(promptText.indexOf('\n') + 1))
+      sendUpdate(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `FOLLOWUP[${sessionId}#${sess.turns};reads=${sess.midTurnReads ?? 0}]:${messages.map(({ source, text }) => `${source}=${text}`).join('|')}` },
+      })
+      if (messages.some(({ text }) => text === 'Follow-up must wait for cancellation')) {
+        await new Promise(resolve => {
+          activeTurns.set(sessionId, { cancel: () => {
+            activeTurns.delete(sessionId)
+            send({ jsonrpc: '2.0', id, result: { stopReason: 'cancelled' } })
+            resolve()
+          } })
+        })
+      } else {
+        send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn', usage: { inputTokens: 25, outputTokens: 7 } } })
+      }
+      return
+    }
+
+    if (promptText.includes('MIDTURN_NATIVE') && !promptText.includes('DELEGATE_MCP_')) {
+      sess.midTurnReads = (sess.midTurnReads ?? 0) + 1
+      sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'midturn-native-read', name: 'read_file', kind: 'read', status: 'completed' })
+      sendUpdate(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'NATIVE_COMPLETE|' } })
+      if (promptText.includes('MIDTURN_NATIVE_ERROR')) {
+        send({ jsonrpc: '2.0', id, error: { code: -32000, message: 'native prompt failed after tool' } })
+      } else {
+        send({ jsonrpc: '2.0', id, result: { stopReason: promptText.includes('MIDTURN_NATIVE_ABORT') ? 'cancelled' : 'end_turn', usage: { inputTokens: 10, outputTokens: 3 } } })
+      }
+      return
+    }
+
+    if (promptText.includes('DELEGATE_MCP_')) {
       const httpMcp = (sess.mcpServers ?? []).find((s) => s && s.type === 'http' && typeof s.url === 'string')
       if (!httpMcp) {
         send({ jsonrpc: '2.0', id, error: { code: -32000, message: 'No HTTP MCP server attached' } })
@@ -311,6 +343,23 @@ async function handleRequest(id, method, params) {
           }),
         })
         return await res.json()
+      }
+
+      if (promptText.includes('DELEGATE_MCP_WAIT_AGENT')) {
+        if (promptText.includes('MIDTURN_NATIVE')) {
+          sendUpdate(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'before-wait', name: 'update_steps', kind: 'other', status: 'completed' })
+        }
+        const wait = await callMcp(1, 'wait_agent', { timeout_ms: 1000 })
+        const output = (r) => r?.result?.content?.map((c) => c.text) ?? [r?.error?.message ?? 'missing']
+        let payload = output(wait)
+        if (promptText.includes('PARALLEL_AFTER_WAIT')) {
+          sendUpdate(sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'More tools' } })
+          const [a, b] = await Promise.all([callMcp(2, 'ops_glob', { pattern: ['a.ts'] }), callMcp(3, 'mnemon_recall', { query: 'prefs' })])
+          payload = [...payload, ...output(a), ...output(b)]
+        }
+        sendUpdate(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `WAIT[${sessionId}#${sess.turns}]:${JSON.stringify(payload)}` } })
+        send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } })
+        return
       }
 
       if (promptText.includes('DELEGATE_MCP_SINGLE')) {

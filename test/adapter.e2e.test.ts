@@ -238,6 +238,85 @@ for (const format of ['legacy', 'tool role', 'runtime-context', 'time-context'] 
   test(`AcpAdapter.stream() resumes the original ACP prompt after a ${format} mirror result`, () => assertMirrorContinuation(format))
 }
 
+for (const scenario of ['follow-up', 'error', 'abort', 'abort follow-up', 'next agent turn', 'next user turn'] as const) {
+  test(`native mirror receipt with a DSH inbox message: ${scenario}`, { timeout: 10_000 }, async t => {
+    const { adapter, pool, runs, mirrorTool } = createHarness()
+    t.after(() => pool.dispose())
+    const sessionId = 'mirror-midturn'
+    const tools = [{ name: MIRROR_TOOL_NAME, description: '', parameters: { type: 'object', properties: {} } }]
+    const marker = scenario === 'error' ? 'MIDTURN_NATIVE_ERROR' : scenario === 'abort' ? 'MIDTURN_NATIVE_ABORT' : 'MIDTURN_NATIVE'
+    const controller = new AbortController()
+    const history: unknown[] = [{ role: 'user', content: [{ type: 'text', text: marker }] }]
+    const stream = () => adapter.stream({ provider: PROVIDER_ID, model: 'gemini-4-neon', sessionId, tools, messages: history, signal: controller.signal } as unknown as GenerateOptions)
+    runs.beginHostTurn(sessionId, 1)
+    const first = await collectChunks(stream())
+    assert.equal(first.find(c => c.type === 'finish')?.reason.kind, 'tool-calls')
+    const call = first.find(c => c.type === 'block-end' && c.block.type === 'tool-call')
+    assert.ok(call?.type === 'block-end' && call.block.type === 'tool-call')
+    const args = JSON.parse(call.block.arguments)
+    assert.equal(args.tool, 'read_file')
+    const value = await mirrorTool.execute(args, { agent: { session: { id: sessionId } } } as ToolRunContext)
+    const rec = runs.get(args.run)!
+    // The mock sends terminal output immediately, so prove the producer really settled before this host step.
+    assert.equal((await rec.waitFor(2))?.kind, scenario === 'error' ? 'error' : 'done')
+    assert.equal(pool.activeSignal(sessionId), undefined)
+    assert.equal(rec.isSettled, true)
+    history.push({ role: 'assistant', content: [call.block] },
+      { role: 'tool', toolCallId: call.block.id, content: mirrorTool.output.render(args, value as never) })
+    const fresh = scenario === 'next agent turn' || scenario === 'next user turn'
+    if (fresh) {
+      runs.endHostTurn(sessionId, 1)
+      runs.beginHostTurn(sessionId, 2)
+    }
+    const kind = scenario === 'next user turn' ? 'user' : 'agent-message'
+    const relay = scenario === 'abort follow-up' ? 'Follow-up must wait for cancellation' : 'New information from the inbox'
+    history.push({ role: 'user', id: 'relay-1', source: { kind }, content: [{ type: 'text', text: relay }] })
+    const next: StreamChunk[] = []
+    let followUpRun: ReturnType<AcpRunStore['getActiveForOwner']>
+    for await (const chunk of stream()) {
+      next.push(chunk)
+      if (scenario === 'abort follow-up' && chunk.type === 'text-delta' && chunk.text.startsWith('FOLLOWUP')) {
+        followUpRun = runs.getActiveForOwner(sessionId)
+        controller.abort()
+      }
+    }
+    const text = next.flatMap(c => c.type === 'text-delta' ? [c.text] : []).join('')
+    const finish = next.find(c => c.type === 'finish')
+    assert.equal(next.filter(c => c.type === 'block-end' && c.block.type === 'tool-call').length, 0)
+    if (fresh) {
+      assert.equal(text, '[sess_1#2] New information from the inbox')
+      assert.equal(finish?.reason.kind, 'stop')
+    } else if (scenario === 'follow-up') {
+      assert.equal(text, 'NATIVE_COMPLETE|FOLLOWUP[sess_1#2;reads=1]:agent-message=New information from the inbox')
+      assert.equal(finish?.reason.kind, 'stop')
+      assert.deepEqual(next.filter(c => c.type === 'block-start').map(c => c.index), [0, 1])
+      const usage = next.filter(c => c.type === 'usage')
+      assert.equal(usage.length, 1)
+      assert.equal(usage[0]?.usage.outputTokens, 10)
+      assert.equal(pool.getStatus().usageTotals.outputTokens, 10)
+    } else if (scenario === 'abort follow-up') {
+      assert.equal(text, 'NATIVE_COMPLETE|FOLLOWUP[sess_1#2;reads=1]:agent-message=Follow-up must wait for cancellation')
+      assert.equal(finish?.reason.kind, 'aborted')
+      assert.ok(followUpRun?.isCancelled)
+      runs.endHostTurn(sessionId, 1)
+      runs.beginHostTurn(sessionId, 2)
+      const fresh = await collectChunks(adapter.stream({ provider: PROVIDER_ID, model: 'gemini-4-neon', sessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'After cancellation' }] }],
+      } as unknown as GenerateOptions))
+      assert.equal(fresh.flatMap(c => c.type === 'text-delta' ? [c.text] : []).join(''), '[sess_1#3] After cancellation')
+      const canceled = followUpRun.items[1]
+      assert.equal(canceled?.kind === 'done' && canceled.stopReason, 'cancelled')
+      assert.equal(pool.activeSignal(sessionId), undefined)
+    } else {
+      assert.equal(text, 'NATIVE_COMPLETE|')
+      assert.equal(finish?.reason.kind, scenario === 'error' ? 'error' : 'aborted')
+      if (finish?.reason.kind === 'error') assert.match(finish.reason.failure!.message, /native prompt failed after tool/)
+      assert.equal(pool.activeSignal(sessionId), undefined)
+    }
+    assert.equal(rec.isReleased, true)
+  })
+}
+
 test('each mirrored DSH step reports the exact usage of its agy model calls from the transcript', async () => {
   const appData = mkdtempSync(path.join(os.tmpdir(), 'agy-acp-transcript-'))
   const saved = { appData: process.env.ANTIGRAVITY_APP_DATA_DIR, flag: process.env.FAKE_TRANSCRIPT }

@@ -6,7 +6,7 @@ import { resolveConfig } from '../src/common/config.ts'
 import { isGeoUnsupportedError, isUnsupportedGeoCountry, maskIpAddress, normalizeGeoCountryCode } from '../src/common/geo.ts'
 import { sanitizeDiagnosticText } from '../src/common/sanitize.ts'
 import { MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME } from '../src/common/types.ts'
-import { detectContinuation } from '../src/provider/adapter.ts'
+import { detectContinuation } from '../src/provider/continuation.ts'
 import {
   compactDisplayInput,
   defineAgyAcpMirrorTool,
@@ -327,22 +327,27 @@ test('buildPromptBlocks stops trailingUsers at tool messages and builds budget-a
   assert.equal(prepareSystemPrompt('   '), null)
 })
 
-test('detectContinuation takes max itemIndex across out-of-order concurrent tool results', () => {
-  const id2 = encodeMirrorCallId('runA', 5)
-  const id1 = encodeMirrorCallId('runA', 3)
-  const cont = detectContinuation([
+test('detectContinuation collects out-of-order parallel receipts only for the outstanding host step', () => {
+  const rec = new AcpRunStore().create('session')
+  rec.expectToolResult(3)
+  rec.expectToolResult(5)
+  const id2 = encodeMirrorCallId(rec.id, 5)
+  const id1 = encodeMirrorCallId(rec.id, 3)
+  const messages = [
     { role: 'user', content: [{ type: 'text', text: 'go' }] },
     { role: 'assistant', content: [] },
     { role: 'tool', toolCallId: id2, content: [{ type: 'text', text: 'res2' }] },
-    { role: 'tool', toolCallId: id1, content: [{ type: 'text', text: 'res1' }] },
     { role: 'user', source: { kind: 'runtime-context' }, content: [{ type: 'text', text: 'ctx' }] },
-  ])
-  assert.deepEqual(cont, { runId: 'runA', itemIndex: 5 })
-  assert.equal(detectContinuation([
-    { role: 'tool', toolCallId: id2, content: [] },
+    { role: 'tool', toolCallId: id1, content: [{ type: 'text', text: 'res1' }] },
     { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'continue' }] },
     { role: 'user', source: { kind: 'time-context' }, content: [{ type: 'text', text: 'step time' }] },
-  ]), null)
+  ]
+  const cont = detectContinuation(messages, rec)
+  assert.deepEqual(cont?.toolResults.map(entry => entry.itemIndex), [5, 3])
+  assert.deepEqual(cont?.midTurnMessages.map(({ text }) => text), ['continue'])
+  rec.acknowledgeToolResults()
+  assert.equal(detectContinuation(messages, rec), null)
+  assert.equal(detectContinuation(messages, undefined), null)
 })
 
 test('sanitizeDiagnosticText redacts credentials case-insensitively before tail truncation', () => {

@@ -115,6 +115,11 @@ export function buildSystemPromptBlock(append: string, updated: boolean): Prompt
   return { type: 'text', text: `<${tag}>\n${append}\n</${tag}>\n` }
 }
 
+export function buildMidTurnPromptBlock(messages: readonly { source: string; text: string }[]): { type: 'text'; text: string } {
+  const entries = messages.map(({ source, text }) => ({ source, text }))
+  return { type: 'text', text: `DSH messages received during this turn (separate from any tool result):\n${JSON.stringify(entries)}` }
+}
+
 export function prepareAuxiliarySystemPrompt(
   purpose: string,
   system?: string,

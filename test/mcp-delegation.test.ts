@@ -8,7 +8,8 @@ import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { resolveConfig } from '../src/common/config.ts'
 import { MIRROR_TOOL_NAME, PROVIDER_ID, WRAPPER_TOOL_NAME } from '../src/common/types.ts'
 import { OVERLAPPING_NATIVE_DSH_TOOLS, ReverseMcpBridge } from '../src/mcp/server.ts'
-import { AcpAdapter, collectContinuationToolResults, detectContinuation } from '../src/provider/adapter.ts'
+import { AcpAdapter } from '../src/provider/adapter.ts'
+import { detectContinuation } from '../src/provider/continuation.ts'
 import { defineAgyAcpMirrorTool } from '../src/provider/mirror-tool.ts'
 import { AcpRunStore, encodeMirrorCallId } from '../src/provider/run-store.ts'
 import { decidePermission, isDshReverseMcpToolCall, type SessionPolicy } from '../src/runtime/permission-manager.ts'
@@ -44,6 +45,7 @@ function createDelegationHarness(opts?: { canUseMirrorTool?: (sessionKey: string
       description: 'Recall memories',
       parameters: { type: 'object', properties: { query: { type: 'string' } }, additionalProperties: false },
     },
+    { name: 'wait_agent', description: 'Wait for agent input', parameters: { type: 'object', properties: { timeout_ms: { type: 'number' } } } },
   ]
 
   const pool: AcpSessionPool = new AcpSessionPool({
@@ -193,6 +195,68 @@ test('delegates reverse MCP calls as real DSH native tool-call steps, suppresses
   assert.equal(errSpan2.find((c) => c.type === 'finish')?.reason.kind, 'stop')
 })
 
+for (const scenario of ['wait only', 'parallel after wait', 'native before wait'] as const) {
+  test(`mid-turn inbox reaches the active wait_agent prompt: ${scenario}`, { timeout: 10_000 }, async t => {
+    const harness = createDelegationHarness()
+    t.after(() => harness.dispose())
+    const sessionId = 'wait-agent-inbox'
+    const mirrorSchema = { name: MIRROR_TOOL_NAME, description: '', parameters: { type: 'object', properties: {} } }
+    const tools = [mirrorSchema, ...harness.dshTools]
+    const marker = scenario === 'native before wait' ? ' MIDTURN_NATIVE' : scenario === 'parallel after wait' ? ' PARALLEL_AFTER_WAIT' : ''
+    const history: unknown[] = [{ role: 'user', content: [{ type: 'text', text: `DELEGATE_MCP_WAIT_AGENT${marker}` }] }]
+    // Exercise the direct-adapter fallback too: no turn/start event in the wait-only case.
+    if (scenario !== 'wait only') harness.runs.beginHostTurn(sessionId, 1)
+    const stream = () => collectChunks(harness.adapter.stream({ provider: PROVIDER_ID, model: 'gemini-4-neon', sessionId, tools, messages: history } as unknown as GenerateOptions))
+    const calls = (chunks: StreamChunk[]) => chunks.flatMap(c => c.type === 'block-end' && c.block.type === 'tool-call' ? [c.block] : [])
+    const message = (kind: string, text: string, id: string) => ({ role: 'user', id, source: { kind }, content: [{ type: 'text', text }] })
+    const result = (toolCallId: string, text: string) => ({ role: 'tool', toolCallId, content: [{ type: 'text', text }] })
+    const relay = message('agent-message', 'The child has finished its report', 'child-1')
+    let step = await stream()
+    const rec = harness.runs.getActiveForOwner(sessionId)!
+    assert.ok(rec)
+    const resolve = t.mock.method(rec, 'resolveMcpCall')
+    if (scenario === 'native before wait') {
+      const native = calls(step)
+      assert.equal(native[0]?.name, MIRROR_TOOL_NAME)
+      const args = JSON.parse(native[0]!.arguments)
+      assert.equal(args.tool, 'update_steps')
+      await harness.mirrorTool.execute(args, { agent: { session: { id: sessionId } } } as ToolRunContext)
+      history.push({ role: 'assistant', content: native }, result(native[0]!.id, 'mirror result'), relay)
+      step = await stream()
+      assert.equal(resolve.mock.callCount(), 0)
+    }
+    const waits = calls(step)
+    assert.deepEqual(waits.map(c => c.name), ['wait_agent'])
+    assert.equal(step.find(c => c.type === 'finish')?.reason.kind, 'tool-calls')
+    history.push({ role: 'assistant', content: waits }, result(waits[0]!.id, '{"timedOut":false}'))
+    if (scenario !== 'native before wait') history.push(relay)
+    step = await stream()
+    const expectedMcpCalls = scenario === 'parallel after wait' ? 3 : 1
+    if (scenario === 'parallel after wait') {
+      const parallel = calls(step)
+      assert.deepEqual(parallel.map(c => c.name).sort(), ['mnemon_recall', 'ops_glob'])
+      history.push({ role: 'assistant', content: parallel }, result(parallel[0]!.id, 'tool-a'),
+        message('time-context', 'An updated clock', 'time'), result(parallel[1]!.id, 'tool-b'),
+        relay, // Same stable host ID, even if a projection returns it again on a subsequent step.
+        message('user', 'Please focus on the conclusion', 'human-1'), message('runtime-context', 'Runtime snapshot', 'snapshot'))
+      step = await stream()
+    }
+    assert.equal(resolve.mock.callCount(), expectedMcpCalls)
+    const waitResult = resolve.mock.calls[0]!.arguments[1]
+    assert.equal(waitResult.content[0]?.text, '{"timedOut":false}')
+    assert.match(waitResult.content[1]!.text, /agent-message.*The child has finished its report/)
+    const text = step.flatMap(c => c.type === 'text-delta' ? [c.text] : []).join('')
+    assert.ok(text.startsWith('WAIT[sess_1#1]:')) // one physical ACP prompt; the peer read the real MCP response
+    const observed = JSON.parse(text.slice(text.indexOf(':') + 1)) as string[]
+    assert.equal(observed[0], '{"timedOut":false}')
+    assert.equal(observed.filter(content => content.includes('The child has finished its report')).length, 1)
+    assert.equal(observed.filter(content => content.includes('Please focus on the conclusion')).length, scenario === 'parallel after wait' ? 1 : 0)
+    assert.ok(observed.every(content => !content.includes('An updated clock') && !content.includes('Runtime snapshot')))
+    assert.equal(step.find(c => c.type === 'finish')?.reason.kind, 'stop')
+    assert.deepEqual(calls(step), [])
+  })
+}
+
 test('Code Mode (PTC) wraps delegated reverse MCP calls in run_code with required description and returns result', { timeout: 10_000 }, async (t) => {
   const harness = createDelegationHarness()
   t.after(() => harness.dispose())
@@ -331,40 +395,38 @@ test('cancelling an active turn immediately rejects pending delegated MCP calls 
   assert.equal(store.getActiveForOwner('sess-cancel'), undefined)
 })
 
-test('detectContinuation and collectContinuationToolResults handle developer/step-context trailers and legacy blocks', () => {
-  const id1 = encodeMirrorCallId('runX', 2)
-  const id2 = encodeMirrorCallId('runX', 4)
-  const msgs = [
+test('only an outstanding receipt in the current turn can cross an agent-message trailer', () => {
+  const runs = new AcpRunStore()
+  const key = 'receipts'
+  runs.beginHostTurn(key, 42)
+  const rec = runs.create(key)
+  rec.expectToolResult(2)
+  rec.expectToolResult(4)
+  const id1 = encodeMirrorCallId(rec.id, 2)
+  const id2 = encodeMirrorCallId(rec.id, 4)
+  const messages = [
     { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'start' }] },
     { role: 'assistant', content: [] },
     { role: 'tool', toolCallId: id1, content: [{ type: 'text', text: 'first' }], isError: false },
-    { role: 'tool', toolCallId: id2, content: [{ type: 'text', text: 'second' }], isError: true },
+    { role: 'user', content: [{ type: 'tool-result', toolCallId: id2, content: [{ type: 'text', text: 'second' }], isError: true }] },
     { role: 'developer', source: { kind: 'tool-registry' }, content: [{ type: 'tool-addition' }] },
-    { role: 'user', source: { kind: 'ptc-mode' }, content: [{ type: 'text', text: 'image ctx' }] },
     { role: 'user', source: { kind: 'runtime-context' }, content: [{ type: 'text', text: 'runtime' }] },
-    { role: 'user', source: { kind: 'custom-deferred-tool-context' }, content: [{ type: 'text', text: 'deferred ctx' }] },
+    { role: 'user', id: 'inbox-1', source: { kind: 'agent-message' }, content: [{ type: 'text', text: 'child reply' }] },
   ]
-  assert.deepEqual(detectContinuation(msgs), { runId: 'runX', itemIndex: 4 })
-  assert.deepEqual(collectContinuationToolResults(msgs, 'runX'), [
+  const continuation = detectContinuation(messages, runs.getContinuationForOwner(key), runs.hasHostTurn(rec))
+  assert.deepEqual(continuation?.toolResults, [
     { itemIndex: 2, result: { content: [{ type: 'text', text: 'first' }], isError: false } },
     { itemIndex: 4, result: { content: [{ type: 'text', text: 'second' }], isError: true } },
   ])
-
-  // Fresh turn triggers (scheduled, agent-message, user) must NOT be skipped as step context
-  assert.equal(
-    detectContinuation([
-      ...msgs,
-      { role: 'user', source: { kind: 'scheduled' }, content: [{ type: 'text', text: 'cron trigger' }] },
-    ]),
-    null,
-  )
-  assert.equal(
-    detectContinuation([
-      ...msgs,
-      { role: 'user', source: { kind: 'agent-message' }, content: [{ type: 'text', text: 'child reply' }] },
-    ]),
-    null,
-  )
+  assert.deepEqual(continuation?.midTurnMessages, [{ key: 'id:inbox-1', source: 'agent-message', text: 'child reply' }])
+  rec.finish('end_turn')
+  assert.equal(runs.getActiveForOwner(key), undefined)
+  assert.equal(detectContinuation(messages, rec), null)
+  assert.ok(detectContinuation(messages, runs.getContinuationForOwner(key), runs.hasHostTurn(rec)))
+  runs.endHostTurn(key, 42)
+  assert.equal(detectContinuation(messages, runs.getContinuationForOwner(key)), null)
+  runs.beginHostTurn(key, 43)
+  assert.equal(detectContinuation(messages, runs.getContinuationForOwner(key)), null)
 })
 
 test('isDshReverseMcpToolCall and decidePermission allow attached dsh-tools MCP across auto/read-only while rejecting spoofs', async () => {
