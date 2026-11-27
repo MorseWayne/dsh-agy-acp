@@ -2,6 +2,11 @@
 
 All notable changes to `@morsewayne/dsh-agy-acp` are documented in this file.
 
+## [0.8.2] - 2026-11-27
+
+### Fixed
+- **DSH token usage at mirrored tool boundaries**: Bill only exact per-call transcript usage at tool boundaries; keep live context occupancy visible in session status without counting it as uncached input. Without a transcript, retain fallback usage at prompt completion, but do not report occupancy alone for cancelled prompts.
+
 ## [0.8.1] - 2026-11-27
 
 ### Fixed
