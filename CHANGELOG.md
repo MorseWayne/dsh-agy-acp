@@ -2,6 +2,17 @@
 
 All notable changes to `@morsewayne/dsh-agy-acp` are documented in this file.
 
+## [0.9.0] - 2026-11-27
+
+### Added
+- **One-Click `agy` CLI Environment Check & Installer** (`src/runtime/env-setup.ts`, `src/client/env-setup-banner.ts`, `src/runtime/doctor.ts`): Added structured 5-step read-only environment diagnostics and in-panel one-click `agy` installation/upgrade from official Google installer endpoints with optional proxy routing and live hot reload.
+- **Console-Managed Multi-Account Store & Direct Google OAuth Login Wizard** (`src/runtime/account-store.ts`, `src/runtime/account-login.ts`, `src/common/account-validation.ts`, `src/client/accounts-panel.ts`): Added `+ Add Account` direct Google OAuth onboarding without pre-filled forms, automatic Google email detection, atomic `0600` persistence to `~/.dsh/agy-acp/accounts.json` with isolated per-account `HOME` directories under `~/.dsh/agy-acp/accounts/<id>`, and full in-panel management (rename, per-account proxy, enable/disable, re-login, and delete).
+- **Automatic On-Open Quota Loading with 3-Minute Cache**: Opening the **Accounts & Quotas** tab now lazily fetches quota snapshots in parallel for eligible enabled accounts (`maxAgeMs` TTL deduplication in `SessionPool.refreshAccountQuota`, 60-second failure retry cooldown, and live loading states) while preserving the manual **Refresh Quota** button for on-demand forced updates.
+
+### Fixed
+- **Machine Default Account (`default`) Auth Status & Re-Login Lifecycle**: Detected ambient `HOME` / `GEMINI_HOME` / `ANTIGRAVITY_GEMINI_DIR` / `ANTIGRAVITY_APP_DATA_DIR` token paths, persisted non-sensitive `defaultAuthVerifiedAt` in `accounts.json` so desktop OS keyring credentials remain recognized across multi-account coexistence and plugin reloads, handled browser `localhost` callback auto-exit (`exit 0`) in `account-login.ts`, retired idle ACP sessions on re-login, and replaced misleading "Login" labels for keyring-backed default accounts.
+- **Multi-Account Default Quota Refresh**: Allowed the machine `default` account to refresh quota alongside managed accounts whenever every other configured account is strictly isolated from the ambient `HOME` and OS keyring.
+
 ## [0.8.4] - 2026-11-27
 
 ### Security
