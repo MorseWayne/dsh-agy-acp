@@ -27,7 +27,8 @@ export function mapUsage(raw: AcpUsage): TokenUsage {
 }
 
 /**
- * Fallback used only when agy's per-call transcript is unavailable.
+ * Terminal fallback used only when agy's per-call transcript is unavailable.
+ * If a completed prompt has no ACP usage, retain the occupancy-only context sample.
  *
  * DSH derives context occupancy from the prompt side of the latest usage sample, but the ACP
  * `session/prompt` usage is cumulative over every internal model call of the run, so its prompt side

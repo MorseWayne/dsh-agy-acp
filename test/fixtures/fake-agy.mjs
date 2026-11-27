@@ -525,6 +525,41 @@ async function handleRequest(id, method, params) {
       return
     }
 
+    if (promptText.includes('USAGE_ACROSS_TOOLS')) {
+      const calls = [
+        { input_tokens: 80, cache_read_tokens: 3920, cache_write_tokens: 0, output_tokens: 40 },
+        { input_tokens: 120, cache_read_tokens: 4780, cache_write_tokens: 100, output_tokens: 50 },
+        { input_tokens: 20, cache_read_tokens: 5970, cache_write_tokens: 10, output_tokens: 60 },
+      ]
+      for (const [index, call] of calls.entries()) {
+        writeTranscript(sessionId, { step_index: index + 1, type: 'PLANNER_RESPONSE', status: 'DONE', ...call })
+        const used = call.input_tokens + call.cache_read_tokens + call.cache_write_tokens
+        sendUpdate(sessionId, { sessionUpdate: 'usage_update', used, size: 65536 })
+        if (index === 2) break
+
+        const toolCall = { sessionUpdate: 'tool_call', toolCallId: `usage-tool-${index}`, name: 'read_file', kind: 'read', status: 'pending' }
+        sendUpdate(sessionId, toolCall)
+        // Wait for the test to acknowledge the tool span before sending the next call's occupancy.
+        await requestClient('session/request_permission', {
+          sessionId, toolCall, options: [{ optionId: 'allow', name: 'Allow once', kind: 'allow_once' }],
+        })
+        const failed = index === 1 && promptText.includes('error')
+        const cancelled = index === 1 && promptText.includes('cancelled')
+        sendUpdate(sessionId, { ...toolCall, sessionUpdate: 'tool_call_update', status: failed || cancelled ? 'failed' : 'completed' })
+        if (failed) {
+          send({ jsonrpc: '2.0', id, error: { code: -32000, message: 'usage fixture tool failed' } })
+          return
+        }
+        if (cancelled) {
+          send({ jsonrpc: '2.0', id, result: { stopReason: 'cancelled' } })
+          return
+        }
+      }
+      const usage = { inputTokens: 220, cachedReadTokens: 14670, cachedWriteTokens: 110, outputTokens: 150 }
+      send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn', ...(promptText.includes('no-usage') ? {} : { usage }) } })
+      return
+    }
+
     if (promptText.includes('USE_TOOL')) {
       writeTranscript(sessionId, { step_index: 0, type: 'USER_INPUT', status: 'DONE' })
       sendUpdate(sessionId, {

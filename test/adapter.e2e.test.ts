@@ -15,7 +15,7 @@ import { AcpRunStore } from '../src/provider/run-store.ts'
 import { MultiAccountPool } from '../src/runtime/account-pool.ts'
 import { EgressGuard } from '../src/runtime/egress-guard.ts'
 import { SessionIndex } from '../src/runtime/session-index.ts'
-import { AcpSessionPool } from '../src/runtime/session-pool.ts'
+import { AcpSessionPool, type SessionPoolDeps } from '../src/runtime/session-pool.ts'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const FAKE_AGY_BIN = path.join(__dirname, 'fixtures', 'fake-agy.mjs')
@@ -29,7 +29,7 @@ async function collectChunks(iterable: AsyncIterable<StreamChunk>): Promise<Stre
   return chunks
 }
 
-function createHarness() {
+function createHarness(overrides: Pick<SessionPoolDeps, 'accountProvider' | 'onPermission'> = {}) {
   const cfg = resolveConfig({
     enabled: true,
     requestTimeoutMs: 10_000,
@@ -47,6 +47,7 @@ function createHarness() {
         ? { outcome: { outcome: 'selected', optionId: allow.optionId } }
         : { outcome: { outcome: 'cancelled' } }
     },
+    ...overrides,
   })
   const adapter = new AcpAdapter({
     getConfig: () => cfg,
@@ -122,10 +123,8 @@ async function assertMirrorContinuation(format: 'legacy' | 'tool role' | 'runtim
     )
 
     assert.deepEqual(permissionLog, ['run_command'])
-    // Mirror boundaries report live context occupancy (usage_update.used) so DSH can render context pressure.
-    const boundaryUsage = span1.find((c) => c.type === 'usage')
-    assert.ok(boundaryUsage && boundaryUsage.type === 'usage')
-    assert.equal(boundaryUsage.usage.inputTokens, 320)
+    // Without a transcript, live occupancy stays in session status, not billable step usage.
+    assert.equal(span1.some(c => c.type === 'usage'), false)
     const observed = pool.getStatus().sessions[0]!
     assert.equal(observed.contextUsed, 320)
     assert.equal(observed.contextSize, 65536)
@@ -363,6 +362,84 @@ test('each mirrored DSH step reports the exact usage of its agy model calls from
     rmSync(appData, { recursive: true, force: true })
   }
 })
+
+for (const scenario of ['cached', 'error', 'cancelled', 'no-usage', 'transcript'] as const) {
+  test(`usage across two mirrored tools: ${scenario}`, { timeout: 10_000 }, async t => {
+    const appData = mkdtempSync(path.join(os.tmpdir(), 'agy-acp-span-usage-'))
+    const withTranscript = scenario === 'transcript'
+    const env = { ...process.env, HOME: appData, USERPROFILE: appData, ANTIGRAVITY_APP_DATA_DIR: appData, FAKE_TRANSCRIPT: withTranscript ? '1' : '0' }
+    const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()]
+    const { adapter, pool, runs, mirrorTool } = createHarness({
+      accountProvider: { acquire: async () => ({ accountId: 'default', env, release: () => {} }) },
+      onPermission: async ({ toolCall }) => {
+        const gate = gates[Number(toolCall.toolCallId.split('-').at(-1))]
+        assert.ok(gate)
+        await gate.promise
+        return { outcome: { outcome: 'selected', optionId: 'allow' } }
+      },
+    })
+    t.after(() => {
+      for (const gate of gates) gate.resolve()
+      pool.dispose()
+      rmSync(appData, { recursive: true, force: true })
+    })
+    const sessionId = 'dsh-usage-across-tools'
+    const tools = [{ name: MIRROR_TOOL_NAME, description: '', parameters: { type: 'object', properties: {} } }]
+    const messages: unknown[] = [{ role: 'user', content: [{ type: 'text', text: `USAGE_ACROSS_TOOLS ${scenario}` }] }]
+    const stream = () => collectChunks(adapter.stream({ provider: PROVIDER_ID, model: 'gemini-4-neon', sessionId, tools, messages } as unknown as GenerateOptions))
+    const usageOf = (span: StreamChunk[]) => span.filter(c => c.type === 'usage').map(c => c.usage)
+    const samples = []
+    const boundaryUsage = [
+      { inputTokens: 80, outputTokens: 40, cacheReadTokens: 3920, cacheWriteTokens: 0, totalTokens: 4040 },
+      { inputTokens: 120, outputTokens: 50, cacheReadTokens: 4780, cacheWriteTokens: 100, totalTokens: 5050 },
+    ]
+
+    for (const [index, contextUsed] of [4000, 5000].entries()) {
+      const span = await stream()
+      assert.equal(span.find(c => c.type === 'finish')?.reason.kind, 'tool-calls')
+      assert.equal(runs.getActiveForOwner(sessionId)?.hasUsageSource, withTranscript)
+      assert.equal(pool.getStatus().sessions[0]?.contextUsed, contextUsed)
+      const usage = usageOf(span)
+      assert.deepEqual(usage, withTranscript ? [boundaryUsage[index]] : [])
+      samples.push(...usage)
+
+      const call = span.find(c => c.type === 'block-end' && c.block.type === 'tool-call')
+      assert.ok(call?.type === 'block-end' && call.block.type === 'tool-call')
+      const args = JSON.parse(call.block.arguments)
+      assert.equal(args.toolCallId, `usage-tool-${index}`)
+      gates[index]!.resolve()
+      const value = await mirrorTool.execute(args, { agent: { session: { id: sessionId } } } as ToolRunContext)
+      messages.push({ role: 'assistant', content: [call.block] },
+        { role: 'tool', toolCallId: call.block.id, content: mirrorTool.output.render(args, value as never) })
+    }
+
+    const terminal = await stream()
+    const finish = terminal.find(c => c.type === 'finish')
+    const usage = usageOf(terminal)
+    if (scenario === 'error' || scenario === 'cancelled') {
+      assert.equal(finish?.reason.kind, scenario === 'error' ? 'error' : 'aborted')
+      if (scenario === 'error') assert.match(finish?.reason.failure?.message ?? '', /usage fixture tool failed/)
+      assert.deepEqual([...samples, ...usage], [])
+      return
+    }
+
+    assert.equal(finish?.reason.kind, 'stop')
+    assert.equal(pool.getStatus().sessions[0]?.contextUsed, 6000)
+    if (scenario === 'no-usage') {
+      assert.deepEqual(usage, [{ inputTokens: 6000, outputTokens: 0 }]) // successful occupancy-only fallback stays supported
+    } else if (withTranscript) {
+      assert.deepEqual(usage, [{ inputTokens: 20, outputTokens: 60, cacheReadTokens: 5970, cacheWriteTokens: 10, totalTokens: 6060 }])
+    } else {
+      assert.deepEqual(usage, [{ inputTokens: 88, outputTokens: 150, cacheReadTokens: 5868, cacheWriteTokens: 44, totalTokens: 6150 }])
+    }
+    if (scenario === 'cached' || withTranscript) {
+      samples.push(...usage)
+      const cacheRead = samples.reduce((sum, u) => sum + (u.cacheReadTokens ?? 0), 0)
+      const promptTokens = samples.reduce((sum, u) => sum + u.inputTokens + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0), 0)
+      assert.equal(cacheRead / promptTokens, 0.978)
+    }
+  })
+}
 
 test('resolved reasoning defaults match persistent ACP selection after returning to Default', async () => {
   const { adapter, pool, cfg } = createHarness()

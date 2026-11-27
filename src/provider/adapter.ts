@@ -405,7 +405,7 @@ export class AcpAdapter extends LlmAdapter {
       const rec = this.deps.runs.create(sessionKey, createPreEditLocator(policy.workspaceRoot))
       this.recordingSessions.set(rec, launch)
       rec.delegatesMcp = mode.canDelegateMcpTools && Boolean(session.hasMcpServers)
-      // agy emits usage_update at the end of a prompt, so seed with the last known occupancy for mirror boundaries.
+      // Retain the last known occupancy for terminal fallback if no fresh usage_update arrives.
       if (typeof session.contextUsed === 'number') rec.contextUsed = session.contextUsed
       // Exact per-call usage (cache hits included) comes from agy's transcript; ACP only reports a run total.
       rec.attachUsageSource(new TranscriptUsageTailer(this.deps.pool.transcriptPaths(session)))
@@ -785,16 +785,9 @@ export class AcpAdapter extends LlmAdapter {
         sawPostToolContent && rec.hasPendingUsage
           ? rec.consumeSpanUsage()
           : await takeSpanUsage(rec, boundaryRetries, signal)
+      // At a tool boundary only transcript counters are billable; occupancy alone has no cache split.
       if (spanUsage) {
         yield { type: 'usage', usage: callUsageToTokenUsage(spanUsage) }
-      } else if (!rec.hasUsageSource && rec.contextUsed !== undefined && rec.contextUsed !== rec.lastFallbackContextUsed) {
-        // No transcript: report live context occupancy once per distinct reading so DSH shows context
-        // pressure without repeatedly billing the same full context across mirrored tool spans.
-        const boundaryUsage = mapContextUsage(undefined, rec.contextUsed)
-        if (boundaryUsage) {
-          rec.lastFallbackContextUsed = rec.contextUsed
-          yield { type: 'usage', usage: boundaryUsage }
-        }
       }
     }
 
@@ -895,6 +888,7 @@ export class AcpAdapter extends LlmAdapter {
         if (closed) yield closed
         const priorUsageCount = rec.consumedSpanUsageCount
         const spanUsage = await takeSpanUsage(rec, FINAL_USAGE_RETRIES, signal)
+        const aborted = signal?.aborted || rec.isCancelled || rec.isReleased || item.stopReason === 'cancelled'
         let usage: TokenUsage | undefined
         if (spanUsage) {
           // agy's transcript.jsonl PLANNER_RESPONSE currently omits thinking_tokens.
@@ -910,13 +904,13 @@ export class AcpAdapter extends LlmAdapter {
               ? { ...spanUsage, reasoningTokens: thought }
               : spanUsage
           usage = callUsageToTokenUsage(enriched)
-        } else if (!rec.hasUsageSource) {
+        } else if (!rec.hasUsageSource && (item.usage || !aborted)) {
+          // Preserve the occupancy-only fallback for completed prompts, not cancelled prompts without usage.
           usage = mapContextUsage(item.usage, rec.contextUsed)
         }
         rec.cursor = Math.max(rec.cursor, idx + 1)
         const pending = rec.undeliveredMidTurnMessages()
         const launch = this.recordingSessions.get(rec)
-        const aborted = signal?.aborted || rec.isCancelled || rec.isReleased || item.stopReason === 'cancelled'
         if (!aborted && pending.length && launch) {
           // The producer drops pool.active before publishing done. Begin on the very same
           // persistent session; never recreate it or replay the preceding prompt or tools.

@@ -352,10 +352,8 @@ export class AcpRunRecording {
     if (changed) this.wakeAll()
   }
 
-  /** Latest `usage_update.used` seen during this run: the real live context occupancy. */
+  /** Latest known live context occupancy, retained for terminal fallback when no transcript exists. */
   contextUsed: number | undefined
-  /** Last fallback occupancy already reported to DSH when transcript usage is unavailable. */
-  lastFallbackContextUsed: number | undefined
 
   private usageSource: CallUsageSource | null = null
   private pendingUsage: CallUsage | null = null

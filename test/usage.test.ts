@@ -36,7 +36,7 @@ test('mapContextUsage scales cumulative ACP usage to usage_update.used and keeps
   assert.equal(u?.totalTokens, 40_559 + 905)
 })
 
-test('mapContextUsage synthesizes a sample at mirror boundaries and stays silent without data', () => {
+test('mapContextUsage keeps the terminal occupancy fallback for a completed prompt with no ACP usage', () => {
   assert.deepEqual(mapContextUsage(undefined, 320), { inputTokens: 320, outputTokens: 0 })
   assert.equal(mapContextUsage(undefined, undefined), undefined)
 })
