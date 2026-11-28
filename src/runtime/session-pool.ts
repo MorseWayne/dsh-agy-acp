@@ -531,7 +531,10 @@ export class AcpSessionPool extends EventEmitter {
       const account = this.accountCatalogs.get(accountId)
       const modelOption = account?.catalog.models.find(m => m.value === model)
       if (!account || !modelOption) return undefined
-      return { model: modelOption, image: account.image === true, contextWindow: account.windows.get(model) }
+      return {
+        model: modelOption, image: account.image === true,
+        contextWindow: account.windows.get(model) ?? this.defaultContextWindowFor(model),
+      }
     }
     const observed = read()
     if (observed?.model.efforts.length || (observed && this.accountCatalogs.get(accountId)?.catalog.routes.get(model)?.kind === 'legacy')) {
@@ -553,8 +556,12 @@ export class AcpSessionPool extends EventEmitter {
 
   supportsImageInput(): boolean { return this.initResult?.agentCapabilities?.promptCapabilities?.image === true }
 
+  defaultContextWindowFor(model: string): number | undefined {
+    return model.startsWith('claude') ? 200_000 : model.startsWith('gemini') ? 1_048_576 : undefined
+  }
+
   contextWindowFor(model: string): number | undefined {
-    return this.observedWindows.get(model) ?? (model.startsWith('claude') ? 200_000 : model.startsWith('gemini') ? 1_048_576 : undefined)
+    return this.observedWindows.get(model) ?? this.defaultContextWindowFor(model)
   }
 
   recordContextUsage(sess: ManagedAcpSession, model: string, used: number, size: number): void {

@@ -167,12 +167,14 @@ export class AcpAdapter extends LlmAdapter {
     const caps = selected?.capabilities
     let modelInfo: LlmResolvedModelInfo
     if (selected) {
-      modelInfo = this.modelInfo(model, caps?.model, caps?.image && this.deps.readImage ? ['text', 'image'] : ['text'], caps?.contextWindow)
+      modelInfo = this.modelInfo(model, caps?.model, caps?.image && this.deps.readImage ? ['text', 'image'] : ['text'],
+        caps?.contextWindow ?? this.deps.pool.defaultContextWindowFor(model))
     } else {
       // With automatic account selection this is only a discovery preflight.
       // Never use another account's observed context window to plan this call.
       const { context: _unscopedContext, ...discovery } = await this.resolveModel(provider, model, signal)
-      modelInfo = discovery
+      const defaultWindow = this.deps.pool.defaultContextWindowFor(model)
+      modelInfo = defaultWindow === undefined ? discovery : { ...discovery, context: { contextWindow: defaultWindow } }
     }
     return {
       model: modelInfo,

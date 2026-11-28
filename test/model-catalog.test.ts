@@ -206,6 +206,14 @@ test('syncSessionOptions publishes thought levels learned only after selecting a
   assert.equal(probeLaunches.length, 0)
 })
 
+test('cold single-account calls use only family defaults for unlisted models', async t => {
+  const { adapter } = createCatalogHarness(t)
+  const claude = await adapter.prepareCall(PROVIDER_ID, 'claude-unlisted')
+  assert.equal(claude.model.context?.contextWindow, 200_000)
+  const unknown = await adapter.prepareCall(PROVIDER_ID, 'unknown-unlisted')
+  assert.equal(unknown.model.context, undefined)
+})
+
 test('prepared calls probe the strict target and never apply another account’s levels on dispatch', async t => {
   const first = setup()
   const second = setup()
@@ -232,17 +240,24 @@ test('prepared calls probe the strict target and never apply another account’s
   const current = await pool.getOrCreateSession('first', process.cwd(), neon)
   assert.equal(current.session.accountId, 'account-1')
   assert.ok(current.session.models.find(m => m.value === neon)?.efforts.includes('high'))
+  pool.recordContextUsage(current.session, neon, 1000, 256_000)
+  accounts.setModelRouting({ models: { [neon]: { accountId: 'account-1', fallback: 'strict' } } })
+  const own = await adapter.prepareCall(PROVIDER_ID, neon)
+  assert.equal(own.model.context?.contextWindow, 256_000)
 
   accounts.setModelRouting({ models: { [neon]: { accountId: 'account-2', fallback: 'strict' } } })
   const strict = await adapter.prepareCall(PROVIDER_ID, neon)
   assert.deepEqual(strict.model.reasoning?.efforts.map(e => e.id), ['low'])
+  assert.equal(strict.model.context?.contextWindow, 1_048_576)
   assert.equal(probeCount, 1, 'must not reuse catalog metadata from account-1')
 
   accounts.setModelRouting({ models: { [neon]: { accountId: 'account-2' } } })
   await pool.forceRefreshModels() // The menu discovers with account-1. The model route selects account-2.
   const automatic = await adapter.prepareCall(PROVIDER_ID, neon)
   assert.ok(automatic.model.reasoning?.efforts.some(e => e.id === 'high'), 'provisional menu evidence')
-  assert.equal(automatic.model.context, undefined)
+  assert.equal(automatic.model.context?.contextWindow, 1_048_576)
+  const unknownFamily = await adapter.prepareCall(PROVIDER_ID, 'gpt-oss-120b-medium')
+  assert.equal(unknownFamily.model.context, undefined)
   await assert.rejects(async () => {
     for await (const _ of automatic.stream({ provider: PROVIDER_ID, model: neon, sessionId: 'actual',
       reasoningEffort: ReasoningEffortId('high'), messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
