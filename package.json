@@ -1,6 +1,6 @@
 {
   "name": "@morsewayne/dsh-agy-acp",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "Persistent Google Antigravity (agy acp) provider bridge for DeepSeek Harness — session/resume continuity, native chat tool cards, tiered reverse MCP gateway, anonymous egress geo-fence, multi-account 5h/7d quota scheduling, and native web console.",
   "icon": "./icon.svg",
   "type": "module",

@@ -2,6 +2,11 @@
 
 All notable changes to `@morsewayne/dsh-agy-acp` are documented in this file.
 
+## [0.10.1] - 2026-11-28
+
+### Fixed
+- `prepareCall()` again uses model-family defaults (Claude: 200,000 tokens; Gemini: 1,048,576) for automatic multi-account routing and cold starts with a single account or strict routing, without borrowing context windows measured on other accounts. This keeps the context usage button and cache hit rate popover visible in DSH.
+
 ## [0.10.0] - 2026-11-28
 
 ### Added
